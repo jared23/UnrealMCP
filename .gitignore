@@ -1,0 +1,33 @@
+# Unreal Engine Plugin Ignores
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+Logs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.pdb
+
+# Python modules
+MCP/python_modules/
+MCP/__pycache__/
+MCP/Commands/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Python venv (macOS bridge)
+MCP/python_env/
+.venv/
+
+# macOS
+.DS_Store
+
+# Private coordination scaffolding + machine-specific working files (kept local / synced privately, not public)
+.mcp_coord/
+scratchpad/
+docs/drafts/
+*.bak
+*.bak-*
