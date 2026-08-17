@@ -5,7 +5,7 @@ This module contains commands for executing Python code in Unreal Engine.
 
 import sys
 import os
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 # Import send_command from the parent module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

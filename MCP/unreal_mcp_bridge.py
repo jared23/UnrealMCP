@@ -74,19 +74,89 @@ if mcp_spec is None:
     sys.exit(1)
 
 try:
-    from mcp.server.fastmcp import FastMCP, Context
+    # mcp 2.0.0: FastMCP was renamed/moved to mcp.server.mcpserver.MCPServer
+    from mcp.server.mcpserver import MCPServer
 except ImportError as e:
-    print(f"Error importing from mcp package: {e}", file=sys.stderr)
-    print("The mcp package is installed but there was an error importing from it.", file=sys.stderr)
-    print("This could be due to a version mismatch or incomplete installation.", file=sys.stderr)
-    print("Please try reinstalling the package using: pip install --upgrade mcp", file=sys.stderr)
+    print(f"Error importing MCPServer from mcp package: {e}", file=sys.stderr)
+    print("This bridge targets mcp >= 2.0 (mcp.server.mcpserver.MCPServer).", file=sys.stderr)
+    print("Installed mcp is missing it — check the venv (setup_unreal_mcp.sh).", file=sys.stderr)
     sys.exit(1)
 
-# Initialize the MCP server
-mcp = FastMCP(
+import inspect as _inspect
+import functools as _functools
+
+
+def _strip_ctx_wrapper(func):
+    """Our tool functions follow the FastMCP `def tool(ctx, ...)` pattern with an untyped
+    leading `ctx`. Under MCPServer that `ctx` would leak into the client-facing schema as a
+    REQUIRED argument (and break calls). This strips a leading ctx/context parameter and
+    passes None for it at call time, leaving the module code unchanged."""
+    sig = _inspect.signature(func)
+    params = list(sig.parameters.values())
+    if not params or params[0].name not in ("ctx", "context"):
+        return func
+    # If the leading param is TYPED (e.g. `ctx: Context`), leave it — MCPServer injects the
+    # real Context and hides it from the schema. Only strip our untyped `ctx` convention.
+    if params[0].annotation is not _inspect.Parameter.empty:
+        return func
+    ctx_name = params[0].name
+    new_sig = sig.replace(parameters=params[1:])
+
+    @_functools.wraps(func)
+    def wrapper(**kwargs):
+        return func(None, **kwargs)
+
+    wrapper.__signature__ = new_sig
+    ann = dict(getattr(func, "__annotations__", {}))
+    ann.pop(ctx_name, None)
+    wrapper.__annotations__ = ann
+    return wrapper
+
+
+class _ToolShim:
+    """FastMCP-compatible facade over MCPServer. The Commands/ and UserTools/ modules register
+    via `@mcp.tool()`; this captures those registrations and, on run(), adds ctx-stripped
+    wrappers to the real MCPServer. Any other attribute access delegates to the real server."""
+
+    def __init__(self, real):
+        self._real = real
+        self._captured = []
+
+    def tool(self, *args, **kwargs):
+        name = kwargs.get("name")
+        description = kwargs.get("description")
+
+        def deco(fn):
+            self._captured.append((fn, name, description))
+            return fn
+        return deco
+
+    def flush(self):
+        for fn, name, description in self._captured:
+            wrapper = _strip_ctx_wrapper(fn)
+            self._real.add_tool(
+                wrapper,
+                name=name or fn.__name__,
+                description=description or (fn.__doc__ or "").strip() or None,
+            )
+        self._captured = []
+
+    def run(self, *args, **kwargs):
+        self.flush()
+        return self._real.run(*args, **kwargs)
+
+    def __getattr__(self, item):
+        # _real/_captured live in __dict__, so this only fires for delegated attrs
+        return getattr(self._real, item)
+
+
+# Initialize the MCP server (mcp 2.0.0), wrapped so existing tool modules work unchanged.
+_real_mcp = MCPServer(
     "UnrealMCP",
-    description="Unreal Engine integration through the Model Context Protocol"
+    description="Unreal Engine integration through the Model Context Protocol",
+    version="0.2.0",
 )
+mcp = _ToolShim(_real_mcp)
 
 def send_command(command_type, params=None, timeout=DEFAULT_TIMEOUT):
     """Send a command to the C++ MCP server and return the response.

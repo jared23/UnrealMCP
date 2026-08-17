@@ -6,9 +6,10 @@ including creation, modification, and querying of materials.
 
 import sys
 import os
+import json
 import importlib.util
 import importlib
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 # Import send_command from the parent module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -104,9 +105,53 @@ def register_all(mcp):
         try:
             params = {"path": path}
             response = send_command("get_material_info", params)
-            if response["status"] == "success":
+            if response.get("status") == "success":
                 return response["result"]
-            else:
-                return {"error": response["message"]}
+            # Native handler supports base UMaterial only. On failure, probe the asset so we
+            # can return an honest, specific message (e.g. MaterialInstanceConstant / not found)
+            # instead of a blind "Failed to load material". The bridge process has no `unreal`
+            # module, so inspect via execute_python. Read-only; no '''/backslash in the code.
+            probe_code = (
+                "import unreal, json\n"
+                "p = " + json.dumps(path) + "\n"
+                "exists = unreal.EditorAssetLibrary.does_asset_exist(p)\n"
+                "cls = None\n"
+                "parent = None\n"
+                "if exists:\n"
+                "    a = unreal.EditorAssetLibrary.load_asset(p)\n"
+                "    cls = a.get_class().get_name() if a else None\n"
+                "    try:\n"
+                "        if isinstance(a, unreal.MaterialInstance):\n"
+                "            par = a.get_editor_property(\"parent\")\n"
+                "            parent = par.get_path_name() if par else None\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "print(\"@@MI@@\" + json.dumps({\"exists\": exists, \"class\": cls, \"parent\": parent}))\n"
+            )
+            info = {}
+            probe = send_command("execute_python", {"code": probe_code})
+            if isinstance(probe, dict) and probe.get("status") == "success":
+                out = (probe.get("result", {}) or {}).get("output", "") or ""
+                for line in out.replace("\r\n", "\n").splitlines():
+                    if "@@MI@@" in line:
+                        try:
+                            info = json.loads(line.split("@@MI@@", 1)[1])
+                        except Exception:
+                            info = {}
+                        break
+            if info and not info.get("exists"):
+                return {"error": "asset not found", "path": path}
+            cls = info.get("class")
+            if cls and cls != "Material":
+                return {
+                    "error": "unsupported material type",
+                    "path": path,
+                    "asset_class": cls,
+                    "parent_material": info.get("parent"),
+                    "note": ("get_material_info supports base UMaterial only. For a %s, use "
+                             "get_material_slots (assigned materials) or get_object_property / "
+                             "describe_object on the asset for parameter overrides." % cls),
+                }
+            return {"error": response.get("message", "get_material_info failed"), "path": path}
         except Exception as e:
-            return {"error": str(e)} 
+            return {"error": str(e)}

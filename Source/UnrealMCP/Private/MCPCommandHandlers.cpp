@@ -411,6 +411,20 @@ TSharedPtr<FJsonObject> FMCPDeleteObjectHandler::Execute(const TSharedPtr<FJsonO
 //
 TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJsonObject> &Params, FSocket *ClientSocket)
 {
+    // This handler runs on the game thread (FMCPTCPServer::Tick -> ProcessClientData -> ProcessCommand).
+    check(IsInGameThread());
+
+    // Re-entrancy guard: GEngine->Exec(python) below runs synchronously and the executed script can pump the
+    // game thread (e.g. save_asset / compile), which re-fires FTSTicker -> a NESTED Execute. Two runs would
+    // collide on the temp-capture files and corrupt each other's state (observed crash: torn FString read in
+    // the output-read phase). Reject the nested call rather than run it re-entrantly.
+    if (bIsExecuting)
+    {
+        MCP_LOG_WARNING("execute_python re-entered on the game thread (an executed script pumped the tick) — rejecting the nested call");
+        return CreateErrorResponse(TEXT("execute_python is already running on this thread (re-entrant call rejected). An executed script pumped the game thread (e.g. save/compile) while another command was in flight; serialize your calls or avoid pumping mid-script."));
+    }
+    TGuardValue<bool> ExecutingGuard(bIsExecuting, true);
+
     // Check if we have code or file parameter
     FString PythonCode;
     FString PythonFile;

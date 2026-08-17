@@ -237,7 +237,15 @@ void FUnrealMCPModule::ExtendLevelEditorToolbar()
         );
         MCP_LOG_INFO("MCP Server entry added to Window menu");
     }
-    
+
+    // Auto-start the MCP server on launch if enabled in settings, so there is no need
+    // to click the toolbar button each session.
+    if (GetDefault<UMCPSettings>()->bAutoStartServer)
+    {
+        MCP_LOG_INFO("Auto-start enabled - starting MCP server");
+        StartServer();
+    }
+
     bToolbarExtended = true;
 }
 
@@ -481,10 +489,11 @@ void FUnrealMCPModule::StartServer()
 	MCP_LOG_WARNING("Creating new server instance");
 	const UMCPSettings* Settings = GetDefault<UMCPSettings>();
 	
-	// Create a config object and set the port from settings
+	// Create a config object and set the port and bind address from settings
 	FMCPTCPServerConfig Config;
 	Config.Port = Settings->Port;
-	
+	Config.BindAddress = Settings->BindAddress;
+
 	// Create the server with the config
 	Server = MakeUnique<FMCPTCPServer>(Config);
 	

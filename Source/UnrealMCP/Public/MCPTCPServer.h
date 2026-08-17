@@ -7,6 +7,7 @@
 #include "Sockets.h"
 #include "SocketSubsystem.h"
 #include "MCPConstants.h"
+#include "Containers/Queue.h"
 
 /**
  * Configuration struct for the TCP server
@@ -16,7 +17,10 @@ struct FMCPTCPServerConfig
 {
     /** Port to listen on */
     int32 Port = MCPConstants::DEFAULT_PORT;
-    
+
+    /** Address to bind to. Empty = all interfaces (0.0.0.0). */
+    FString BindAddress;
+
     /** Client timeout in seconds */
     float ClientTimeoutSeconds = MCPConstants::DEFAULT_CLIENT_TIMEOUT_SECONDS;
     
@@ -46,6 +50,14 @@ struct FMCPClientConnection
     
     /** Buffer for receiving data */
     TArray<uint8> ReceiveBuffer;
+
+    /** Default constructor — required for TQueue's sentinel node. Socket==nullptr, so ProcessClientData
+     *  skips it; never represents a live connection. */
+    FMCPClientConnection()
+        : Socket(nullptr)
+        , TimeSinceLastActivity(0.0f)
+    {
+    }
 
     /**
      * Constructor
@@ -232,7 +244,22 @@ protected:
     
     /** Client connections */
     TArray<FMCPClientConnection> ClientConnections;
-    
+
+    /**
+     * New connections are accepted on the FTcpListener's OWN thread (HandleConnectionAccepted), but
+     * ClientConnections is otherwise game-thread-only. Adding to it directly from the listener thread raced
+     * with the game-thread Tick's copy/iterate and corrupted the array (torn FMCPClientConnection read ->
+     * EXCEPTION_ACCESS_VIOLATION). The listener thread now only ENQUEUES here (lock-free); the game thread
+     * drains it into ClientConnections in ProcessPendingConnections, keeping that array single-threaded.
+     */
+    TQueue<FMCPClientConnection, EQueueMode::Mpsc> PendingConnectionQueue;
+
+    /** Per-socket inbound byte accumulator. A command may be split across TCP reads or exceed one
+     *  ReceiveBuffer; bytes are appended here until they parse as a complete JSON object, then the
+     *  entry is cleared. Keyed by client socket (stable across ticks; ProcessClientData iterates a
+     *  copy of ClientConnections, so this state must live on the server). Cleared on disconnect. */
+    TMap<FSocket*, TArray<uint8>> PartialMessages;
+
     /** Running flag */
     bool bRunning;
     

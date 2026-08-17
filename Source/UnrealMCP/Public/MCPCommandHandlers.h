@@ -182,4 +182,13 @@ public:
      * @return JSON response object
      */
     virtual TSharedPtr<FJsonObject> Execute(const TSharedPtr<FJsonObject>& Params, FSocket* ClientSocket) override;
+
+private:
+    /**
+     * Re-entrancy guard. Execute runs on the game thread and calls GEngine->Exec(python) synchronously.
+     * If the executed script pumps the game thread (e.g. save_asset / compile), FTSTicker can re-fire ->
+     * FMCPTCPServer::Tick -> a NESTED Execute. Two executions would share the temp-capture files and corrupt
+     * each other (crash: torn FString read in the output-read phase). Set true for the duration of a run.
+     */
+    bool bIsExecuting = false;
 }; 

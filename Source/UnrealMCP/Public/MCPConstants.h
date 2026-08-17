@@ -9,8 +9,12 @@ namespace MCPConstants
 {
     // Network constants
     constexpr int32 DEFAULT_PORT = 13377;
-    constexpr int32 DEFAULT_RECEIVE_BUFFER_SIZE = 65536; // 64KB buffer size
+    constexpr int32 DEFAULT_RECEIVE_BUFFER_SIZE = 65536; // 64KB per-Recv chunk size
     constexpr int32 DEFAULT_SEND_BUFFER_SIZE = DEFAULT_RECEIVE_BUFFER_SIZE;
+    // Upper bound on a single reassembled command. Inbound bytes are accumulated across reads until
+    // they parse as a complete JSON object; if a client sends more than this without a valid message,
+    // the buffer is discarded (guards against unbounded growth / malformed clients).
+    constexpr int32 MAX_PENDING_MESSAGE_BYTES = 16 * 1024 * 1024; // 16 MB
     constexpr float DEFAULT_CLIENT_TIMEOUT_SECONDS = 30.0f;
     constexpr float DEFAULT_TICK_INTERVAL_SECONDS = 0.1f;
     
