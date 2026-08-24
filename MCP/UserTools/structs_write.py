@@ -132,6 +132,47 @@ def register_tools(mcp, utils):
                   'PARAMS = _json.loads(_b64.b64decode("%s").decode("utf-8"))\n' % b64)
         return _query(header + body)
 
+    # --- Python-side TypeJson builders (host process, NOT snippet bodies) -------- #
+    # A field type is COMPLEX (needs the C++ add_struct_field_ex / change_struct_field_type
+    # TypeJson path) when it names an object/class/soft/interface/struct/enum category, OR
+    # carries a type_path, OR uses an array|set|map container. Bare scalars ("int", "float",
+    # "vector", ...) take the scalar fast-path (add_struct_field) or a bare-string retype.
+    _COMPLEX_STRUCT_CATS = {"object", "class", "softobject", "softclass", "interface",
+                            "struct", "enum"}
+
+    def _struct_type_is_complex(type_name, type_path, container):
+        if type_path:
+            return True
+        if container and str(container).lower() not in ("none", ""):
+            return True
+        if type_name and str(type_name).lower() in _COMPLEX_STRUCT_CATS:
+            return True
+        return False
+
+    def _build_struct_type_json(type_name, type_path, container, value_type=None,
+                                value_type_path=None):
+        """Assemble a TypeJson dict for add_struct_field_ex / change_struct_field_type."""
+        tj = {"category": type_name}
+        if type_path:
+            tj["type_path"] = type_path
+        cont = str(container).lower() if container else "none"
+        if cont not in ("none", ""):
+            tj["container"] = cont
+            if cont == "map" and value_type:
+                v = {"category": value_type}
+                if value_type_path:
+                    v["type_path"] = value_type_path
+                tj["value"] = v
+        return tj
+
+    def _retype_json(type_name, type_path, container, value_type, value_type_path):
+        """Retype payload for change_struct_field_type: dict (complex) | bare scalar str | None."""
+        if not type_name and not type_path:
+            return None
+        if type_path or (container and str(container).lower() not in ("none", "")):
+            return _build_struct_type_json(type_name, type_path, container, value_type, value_type_path)
+        return type_name
+
     # Shared Unreal-side helpers. No triple-single-quote / no backslash in this block.
     #   _ledger()          -> per-session undo stack (copied verbatim from editor_level.py).
     #   _struct_fields(o)   -> default member schema readback via MCPReflectionLibrary (hasattr-guarded).
@@ -307,26 +348,38 @@ else:
                  '"FLinearColor":"linearcolor"}\n')
 
     _ADD_STRUCT_FIELD_BODY = _SW_HELPERS + _CPP2TYPE + r'''
-struct_path = PARAMS["struct_path"]; field_name = PARAMS["field_name"]; type_name = PARAMS["type_name"]
+struct_path = PARAMS["struct_path"]; field_name = PARAMS["field_name"]
+type_name = PARAMS.get("type_name"); type_json = PARAMS.get("type_json")
+is_complex = bool(PARAMS.get("is_complex"))
 EAL = unreal.EditorAssetLibrary
 mrl = getattr(unreal, "MCPReflectionLibrary", None)
 obj = EAL.load_asset(struct_path)
 if obj is None or not isinstance(obj, unreal.UserDefinedStruct):
     print("@@UMCP@@" + json.dumps({"status": "error", "message": "not a UserDefinedStruct: %s" % struct_path}))
-elif mrl is None or not hasattr(mrl, "add_struct_field"):
+elif is_complex and (mrl is None or not hasattr(mrl, "add_struct_field_ex")):
+    print("@@UMCP@@" + json.dumps({"status": "error",
+        "message": "C++ handler add_struct_field_ex unavailable (plugin DLL predates the complex-add round; recompile needed)"}))
+elif (not is_complex) and (mrl is None or not hasattr(mrl, "add_struct_field")):
     print("@@UMCP@@" + json.dumps({"status": "error",
         "message": "C++ handler add_struct_field unavailable (plugin DLL predates C++ #4; recompile needed)"}))
 else:
-    res = json.loads(mrl.add_struct_field(obj, field_name, type_name))
+    if is_complex:
+        tj = type_json if isinstance(type_json, str) else json.dumps(type_json)
+        res = json.loads(mrl.add_struct_field_ex(obj, field_name, tj))
+    else:
+        res = json.loads(mrl.add_struct_field(obj, field_name, type_name))
     if isinstance(res, dict) and res.get("error"):
         print("@@UMCP@@" + json.dumps({"status": "error", "message": res.get("error")}))
     else:
         try: EAL.save_asset(struct_path, only_if_is_dirty=False)
         except Exception: pass
+        # Complex-add reuses the SAME ledger op as the scalar add -> inverse is C++ remove_struct_field
+        # (by friendly name), already folded into editor_level.undo. No new op for the complex path.
         _ledger().append({"op": "add_struct_field", "asset_path": struct_path, "field_name": field_name})
         print("@@UMCP@@" + json.dumps({"status": "success", "struct": res.get("struct"),
-            "added_field": field_name, "type": type_name, "field_count": res.get("field_count"),
-            "ledger_depth": len(_ledger())}))
+            "added_field": field_name, "type": (type_json if is_complex else type_name),
+            "complex": is_complex, "guid": res.get("guid"), "added_type": res.get("added_type"),
+            "field_count": res.get("field_count"), "ledger_depth": len(_ledger())}))
 '''
 
     _REMOVE_STRUCT_FIELD_BODY = _SW_HELPERS + _CPP2TYPE + r'''
@@ -415,24 +468,151 @@ else:
             "entry_count": res.get("entry_count"), "ledger_depth": len(_ledger())}))
 '''
 
+    # ------------------------------------------------------------------ #
+    # set_blueprint_struct_variable — modify member name/type/default/tooltip
+    # via the C++ #N handlers (rename/change_type/set_default/set_tooltip). Each sub-change
+    # ledgers its OWN reversible op capturing the prior from the handler's JSON return. Order:
+    # type -> default -> tooltip -> rename LAST (rename last keeps the name lookups valid; on
+    # LIFO undo the rename inverse runs FIRST, restoring the old name before the other inverses
+    # replay against it).
+    _SET_STRUCT_VAR_BODY = _SW_HELPERS + r'''
+struct_path = PARAMS["struct_path"]; name = PARAMS["name"]
+new_name = PARAMS.get("new_name"); type_json = PARAMS.get("type_json")
+has_default = bool(PARAMS.get("has_default")); default = PARAMS.get("default")
+tooltip = PARAMS.get("tooltip")
+EAL = unreal.EditorAssetLibrary
+mrl = getattr(unreal, "MCPReflectionLibrary", None)
+obj = EAL.load_asset(struct_path)
+if obj is None or not isinstance(obj, unreal.UserDefinedStruct):
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "not a UserDefinedStruct: %s" % struct_path}))
+elif mrl is None:
+    print("@@UMCP@@" + json.dumps({"status": "error",
+        "message": "MCPReflectionLibrary unavailable (plugin DLL predates the struct-edit round; recompile needed)"}))
+else:
+    changes = []; errors = []
+    if type_json is not None:
+        if not hasattr(mrl, "change_struct_field_type"):
+            errors.append("change_struct_field_type unavailable")
+        else:
+            tj = type_json if isinstance(type_json, str) else json.dumps(type_json)
+            r = json.loads(mrl.change_struct_field_type(obj, name, tj))
+            if isinstance(r, dict) and r.get("error"):
+                errors.append("type: " + str(r.get("error")))
+            else:
+                prior = r.get("prev_type")
+                _ledger().append({"op": "change_struct_field_type", "asset_path": struct_path,
+                                  "name": name, "prior_type_json": prior})
+                changes.append({"field": "type", "new_type": r.get("new_type"), "prev_type": prior})
+    if has_default:
+        if not hasattr(mrl, "set_struct_field_default"):
+            errors.append("set_struct_field_default unavailable")
+        else:
+            r = json.loads(mrl.set_struct_field_default(obj, name, default))
+            if isinstance(r, dict) and r.get("error"):
+                errors.append("default: " + str(r.get("error")))
+            else:
+                prior = r.get("prev_default")
+                _ledger().append({"op": "set_struct_field_default", "asset_path": struct_path,
+                                  "name": name, "prior_default": prior})
+                changes.append({"field": "default", "new_default": default, "prev_default": prior})
+    if tooltip is not None:
+        if not hasattr(mrl, "set_struct_field_tooltip"):
+            errors.append("set_struct_field_tooltip unavailable")
+        else:
+            r = json.loads(mrl.set_struct_field_tooltip(obj, name, tooltip))
+            if isinstance(r, dict) and r.get("error"):
+                errors.append("tooltip: " + str(r.get("error")))
+            else:
+                prior = r.get("prev_tooltip")
+                _ledger().append({"op": "set_struct_field_tooltip", "asset_path": struct_path,
+                                  "name": name, "prior_tooltip": prior})
+                changes.append({"field": "tooltip", "new_tooltip": tooltip, "prev_tooltip": prior})
+    if new_name is not None:
+        if not hasattr(mrl, "rename_struct_field"):
+            errors.append("rename_struct_field unavailable")
+        else:
+            r = json.loads(mrl.rename_struct_field(obj, name, new_name))
+            if isinstance(r, dict) and r.get("error"):
+                errors.append("rename: " + str(r.get("error")))
+            else:
+                old = r.get("old_name")
+                _ledger().append({"op": "rename_struct_field", "asset_path": struct_path,
+                                  "name": new_name, "prior_name": old})
+                changes.append({"field": "name", "new_name": new_name, "old_name": old})
+    if changes:
+        try: EAL.save_asset(struct_path, only_if_is_dirty=False)
+        except Exception: pass
+    status = "success" if (changes and not errors) else ("partial" if changes else "error")
+    print("@@UMCP@@" + json.dumps({"status": status, "struct_path": struct_path, "field": name,
+        "changes": changes, "errors": errors, "ledger_depth": len(_ledger())}))
+'''
+
     @mcp.tool()
-    def add_struct_field(ctx, struct_path: str, field_name: str, type_name: str) -> str:
-        """Add a member field to a UserDefinedStruct. REQUIRES the C++ #4 handler
-        (unreal.MCPReflectionLibrary.add_struct_field); returns a clear error on an older DLL.
+    def add_struct_field(ctx, struct_path: str, field_name: str, type_name: str,
+                         type_path: str = None, container: str = None,
+                         value_type: str = None, value_type_path: str = None) -> str:
+        """Add a member field to a UserDefinedStruct. REQUIRES the C++ handler
+        (unreal.MCPReflectionLibrary.add_struct_field / add_struct_field_ex); clear error on older DLL.
 
         struct_path: object/package path of the UserDefinedStruct asset.
         field_name:  friendly name for the new field (e.g. 'Health').
-        type_name:   one of (case-insensitive) bool | byte | int | int64 | float | name | string | text |
-                     vector | vector2d | rotator | transform | linearcolor.
+        type_name:   SCALAR (case-insensitive): bool | byte | int | int64 | float | name | string | text |
+                     vector | vector2d | rotator | transform | linearcolor -> scalar fast-path.
+                     COMPLEX category: object | class | softobject | softclass | interface | struct | enum
+                     (pair with type_path) -> routes to add_struct_field_ex.
+        type_path:   for complex categories, the referenced type, e.g. '/Script/Engine.Actor' (object),
+                     '/Game/.../MyStruct.MyStruct' (struct), '/Game/.../E_Kind.E_Kind' (enum).
+        container:   none | array | set | map. Any of array/set/map (even over a scalar element) is COMPLEX.
+        value_type / value_type_path: element type of a MAP's VALUE (container='map'); key type is type_name.
 
-        The new field is appended and renamed to field_name (its internal VarName carries a GUID suffix).
-        Saved after the edit. Verify with structs.describe_blueprint_struct.
+        Complex types route to the C++ add_struct_field_ex (returns guid + added_type); scalars keep the
+        add_struct_field fast-path. Saved after the edit. Verify with structs.describe_blueprint_struct.
 
-        Ledgered write op 'add_struct_field' {asset_path, field_name}. Inverse (in editor_level.undo):
-        remove_struct_field(field_name) -> FAITHFUL (removes exactly the field we added by name)."""
-        params = {"struct_path": struct_path, "field_name": field_name, "type_name": type_name}
+        Ledgered write op 'add_struct_field' {asset_path, field_name} — SAME op for scalar AND complex adds.
+        Inverse (already in editor_level.undo): remove_struct_field(field_name) -> FAITHFUL (removes exactly
+        the field we added, by name). The complex-add path introduces NO new ledger op."""
+        complex_ = _struct_type_is_complex(type_name, type_path, container)
+        type_json = (_build_struct_type_json(type_name, type_path, container, value_type, value_type_path)
+                     if complex_ else None)
+        params = {"struct_path": struct_path, "field_name": field_name, "type_name": type_name,
+                  "type_json": type_json, "is_complex": complex_}
         try:
             return json.dumps(_exec(_ADD_STRUCT_FIELD_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def set_blueprint_struct_variable(ctx, struct_path: str, name: str, new_name: str = None,
+                                      type: str = None, type_path: str = None, default: str = None,
+                                      tooltip: str = None, container: str = None,
+                                      value_type: str = None, value_type_path: str = None) -> str:
+        """Modify an existing UserDefinedStruct member: rename, retype, set default, and/or set tooltip.
+        REQUIRES the C++ struct-edit handlers (rename_struct_field / change_struct_field_type /
+        set_struct_field_default / set_struct_field_tooltip); each missing handler is reported per-field.
+
+        struct_path: object/package path of the UserDefinedStruct asset.
+        name:        CURRENT friendly name of the member to edit.
+        new_name:    optional new friendly name (rename is applied LAST so the other edits resolve 'name').
+        type/type_path/container/value_type/value_type_path: optional retype. 'type' is a scalar name OR a
+                     complex category (object/struct/enum/...); pair complex categories with type_path;
+                     container array|set|map wraps it; value_type(_path) is a map VALUE's element type.
+        default:     optional new default value (string form, e.g. '5', 'true', '1,2,3').
+        tooltip:     optional new tooltip text.
+
+        Each provided edit is applied in the order type -> default -> tooltip -> rename, and EACH ledgers
+        its OWN reversible op capturing the prior value returned by the handler. Saved after any change.
+
+        New ledger ops (folded into editor_level.undo):
+          - change_struct_field_type {asset_path, name, prior_type_json} -> inverse change_struct_field_type(name, prior_type_json)
+          - set_struct_field_default {asset_path, name, prior_default}    -> inverse set_struct_field_default(name, prior_default)
+          - set_struct_field_tooltip {asset_path, name, prior_tooltip}    -> inverse set_struct_field_tooltip(name, prior_tooltip)
+          - rename_struct_field {asset_path, name:new_name, prior_name}   -> inverse rename_struct_field(new_name, prior_name)"""
+        type_json = _retype_json(type, type_path, container, value_type, value_type_path)
+        params = {"struct_path": struct_path, "name": name, "new_name": new_name,
+                  "type_json": type_json, "has_default": (default is not None), "default": default,
+                  "tooltip": tooltip}
+        try:
+            return json.dumps(_exec(_SET_STRUCT_VAR_BODY, params), indent=2)
         except Exception as e:
             return f"Error: {e}"
 
@@ -487,6 +667,69 @@ else:
             return json.dumps(_exec(_REMOVE_ENUM_ENTRY_BODY, params), indent=2)
         except Exception as e:
             return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # create_blueprint_struct — create + add members atomically (thin wrapper)
+    # ------------------------------------------------------------------ #
+    @mcp.tool()
+    def create_blueprint_struct(ctx, name: str, package_path: str = "/Game/MCP_Scratch",
+                                members=None) -> str:
+        """Create a UserDefinedStruct and (optionally) add members atomically.
+
+        name:         asset name for the new struct (e.g. 'S_ItemInfo').
+        package_path: content directory (default '/Game/MCP_Scratch').
+        members:      optional list (or JSON string) of member dicts, each:
+                        {"name": <str>, "type": <scalar|complex category>, "type_path": <opt>,
+                         "container": <none|array|set|map, opt>, "value_type": <map value, opt>,
+                         "value_type_path": <opt>, "default": <opt>}
+
+        Thin wrapper: calls create_user_defined_struct (reuses the folded 'create_asset' undo op), then
+        loops add_struct_field (scalar or complex -> add_struct_field_ex; each ledgers 'add_struct_field',
+        inverse = C++ remove_struct_field) and, if a member has a 'default', set_blueprint_struct_variable.
+        NO new ledger op is introduced here — reuses create_asset + the field ops. NOTE: a fresh
+        UserDefinedStruct ships with one default bool member (MemberVar_0_<GUID>); requested members are
+        APPENDED after it."""
+        if isinstance(members, str):
+            try:
+                members = json.loads(members)
+            except Exception as e:
+                return json.dumps({"status": "error", "message": "members not valid JSON: %s" % e}, indent=2)
+        try:
+            created = json.loads(create_user_defined_struct(ctx, name, package_path))
+        except Exception as e:
+            return f"Error (create): {e}"
+        if not isinstance(created, dict) or created.get("status") != "success":
+            return json.dumps({"status": "error", "stage": "create", "detail": created}, indent=2)
+        asset_path = created.get("asset_path")
+        member_results = []
+        for m in (members or []):
+            if not isinstance(m, dict) or not m.get("name") or not m.get("type"):
+                member_results.append({"member": m, "status": "error",
+                                       "message": "each member needs at least 'name' and 'type'"})
+                continue
+            try:
+                ar = json.loads(add_struct_field(ctx, asset_path, m["name"], m["type"],
+                                                 type_path=m.get("type_path"), container=m.get("container"),
+                                                 value_type=m.get("value_type"),
+                                                 value_type_path=m.get("value_type_path")))
+            except Exception as e:
+                member_results.append({"member": m.get("name"), "status": "error", "message": str(e)})
+                continue
+            entry = {"member": m.get("name"), "add": ar}
+            if m.get("default") is not None:
+                try:
+                    entry["default"] = json.loads(
+                        set_blueprint_struct_variable(ctx, asset_path, m["name"], default=m.get("default")))
+                except Exception as e:
+                    entry["default_error"] = str(e)
+            member_results.append(entry)
+        return json.dumps({"status": "success", "asset_path": asset_path, "created": created,
+                           "members": member_results}, indent=2)
+
     # This module registers NO `undo` tool (editor_level.py owns the unified one). The 2 creates reuse the
-    # generic "create_asset" inverse; the 4 authoring tools add 4 new ops (add_struct_field/
-    # remove_struct_field/add_enum_entry/remove_enum_entry) whose inverses are folded into editor_level.undo.
+    # generic "create_asset" inverse; the authoring tools add ops (add_struct_field/remove_struct_field/
+    # add_enum_entry/remove_enum_entry) plus the struct-EDIT ops from set_blueprint_struct_variable
+    # (change_struct_field_type/set_struct_field_default/set_struct_field_tooltip/rename_struct_field),
+    # whose inverses are folded into editor_level.undo. The complex add_struct_field path REUSES the
+    # existing add_struct_field op (inverse C++ remove_struct_field) -> NO new op. create_blueprint_struct
+    # is a thin wrapper reusing create_asset + the field ops -> NO new op.

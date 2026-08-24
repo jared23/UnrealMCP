@@ -1083,20 +1083,42 @@ CATALOG = {
   "Motion": ["Tilt","RotationRate","Gravity","Acceleration"],
 }
 rows = []
-for c, keys in CATALOG.items():
-    if cat and cat != c.lower():
+_used_live = False
+_lib = getattr(unreal, "MCPReflectionLibrary", None)
+if _lib is not None and hasattr(_lib, "get_all_input_keys_json"):
+    try:
+        _live = json.loads(_lib.get_all_input_keys_json())
+        if isinstance(_live, dict) and _live.get("status") == "success":
+            for k in (_live.get("keys") or []):
+                if k.get("is_gamepad_key"):
+                    c = "Gamepad"
+                elif k.get("is_mouse_button"):
+                    c = "Mouse"
+                elif k.get("is_touch"):
+                    c = "Touch"
+                else:
+                    c = "Keyboard"
+                rows.append({"key": k.get("name"), "category": c, "display_name": k.get("display_name"),
+                             "is_analog": bool(k.get("is_analog")), "is_axis_2d": bool(k.get("is_axis_2d"))})
+            _used_live = True
+    except Exception:
+        rows = []; _used_live = False
+if not _used_live:
+    for c, keys in CATALOG.items():
+        for kn in keys:
+            rows.append({"key": kn, "category": c})
+frows = []
+for r in rows:
+    if cat and cat != str(r.get("category") or "").lower():
         continue
-    for kn in keys:
-        if flt and flt not in kn.lower():
-            continue
-        rows.append({"key": kn, "category": c})
-total = len(rows); window = rows[:max_results]
+    if flt and flt not in str(r.get("key") or "").lower():
+        continue
+    frows.append(r)
+total = len(frows); window = frows[:max_results]
 print("@@UMCP@@" + json.dumps({"status": "success", "total_matching": total, "returned": len(window),
-    "truncated": total > len(window), "categories": sorted(CATALOG.keys()), "keys": window,
-    "note": ("Curated canonical FKey catalog. UE 5.8 does NOT bind EKeys::GetAllKeys to Python (no "
-        "InputKeyManager/EKeys/InputCoreTypes on unreal.*), so this is a maintained standard-key list, "
-        "not a live registry dump; project-registered custom keys are not enumerated. Any name here is a "
-        "valid FKey for add_mapping_to_context / set_key_mapping.")}))
+    "truncated": total > len(window), "source": ("live_registry" if _used_live else "curated_fallback"),
+    "categories": sorted(CATALOG.keys()), "keys": window,
+    "note": ("Full live EKeys registry via MCPReflectionLibrary.GetAllInputKeysJson (includes project/plugin-registered keys)." if _used_live else "Curated canonical FKey fallback (C++ GetAllInputKeysJson unavailable in this plugin DLL); project-registered custom keys not enumerated.")}))
 '''
 
     @mcp.tool()

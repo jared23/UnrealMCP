@@ -527,3 +527,55 @@ else:
             return json.dumps(_exec(_GET_PID_BODY, params), indent=2)
         except Exception as e:
             return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # get_property_valid_types — classes assignable to an object/class    #
+    # property (C++-backed; read-only)                                    #
+    # ------------------------------------------------------------------ #
+    _VALID_TYPES_BODY = r'''
+import unreal, json
+rl = getattr(unreal, "MCPReflectionLibrary", None)
+if rl is None or not hasattr(rl, "get_property_valid_types_json"):
+    print("@@UMCP@@" + json.dumps({"status": "error",
+        "message": ("get_property_valid_types requires unreal.MCPReflectionLibrary.get_property_valid_types_json "
+                    "(rebuild the UnrealMCP plugin DLL with MCPReflection_SmallCats.cpp to enable it).")}))
+else:
+    try:
+        res = json.loads(rl.get_property_valid_types_json(PARAMS["class_name"], PARAMS["property_path"],
+            PARAMS.get("filter", ""), bool(PARAMS.get("include_abstract", False))))
+    except Exception as _e:
+        res = {"error": "handler raised: %s" % _e}
+    if isinstance(res, dict) and res.get("error"):
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": res.get("error")}))
+    else:
+        if isinstance(res, dict):
+            res["status"] = "success"
+        print("@@UMCP@@" + json.dumps(res))
+'''
+
+    @mcp.tool()
+    def get_property_valid_types(ctx, class_name: str, property_path: str,
+                                 filter: str = "", include_abstract: bool = False) -> str:
+        """List the classes assignable to an object/class-reference property. Read-only.
+
+        class_name:    the owning class -- bare name ('StaticMeshActor') or full path
+                       ('/Script/Engine.StaticMeshActor').
+        property_path: the property name, or a dotted path into a struct member ('Foo.Bar'). Must resolve to
+                       an FObjectProperty / FClassProperty / FSoftObjectProperty / FSoftClassProperty.
+        filter:        case-insensitive substring narrowing the concrete class names returned (empty = all).
+        include_abstract: include abstract classes among the concrete results (default False).
+
+        Resolves the property, derives the base class it accepts (PropertyClass for object/soft-object refs,
+        MetaClass for class/soft-class refs), reads the AllowedClasses / DisallowedClasses / MustImplement
+        metadata, then enumerates concrete UClasses IsChildOf the base (honoring those restrictions). This
+        FProperty type-graph walk is not reachable from stock Python, hence the C++ handler. Returns
+        {class, property, property_kind, is_meta_class, base_class, base_class_path, allowed_classes[],
+        disallowed_classes[], must_implement, valid_concrete_count, truncated, valid_concrete_classes:[{class,
+        path, is_abstract}]}. The concrete list is capped (truncated=true if exceeded -- tighten filter).
+        Needs the C++ handler (inert until the plugin DLL is rebuilt with MCPReflection_SmallCats.cpp)."""
+        params = {"class_name": class_name, "property_path": property_path,
+                  "filter": filter, "include_abstract": include_abstract}
+        try:
+            return json.dumps(_exec(_VALID_TYPES_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"

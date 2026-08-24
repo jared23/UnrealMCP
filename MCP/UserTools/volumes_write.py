@@ -271,7 +271,12 @@ def _descend(root, comp_name, path):
     #   back the realized extent from get_actor_bounds.
     _VOL_HELPERS = r'''
 def _resolve_class(cname):
+    # Prefer the reflected Python TYPE (issubclass/isinstance-friendly). For a full class path
+    # ("/Script/Engine.TriggerVolume") fall back to the short-name attr so we still get a real type;
+    # only if that misses do we use load_class (which returns a uClass instance, not a Python type).
     cls = getattr(unreal, cname, None)
+    if cls is None and "." in str(cname):
+        cls = getattr(unreal, str(cname).split(".")[-1], None)
     if cls is None:
         try:
             cls = unreal.load_class(None, cname)
@@ -607,5 +612,127 @@ else:
                   "unbound": unbound, "priority": priority}
         try:
             return json.dumps(_exec(_PPV_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # create_volume — spawn ANY AVolume subclass by class name/path       #
+    # ------------------------------------------------------------------ #
+    _CREATE_VOLUME_BODY = _VOL_PREFIX + r'''
+name = PARAMS["name"]
+loc = PARAMS.get("location") or [0, 0, 0]
+box_extent = PARAMS.get("box_extent")
+cpath = PARAMS["volume_class_path"]
+cls = _resolve_class(cpath)
+if cls is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "volume class unresolved: %s" % cpath}))
+else:
+    # Authoritative AVolume gate: spawn, then isinstance(actor, unreal.Volume). This works whether
+    # cls resolved to a Python type or a uClass instance (issubclass is unreliable on a uClass).
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    result = {"status": "error", "message": "spawn failed"}
+    with unreal.ScopedEditorTransaction("MCP create_volume"):
+        actor = _spawn(cls, loc, [0, 0, 0])
+        if actor is None:
+            result = {"status": "error", "message": "spawn returned None for %s" % cpath}
+        elif not isinstance(actor, unreal.Volume):
+            bad = actor.get_class().get_name()
+            eas.destroy_actor(actor)
+            result = {"status": "error",
+                      "message": "class is not an AVolume subclass: %s (resolved %s); no actor kept" % (cpath, bad)}
+        else:
+            actor.set_actor_label(name)
+            applied = _apply_box_extent(actor, box_extent)
+            root = _get_prop(actor, "root_component")
+            brush = _get_prop(actor, "brush_component")
+            uniq = actor.get_name()
+            _ledger().append({"op": "spawn_actor", "actor_name": uniq, "label": actor.get_actor_label()})
+            l = actor.get_actor_location()
+            result = {"status": "success", "name": uniq, "label": actor.get_actor_label(),
+                      "class": actor.get_class().get_name(),
+                      "requested_class": cpath,
+                      "root_component": (root.get_class().get_name() if root else None),
+                      "brush_component": (brush.get_class().get_name() if brush else None),
+                      "location": [l.x, l.y, l.z], "applied": applied,
+                      "ledger_depth": len(_ledger())}
+    print("@@UMCP@@" + json.dumps(result))
+'''
+
+    @mcp.tool()
+    def create_volume(ctx, name: str, volume_class_path: str, location: list = None,
+                      box_extent: list = None) -> str:
+        """Spawn an arbitrary AVolume subclass into the active level by class name or path — the
+        generic counterpart to the dedicated nav/blocking/trigger/post-process spawners.
+
+        name:              display label for the new volume (required).
+        volume_class_path: an AVolume subclass, as either a short unreal name ('TriggerVolume',
+                           'PhysicsVolume', 'AudioVolume', 'CullDistanceVolume', 'KillZVolume', ...)
+                           or a full class path ('/Script/Engine.TriggerVolume'). Rejected (no spawn)
+                           if it does not resolve to an unreal.Volume subclass.
+        location:          [x, y, z] world position (default [0,0,0]).
+        box_extent:        [x, y, z] half-extents (cm); the AVolume BrushComponent has no
+                           set_box_extent, so size is applied via actor scale (scale = extent/100,
+                           default brush half-extent 100). Realized size read back in
+                           'applied.result_bounds_extent'. Omit for the default 200x200x200 brush.
+
+        Ledgered write: recorded as spawn_actor so editor_level's `undo` deletes it (which reverts
+        the scale/config too)."""
+        params = {"name": name, "volume_class_path": volume_class_path,
+                  "location": location, "box_extent": box_extent}
+        try:
+            return json.dumps(_exec(_CREATE_VOLUME_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # validate_volume — READ: brush geometry of a placed volume           #
+    # ------------------------------------------------------------------ #
+    _VALIDATE_VOLUME_BODY = _VOL_PREFIX + r'''
+actor = _resolve_actor(PARAMS["actor_name"])
+if actor is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "actor not found: %s" % PARAMS["actor_name"]}))
+else:
+    is_vol = False
+    try:
+        is_vol = isinstance(actor, unreal.Volume)
+    except Exception:
+        is_vol = False
+    brush = _get_prop(actor, "brush_component")
+    root = _get_prop(actor, "root_component")
+    issues = []
+    warnings = []
+    if not is_vol:
+        issues.append("actor is not an AVolume subclass (class %s)" % actor.get_class().get_name())
+    if brush is None:
+        warnings.append("no brush_component found (unusual for an AVolume)")
+    ext = _bounds_extent(actor)
+    if ext is not None and (ext[0] <= 0.0 or ext[1] <= 0.0 or ext[2] <= 0.0):
+        issues.append("degenerate brush bounds (zero/negative extent): %s" % ext)
+    sc = None
+    try:
+        s = actor.get_actor_scale3d(); sc = [round(s.x, 4), round(s.y, 4), round(s.z, 4)]
+    except Exception:
+        sc = None
+    print("@@UMCP@@" + json.dumps({"status": "success", "actor": actor.get_name(),
+        "label": actor.get_actor_label(), "class": actor.get_class().get_name(),
+        "is_volume": is_vol,
+        "brush_component": (brush.get_class().get_name() if brush else None),
+        "root_component": (root.get_class().get_name() if root else None),
+        "bounds_extent": ext, "actor_scale3d": sc,
+        "valid": (len(issues) == 0), "issues": issues, "warnings": warnings}))
+'''
+
+    @mcp.tool()
+    def validate_volume(ctx, actor_name: str) -> str:
+        """READ / health-check a placed AVolume: confirms it is a Volume subclass, reports its
+        brush/root component classes, realized brush bounds extent, and actor scale; flags
+        non-volume actors and degenerate (zero/negative) brush bounds.
+
+        actor_name: actor label or unique name of the volume.
+
+        Read-only (not ledgered). 'valid' is False when a hard issue is present."""
+        params = {"actor_name": actor_name}
+        try:
+            return json.dumps(_exec(_VALIDATE_VOLUME_BODY, params), indent=2)
         except Exception as e:
             return f"Error: {e}"

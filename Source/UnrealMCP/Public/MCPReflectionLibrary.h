@@ -623,4 +623,643 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
     static FString SetEnvQueryNodeProperty(UEnvQuery* Query, const FString& NodeLocator, const FString& PropName, const FString& ValueJson);
+
+    // ==== C++ #17 2026-08-18 (input: full EKeys registry enumerator; defined in MCPReflection_Input.cpp) ====
+    /** Enumerate the FULL EKeys registry (InputCore) via EKeys::GetAllKeys. Per key {name, display_name,
+     *  is_gamepad_key, is_mouse_button, is_modifier_key, is_touch, is_axis_1d/2d/3d, is_analog, is_digital}.
+     *  Shape {"status":"success","count":N,"keys":[{...}]}. Read-only. Backs list_input_keys full-registry mode. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetAllInputKeysJson();
+
+    // ==== C++ #17 2026-08-18 (UserDefinedStruct member AUTHORING; defined in MCPReflection_Structs.cpp) ====
+    // Full member edit (rename/retype/default/tooltip) + complex-typed add via FStructureEditorUtils +
+    // FEdGraphPinType (both already Build.cs deps -> NO Build.cs change). Each returns {"status", ...}.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenameStructField(UUserDefinedStruct* Struct, const FString& FieldName, const FString& NewName);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ChangeStructFieldType(UUserDefinedStruct* Struct, const FString& FieldName, const FString& TypeJson);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStructFieldDefault(UUserDefinedStruct* Struct, const FString& FieldName, const FString& DefaultValue);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStructFieldTooltip(UUserDefinedStruct* Struct, const FString& FieldName, const FString& Tooltip);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddStructFieldEx(UUserDefinedStruct* Struct, const FString& FieldName, const FString& TypeJson);
+
+    // ==== C++ #18 2026-08-18 StateTree editor WRITERS + params/bindings/compile (MCPReflection_StateTree.cpp) ====
+    // C++ #19: GATING ed-link fix — roots UStateTreeEditorData via the real UStateTree::EditorData pointer so it
+    // survives GC (create_statetree calls this at end of creation). Idempotent. Returns {was_linked,linked,created}.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString EnsureStateTreeEditorData(UStateTree* StateTree);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateTreeNodePropertyJson(UStateTree* StateTree, const FString& StateName, const FString& NodeKind, int32 NodeIndex, const FString& PropertyName, const FString& NewValueText, const FString& Container);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateTreeTransitionPropertyJson(UStateTree* StateTree, const FString& StateName, int32 TransitionIndex, const FString& PropertyName, const FString& NewValueText);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateTreeComponentTreeJson(UObject* Component, const FString& PropertyName, UStateTree* NewStateTree, const FString& NewRefText);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateTreeColorJson(UStateTree* StateTree, const FString& StateName, const FString& ColorName, const FString& ColorGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetStateTreeParametersJson(UStateTree* StateTree);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddStateTreeParameter(UStateTree* StateTree, const FString& ParamName, const FString& TypeName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateTreeParameter(UStateTree* StateTree, const FString& ParamName, const FString& ValueText);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveStateTreeParameter(UStateTree* StateTree, const FString& ParamName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddStateTreeBinding(UStateTree* StateTree, const FString& SourceStructId, const FString& SourcePath, const FString& TargetStructId, const FString& TargetPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveStateTreeBinding(UStateTree* StateTree, const FString& TargetStructId, const FString& TargetPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CompileStateTree(UStateTree* StateTree);
+    // C++ #20 (2026-08-18): repair malformed editor nodes (empty Instance struct + zero ID) that Python
+    // import_text authoring leaves behind — THE real cause of the StateTree editor crash. Reallocs each
+    // node's Instance to match Node->GetInstanceDataType() (as the editor's ConditionalUpdateNodeInstanceData
+    // does) + assigns fresh GUIDs to unset node/state/transition IDs. Idempotent. Call before any save/compile.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RepairStateTreeNodes(UStateTree* StateTree);
+    // C++ #21 (2026-08-19): the last 3 StateTree spec features. Binding SOURCES reader (GetBindableStructs);
+    // task-completion binding (EditorBindings.AddTaskCompletionBinding); delegate dispatcher->listener binding
+    // (a property binding via AddPropertyBinding). Take these to statetree 100%.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetStateTreeBindingSourcesJson(UStateTree* StateTree, const FString& TargetStructId);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddStateTreeTaskCompletionBinding(UStateTree* StateTree, const FString& SourceTaskId, const FString& TargetStructId, const FString& TargetPath, const FString& Condition);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BindStateTreeDelegate(UStateTree* StateTree, const FString& DispatcherStructId, const FString& DispatcherPath, const FString& ListenerStructId, const FString& ListenerPath);
+
+    // C++ #22 (2026-08-19): gas RUNTIME reader — get_ability_system_info reads a live UAbilitySystemComponent
+    // (attributes/tags/abilities/active-effects). AddTestAbilitySystemComponent is test scaffolding so a live
+    // ASC can be created + verified over the bridge (project actors have none). See MCPReflection_GAS.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetAbilitySystemInfoJson(AActor* Actor);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddTestAbilitySystemComponent(AActor* Actor, const FString& LooseTag);
+
+    // C++ #23 (2026-08-19): BehaviorTree RUNTIME reader/control on a live UBehaviorTreeComponent in PIE.
+    // SpawnBehaviorTreeTestActor is the test fixture (spawn an AIController + RunBehaviorTree). See MCPReflection_BTRuntime.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBehaviorTreeRuntimeJson(AActor* Actor, bool bIncludeBlackboard);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ControlBehaviorTreeRuntimeJson(AActor* Actor, const FString& Action);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBehaviorTreeDynamicSubtreeJson(AActor* Actor, const FString& InjectTag, UBehaviorTree* Subtree);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SpawnBehaviorTreeTestActor(AActor* WorldContextActor, UBehaviorTree* BT);
+
+    // C++ #24 (2026-08-18): niagara graph/stack READERS (emitter/system graph modules, module inputs, node/pin
+    // detail, BFS wire trace, structural stack validation) + one reversible write (SetNiagaraModuleEnabled).
+    // All via the exported NiagaraEditor symbols — NO Build.cs change. See MCPReflection_Niagara2.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraModules(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, bool bIncludeInputs);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraModuleInputs(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, const FString& InputFilter);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraGraphNodes(const FString& SystemPath, const FString& EmitterName, const FString& Verbosity, const FString& TypeFilter);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraNodeInfo(const FString& SystemPath, const FString& EmitterName, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString TraceNiagaraConnection(const FString& SystemPath, const FString& EmitterName, const FString& NodeGuid, const FString& PinName, const FString& Direction, int32 MaxDepth);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ValidateNiagaraStack(const FString& SystemPath, const FString& EmitterName, const FString& MinSeverity);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraModuleEnabled(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, bool bEnabled);
+
+    // C++ #25 (2026-08-18): control-rig per-bone WEIGHTED bounds from a skeletal mesh's render data (to size/
+    // place rig controls & pole vectors). Engine-only, NO Build.cs change. See MCPReflection_ControlRig.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetSkeletalBoneBoundsJson(USkeletalMesh* Mesh, const FString& BoneFilter, const FString& WeightMode, int32 LODIndex, float MinWeight);
+
+    // C++ #26 (2026-08-18): niagara module-stack WRITERS #2 — reorder + input setters (dynamic input,
+    // stack local/linked value, float-curve keys). See MCPReflection_Niagara3.cpp. Reorder needs the
+    // MoveModule NIAGARAEDITOR_API export patch; the setters use only already-exported symbols.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ReorderNiagaraModule(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, int32 NewIndex);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraDynamicInput(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, const FString& InputName, const FString& DynamicInputScriptPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraStackValue(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, const FString& InputName, const FString& Mode, const FString& ValueOrParameter);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraCurve(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, const FString& InputName, const FString& KeysJson);
+    // Faithful inverse for the fresh-input setters: remove an input's override pin (dynamic input / linked / local / curve).
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ClearNiagaraInputOverride(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, const FString& InputName);
+
+    // C++ #29 (2026-08-18): get_niagara_particle_stats (live PIE UNiagaraComponent particle counts) + the
+    // CORRECTED reorder (ReorderNiagaraModuleV2 — safe index mapping, replaces the crashing ReorderNiagaraModule).
+    // See MCPReflection_Niagara5.cpp. No Build.cs / engine patch (reuses the MoveModule export patch).
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraParticleStatsJson(AActor* Actor, const FString& ComponentName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ReorderNiagaraModuleV2(const FString& SystemPath, const FString& EmitterName, const FString& ScriptUsage, const FString& ModuleName, int32 NewIndex);
+
+    // C++ #27 (2026-08-18): niagara GRAPH/SCRIPT authoring — scratch-pad + standalone module asset + graph node
+    // add/build/delete/layout on a standalone UNiagaraScript. See MCPReflection_Niagara4.cpp. No Build.cs / engine patch.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateNiagaraScratchPadModule(UNiagaraSystem* System, const FString& ScriptName, const FString& ScriptType);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateNiagaraModuleAsset(const FString& PackagePath, const FString& AssetName, const FString& ScriptType);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddNiagaraGraphNode(const FString& ScriptPath, const FString& NodeSpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BuildNiagaraGraph(const FString& ScriptPath, const FString& SpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteNiagaraGraphNode(const FString& ScriptPath, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString LayoutNiagaraGraph(const FString& ScriptPath, const FString& OptionsJson);
+
+    // C++ #28 (2026-08-18): Control Rig RUNTIME (eval-based) — instantiate a transient UControlRig, run its
+    // Forwards Solve, read the solved hierarchy. Reads + transient-only writes (no undo). Needs ControlRig in
+    // Build.cs. See MCPReflection_ControlRigRuntime.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetRigPoseJson(const FString& ControlRigPath, const FString& BonesCsv, float ThresholdCm);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString AnalyzeRigIoJson(const FString& ControlRigPath, int32 Frames, float DeltaTime);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString AnalyzeRigControlImpactJson(const FString& ControlRigPath, const FString& ControlsCsv, float OffsetCm);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ProfileRigJson(const FString& ControlRigPath, int32 Frames, float DeltaTime, int32 TopNodes);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString SimulateRigJson(const FString& ControlRigPath, const FString& AnimSequencePath, int32 Frames, float DeltaTime);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString StartRigMotionCaptureJson(const FString& ControlRigPath, int32 Frames, float DeltaTime);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetRigMotionReportJson(const FString& ControlRigPath);
+
+    // C++ #30 (2026-08-18): Control Rig PHYSICS/validation — transient-rig solve + geometry analysis; physics
+    // stepping rides the rig's own "Step Physics Solver" VM node (UE5.8: CR core no longer sims directly), so
+    // NO ControlRigPhysics/Chaos link + NO Build.cs change. See MCPReflection_ControlRigPhysics.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ValidateRigPhysicsJson(const FString& ControlRigPath, float DeviationThresholdCm);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ValidateRigDeformationJson(const FString& ControlRigPath, float ScaleTolerance, float ShearToleranceDeg);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString StartRigPhysicsProbeJson(const FString& ControlRigPath, const FString& Control, float ShakeCm, int32 SettleFrames);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetRigPhysicsProbeReportJson(const FString& ControlRigPath, float ResidualThresholdCm, int32 MaxBones);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString MeasureMeshPenetrationJson(const FString& ControlRigPath, const FString& ChainFilter, const FString& BodyFilter, float MarginCm);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString FitRigChainCollisionJson(const FString& ControlRigPath, const FString& ModuleName, float MarginCm, const FString& Shape);
+
+    // C++ #31 (2026-08-19, materials M5): Material Attribute Layers stack (set/get) on a MaterialInstance +
+    // base-Material graph comment add/remove. All ENGINE_API / public-member Engine calls -> NO Build.cs
+    // change, NO engine export patch. See MCPReflection_Materials.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetMaterialLayersJson(const FString& InstancePath, const FString& LayersJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString GetMaterialLayersJson(const FString& InstancePath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddMaterialCommentJson(const FString& MaterialPath, const FString& Text, int32 X, int32 Y, int32 SizeX, int32 SizeY, const FString& Color);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveMaterialCommentJson(const FString& MaterialPath, const FString& CommentName);
+
+    // C++ #32 (2026-08-19, blueprints B): SCS (Simple Construction Script) COMPONENT authoring on a Blueprint
+    // asset. Engine/UnrealEd only -> NO Build.cs change, NO export patch. See MCPReflection_BlueprintSCS.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintSCSJson(const FString& BlueprintPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddComponentToBlueprintJson(const FString& BlueprintPath, const FString& ComponentClass, const FString& ComponentName, const FString& ParentComponentName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintComponentPropertyJson(const FString& BlueprintPath, const FString& ComponentName, const FString& PropertyName, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteBlueprintComponentJson(const FString& BlueprintPath, const FString& ComponentName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ReparentBlueprintComponentJson(const FString& BlueprintPath, const FString& ComponentName, const FString& NewParentName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintRootComponentJson(const FString& BlueprintPath, const FString& ComponentName);
+
+    // C++ #33 (2026-08-19, blueprints C-core): K2 graph reader + node primitives (add/connect/set-pin/break/
+    // delete/set-prop) + compile. BlueprintGraph/UnrealEd only -> NO Build.cs change. See MCPReflection_BlueprintGraph.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintGraphJson(const FString& BlueprintPath, const FString& GraphName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString SearchBlueprintNodesJson(const FString& BlueprintPath, const FString& GraphName, bool bWithPins);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString DescribeBlueprintNodeJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddBlueprintNodeJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeSpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ConnectBlueprintNodesJson(const FString& BlueprintPath, const FString& GraphName, const FString& FromGuid, const FString& FromPin, const FString& ToGuid, const FString& ToPin);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintPinDefaultJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, const FString& PinName, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BreakBlueprintNodeLinkJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, const FString& PinName, const FString& OtherGuid, const FString& OtherPin);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteBlueprintNodeJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintNodePropertyJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, const FString& PropertyName, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CompileBlueprintByPath(const FString& BlueprintPath);
+
+    // C++ #34 (2026-08-19, blueprints D): Blueprint FUNCTION + EVENT-GRAPH authoring. BlueprintGraph/UnrealEd
+    // only -> NO Build.cs change, NO export patch. See MCPReflection_BlueprintFunc.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateBlueprintFunctionGraphJson(const FString& BlueprintPath, const FString& FunctionName, const FString& ReturnTypeJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddFunctionInputJson(const FString& BlueprintPath, const FString& FunctionName, const FString& PinName, const FString& TypeJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddFunctionOutputJson(const FString& BlueprintPath, const FString& FunctionName, const FString& PinName, const FString& TypeJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetFunctionPropertiesJson(const FString& BlueprintPath, const FString& FunctionName, const FString& PropsJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateLocalVariableJson(const FString& BlueprintPath, const FString& FunctionName, const FString& VarName, const FString& TypeJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteBlueprintFunctionJson(const FString& BlueprintPath, const FString& FunctionName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString OverrideBlueprintFunctionJson(const FString& BlueprintPath, const FString& FunctionName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateEventGraphJson(const FString& BlueprintPath, const FString& GraphName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenameEventGraphJson(const FString& BlueprintPath, const FString& OldName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteEventGraphJson(const FString& BlueprintPath, const FString& GraphName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddEventDispatcherInputJson(const FString& BlueprintPath, const FString& DispatcherName, const FString& PinName, const FString& TypeJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveFunctionPinJson(const FString& BlueprintPath, const FString& FunctionName, const FString& PinName, bool bIsOutput);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveLocalVariableJson(const FString& BlueprintPath, const FString& FunctionName, const FString& VarName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveEventDispatcherInputJson(const FString& BlueprintPath, const FString& DispatcherName, const FString& PinName);
+
+    // C++ #35 (2026-08-19, blueprints C): graph-builders + typed-asset creators + type-registry + var-flag setter.
+    // BlueprintGraph/UnrealEd/Engine/AssetRegistry (all deps) -> NO Build.cs change. See MCPReflection_BlueprintMisc.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BuildBlueprintGraphJson(const FString& BlueprintPath, const FString& GraphName, const FString& SpecJson, const FString& Mode);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ArrangeBlueprintGraphJson(const FString& BlueprintPath, const FString& GraphName, const FString& OptionsJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateBlueprintInterfaceJson(const FString& Name, const FString& Path);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateTypedBlueprintJson(const FString& Name, const FString& Path, const FString& ParentClass, const FString& BlueprintType);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetTypeRegistryJson(const FString& Kind, const FString& Query, bool bIncludeEngine, int32 Max);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintVariableFlagsJson(const FString& BlueprintPath, const FString& VariableName, const FString& FlagsJson);
+
+    // C++ #36 (2026-08-19): EQS RUNTIME executor — run a UEnvQuery in a live PIE world, return scored items.
+    // PIE-gated (editor world does not tick EQS). AIModule dep -> NO Build.cs change. See MCPReflection_EQS.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString RunEnvQueryJson(UEnvQuery* Query, AActor* Querier, const FString& RunMode, int32 MaxItems);
+
+    // C++ #37 (2026-08-19, widgets W-B): UMG widget-tree ops + named slots + property bindings. Extends C++ #8
+    // (RootWidget/bIsVariable/Bindings/INamedSlotInterface/ReplaceWidgets -- all python-refused). UMG+UMGEditor
+    // already deps -> NO Build.cs change. See MCPReflection_Widgets.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenameWidgetJson(const FString& WidgetBlueprintPath, const FString& OldName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetRootWidgetJson(const FString& WidgetBlueprintPath, const FString& WidgetName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetWidgetIsVariableJson(const FString& WidgetBlueprintPath, const FString& WidgetName, bool bIsVariable);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ReplaceWidgetJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& NewClass);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString WrapWidgetJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& PanelClass);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListNamedSlotsJson(const FString& WidgetBlueprintPath, const FString& WidgetName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNamedSlotContentJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& SlotName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNamedSlotContentJson(const FString& WidgetBlueprintPath, const FString& HostWidgetName, const FString& SlotName, const FString& ContentWidgetName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ClearNamedSlotJson(const FString& WidgetBlueprintPath, const FString& HostWidgetName, const FString& SlotName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddPropertyBindingJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& PropertyName, const FString& FunctionName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemovePropertyBindingJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& PropertyName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListPropertyBindingsJson(const FString& WidgetBlueprintPath);
+
+    // C++ #38 (2026-08-19, widget ANIMATIONS W-C): UWidgetAnimation CRUD + MovieScene possessable bindings /
+    // property tracks / channel keys. Adds MovieScene + MovieSceneTracks Build.cs deps. See MCPReflection_WidgetAnim.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateWidgetAnimationJson(const FString& WidgetBlueprintPath, const FString& AnimName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListWidgetAnimationsJson(const FString& WidgetBlueprintPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveWidgetAnimationJson(const FString& WidgetBlueprintPath, const FString& AnimName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimationWidgetBindingJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimationWidgetBindingJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimationTrackJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName, const FString& TrackType);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimationKeyJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName, const FString& TrackType, float TimeSeconds, float Value, int32 ChannelIndex, const FString& Interp);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListAnimationTracksJson(const FString& WidgetBlueprintPath, const FString& AnimName);
+    // Reversal handlers for the add_track/add_key undo (MCPReflection_WidgetAnim.cpp).
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimationTrackJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName, const FString& TrackType);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimationKeyJson(const FString& WidgetBlueprintPath, const FString& AnimName, const FString& WidgetName, const FString& TrackType, int32 ChannelIndex, float TimeSeconds);
+
+    // C++ #39 (2026-08-19, widget UI-COMPONENTS W-E, UE5.8 beta): attach/detach/list a UUIComponent on a WBP widget
+    // via FUIComponentUtils (UMGEditor). NO Build.cs change. See MCPReflection_WidgetUIComp.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddUIComponentJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& ComponentClass);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveUIComponentJson(const FString& WidgetBlueprintPath, const FString& WidgetName, const FString& ComponentClass);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListUIComponentsJson(const FString& WidgetBlueprintPath);
+
+    // C++ #40 (2026-08-19, widgets W-D): UMG Model-View-ViewModel authoring via the exported UMVVMEditorSubsystem.
+    // Requires the beta ModelViewViewModel plugin ENABLED + Build.cs += ModelViewViewModel/Blueprint/Editor.
+    // NO engine export patch. See MCPReflection_WidgetMVVM.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetMvvmViewmodelsJson(const FString& WidgetBlueprintPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddMvvmViewmodelJson(const FString& WidgetBlueprintPath, const FString& ViewModelClassPath, const FString& DesiredName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveMvvmViewmodelJson(const FString& WidgetBlueprintPath, const FString& ViewModelName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenameMvvmViewmodelJson(const FString& WidgetBlueprintPath, const FString& OldName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetMvvmViewmodelSettingsJson(const FString& WidgetBlueprintPath, const FString& ViewModelName, const FString& SettingsJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetMvvmBindingsJson(const FString& WidgetBlueprintPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddMvvmBindingJson(const FString& WidgetBlueprintPath, const FString& SpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetMvvmBindingJson(const FString& WidgetBlueprintPath, const FString& BindingId, const FString& SpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveMvvmBindingJson(const FString& WidgetBlueprintPath, const FString& BindingId);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetMvvmConversionFunctionsJson(const FString& WidgetBlueprintPath, const FString& NameFilter, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetVariableFieldNotifyJson(const FString& BlueprintPath, const FString& VariableName, bool bEnable);
+
+    // C++ #41 (2026-08-19, small-cats sweep): console-object info + project-settings set/persist + search +
+    // data-asset property valid-types. All Core/CoreUObject/DeveloperSettings (already deps) -> NO Build.cs change.
+    // See MCPReflection_SmallCats.cpp.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetConsoleObjectInfoJson(const FString& Name);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetDeveloperSettingJson(const FString& SettingsClassName, const FString& PropertyPath, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString SearchProjectSettingsJson(const FString& Filter, const FString& Container);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetPropertyValidTypesJson(const FString& ClassName, const FString& PropertyPath, const FString& Filter, bool bIncludeAbstract);
+
+    // ==== C++ #18 2026-08-18 anim skeleton-SLOT registry + editor outliner FOLDERS (MCPReflection_AnimSkelEditor.cpp) ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetSkeletonSlotsJson(USkeleton* Skeleton);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddSkeletonSlot(USkeleton* Skeleton, const FString& SlotName, const FString& GroupName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveSkeletonSlot(USkeleton* Skeleton, const FString& SlotName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenameSkeletonSlot(USkeleton* Skeleton, const FString& OldName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddSkeletonSlotGroup(USkeleton* Skeleton, const FString& GroupName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveSkeletonSlotGroup(USkeleton* Skeleton, const FString& GroupName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateOutlinerFolder(const FString& FolderPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteOutlinerFolder(const FString& FolderPath);
+
+    // ==== C++ #18 2026-08-18 AnimGraph state-machine + nodes/layers (MCPReflection_AnimGraph.cpp) — ISOLATED; needs Build.cs AnimGraph/AnimGraphRuntime ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimStateMachine(UAnimBlueprint* AnimBlueprint, const FString& MachineName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimState(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& StateName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimTransition(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& FromState, const FString& ToState);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetAnimEntryState(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& StateName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetAnimStateMachineJson(UAnimBlueprint* AnimBlueprint, const FString& MachineName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimState(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& StateName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimTransition(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& FromState, const FString& ToState);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetAnimTransitionProperty(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& FromState, const FString& ToState, const FString& PropName, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BuildAnimStateMachine(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& SpecJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetAnimNodePinExposure(UAnimBlueprint* AnimBlueprint, const FString& NodeGuid, const FString& PropertyName, bool bExpose);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BindAnimNodeFunction(UAnimBlueprint* AnimBlueprint, const FString& NodeGuid, const FString& BindingSlot, const FString& FunctionName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddAnimLayer(UAnimBlueprint* AnimBlueprint, const FString& LayerName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateAnimLayerInterface(const FString& PackagePath, const FString& AssetName);
+
+    // ==== C++ #19 2026-08-18 batch — Blueprint interfaces + var-flags (MCPReflection_BlueprintExt.cpp),
+    //      AnimGraph removers (MCPReflection_AnimRemove.cpp), Niagara renderer/emitter (MCPReflection_NiagaraExt.cpp).
+    //      NO Build.cs change (all modules already deps). EnsureStateTreeEditorData decl is up in the StateTree block. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ImplementBlueprintInterface(UBlueprint* Blueprint, const FString& InterfacePath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveBlueprintInterface(UBlueprint* Blueprint, const FString& InterfacePath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListBlueprintInterfaces(UBlueprint* Blueprint);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintVariableFlagsJson(UBlueprint* Blueprint, const FString& VarName);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimStateMachineNode(UAnimBlueprint* AnimBP, const FString& MachineName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveAnimLayerNode(UAnimBlueprint* AnimBP, const FString& LayerName);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraRendererProperty(const FString& SystemPath, const FString& EmitterName, int32 RendererIndex, const FString& PropertyName, const FString& ValueJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetNiagaraRendererBinding(const FString& SystemPath, const FString& EmitterName, int32 RendererIndex, const FString& BindingName, const FString& SourceValue);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DuplicateNiagaraEmitterHandle(UNiagaraSystem* System, const FString& EmitterName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ReorderNiagaraEmitterHandle(UNiagaraSystem* System, const FString& EmitterName, int32 NewIndex);
+
+    // ==== C++ #42 2026-08-19 (WORLD "C++-A infra ext"): editor modes + world-partition settings/grid/build +
+    //      navigation build status (MCPReflection_WorldExt.cpp). All reach objects with NO BlueprintCallable /
+    //      reflected Python surface in 5.8: the live UWorldPartition is unreachable from editor Python (C++ path
+    //      GEditor->GetEditorWorldContext().World()->GetWorldPartition()); editor modes go through the non-UFUNCTION
+    //      global FEditorModeTools (GLevelEditorModeTools()); nav build-status funcs are not UFUNCTIONs. Modules:
+    //      UnrealEd (GLevelEditorModeTools + UAssetEditorSubsystem) + EditorFramework (FEditorModeInfo/EM_Default) +
+    //      Engine (UWorldPartition) + NavigationSystem — EditorFramework & NavigationSystem are PUBLIC deps of
+    //      UnrealEd so they link transitively -> NO Build.cs change strictly required, NO engine export patch.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListEditorModesJson();
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetEditorModeJson(const FString& ModeId);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetWorldPartitionSettingsJson();
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetWorldPartitionSettingsJson(const FString& SettingsJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetRuntimeGridJson(const FString& GridJson);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString BuildWorldPartitionJson(const FString& Builder);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString NavigationBuildStatusJson();
+
+    // ==== C++ #43 2026-08-19 LANDSCAPE / terrain edit-data BRIDGE (MCPReflection_Landscape.cpp) ====
+    // Landscape has NO reflected Python authoring surface in UE 5.8 — ALandscapeProxy::Import and the
+    // FLandscapeEditDataInterface / FHeightmapAccessor / TAlphamapAccessor edit-data path are C++-only.
+    // ALL required symbols are LANDSCAPE_API-exported (or header-only templates) -> NO engine export patch;
+    // Build.cs += "Landscape" (runtime module) ONLY. Height/weight arrays cross the boundary as base64 of
+    // raw little-endian uint16 (heights, row-major W*H) / uint8 (weights). All handlers are #if WITH_EDITOR,
+    // null/bounds-guarded, JSON returns. Section math is done HOST-SIDE in Python (landscape_write.py).
+    //   Height encoding: uint16 H; LocalZ = (H-32768)/128; WorldZ = LocalZ*ActorScaleZ. Flat = 32768.
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateLandscapeJson(const FString& Name, const FString& TransformJson, const FString& ConfigJson, const FString& HeightDataB64);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString LandscapeGetInfoJson(const FString& ActorName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString LandscapeGetHeightRegionJson(const FString& ActorName, int32 X, int32 Y, int32 W, int32 H);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString LandscapeSetHeightRegionJson(const FString& ActorName, int32 X, int32 Y, int32 W, int32 H, const FString& HeightDataB64, bool bReturnPrior);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString LandscapePaintWeightRegionJson(const FString& ActorName, const FString& LayerName, int32 X, int32 Y, int32 W, int32 H, const FString& WeightDataB64, const FString& LayerInfoAssetPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ValidateLandscapeJson(const FString& ActorName);
+
+    // ==== C++ #44 2026-08-19 (debug category, Wave 1+2): Blueprint DEBUGGER — breakpoints / pin-watches /
+    // debug-object / runtime state / execution-trace / call-stack / live-value inspection (MCPReflection_Debug.cpp).
+    // All via UNREALED_API FKismetDebugUtilities + ENGINE_API UBlueprint debug accessors -> NO Build.cs change,
+    // NO engine export patch. node_id == the node's NodeGuid string. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintBreakpointJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, bool bEnabled);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveBlueprintBreakpointJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, bool bAll);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListBlueprintBreakpointsJson(const FString& BlueprintPath, const FString& Filter, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintPinWatchJson(const FString& BlueprintPath, const FString& GraphName, const FString& NodeGuid, const FString& PinName, bool bRemove);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListBlueprintPinWatchesJson(const FString& BlueprintPath, bool bValues, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlueprintDebugObjectJson(const FString& BlueprintPath, const FString& Instance, bool bClear);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListBlueprintDebugObjectsJson(const FString& BlueprintPath, const FString& Filter, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintDebugStateJson(const FString& Detail);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintExecutionTraceJson(const FString& BlueprintPath, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetBlueprintCallStackJson(int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString InspectBlueprintDebugValueJson(const FString& BlueprintPath, const FString& Path, const FString& Filter, int32 Depth, int32 MaxResults);
+
+    // ==== C++ #45 2026-08-19 (debug category, Wave 4): BehaviorTree BREAKPOINTS on the editor graph
+    // (MCPReflection_BTDebug.cpp). State = the PUBLIC TRANSIENT bitfields bHasBreakpoint/bIsBreakpointEnabled
+    // on UBehaviorTreeGraphNode (NOT UPROPERTY, NOT saved -> list is empty after editor restart by design).
+    // NO Build.cs change (AIModule/AIGraph/BehaviorTreeEditor already deps, proven by C++ #11); NO export patch.
+    // node_id == runtime NodeName (matches get_behavior_tree_info). ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBTBreakpointJson(const FString& BehaviorTreePath, const FString& NodeId, bool bEnabled);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemoveBTBreakpointJson(const FString& BehaviorTreePath, const FString& NodeId, bool bAll);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListBTBreakpointsJson(const FString& BehaviorTreePath, int32 MaxResults);
+
+    // ==== C++ #46 2026-08-19 (mutable Wave 3): CustomizableObject SOURCE-GRAPH reader + node primitives
+    // (MCPReflection_Mutable.cpp). Source reached via GetPrivate()->GetSource() (both CUSTOMIZABLEOBJECT_API,
+    // public) -> NO engine export patch. Node/schema classes are MinimalAPI but their methods are UE_API
+    // (CUSTOMIZABLEOBJECTEDITOR_API): AllocateDefaultPins/ReconstructNode/DestroyNode + TryCreateConnection/
+    // Break*. Build.cs += CustomizableObject (Runtime) + CustomizableObjectEditor (UncookedOnly). Graph edits
+    // do NOT compile the CO -> call compile_customizable_object separately. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetMutableGraphJson(const FString& CoPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetMutableNodeJson(const FString& CoPath, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddMutableNodeJson(const FString& CoPath, const FString& NodeClass, float X, float Y);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ConnectMutableNodesJson(const FString& CoPath, const FString& FromGuid, const FString& FromPin, const FString& ToGuid, const FString& ToPin);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DisconnectMutablePinJson(const FString& CoPath, const FString& NodeGuid, const FString& PinName, const FString& OtherGuid, const FString& OtherPin);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString DeleteMutableNodeJson(const FString& CoPath, const FString& NodeGuid);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetMutableNodePropertyJson(const FString& CoPath, const FString& NodeGuid, const FString& PropertyName, const FString& ValueJson);
+
+    // ==== C++ #47 2026-08-19 (AUDIO C++-only: MetaSound DISCOVERY #1-4 + SoundSubmix parent WRITER #38;
+    // MCPReflection_AudioCpp.cpp). MetaSound node classes are frontend-registry entries (NOT UClasses) so Python
+    // can't enumerate them; the search/registry singletons are C++-only. Submix parent_submix/child_submixes are
+    // EditConst (Python-refused) -> C++ calls the public ENGINE_API SetParentSubmix. Build.cs += "MetasoundFrontend"
+    // (all symbols METASOUNDFRONTEND_API -> NO export patch). Discovery = reads; set_submix_parent = ledgered write. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString SearchMetaSoundNodesJson(const FString& Filter, const FString& Category, int32 MaxResults);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString DescribeMetaSoundNodeJson(const FString& Namespace, const FString& Name, const FString& Variant);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListMetaSoundDataTypesJson(const FString& Filter);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListMetaSoundInterfacesJson(const FString& Filter);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetSubmixParentJson(const FString& SubmixPath, const FString& ParentPath);
+
+    // ==== C++ #48 2026-08-19 (PCG Wave 5, FINAL PCG slice): graph-parameter SCHEMA authoring +
+    // dynamic-input-pin editing (MCPReflection_PCG.cpp). UPCGGraph.UserParameters is a reflected
+    // FInstancedPropertyBag but unreal.InstancedPropertyBag exposes NO add/remove/rename-property surface;
+    // UPCGSettingsWithDynamicInputs::OnUserAdd/RemoveDynamicInputPin are WITH_EDITOR PCG_API with no reflected
+    // surface -> both are C++-only. SCHEMA via UPCGGraph::AddUserParameters / UpdateUserParametersStruct(Bag ->
+    // RemovePropertyByName) / RenameUserParameter (all PCG_API); enum via GetUserParametersStruct()->
+    // GetPropertyBagStruct()->GetPropertyDescs(). Dynamic pins via OnUserAdd/RemoveDynamicInputPin GUARDED by
+    // CanUserRemoveDynamicInputPin (the remove has check() asserts). Build.cs += "PCG" (RUNTIME module; all
+    // symbols PCG_API) -> NO engine export patch. PropertyBag types are in CoreUObject (already a dep). Schema
+    // does NOT duplicate Wave-3 PCGGraphParametersHelpers (which does typed VALUE get/set on the same bag). ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListPCGGraphParametersJson(const FString& GraphPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetPCGGraphParameterJson(const FString& GraphPath, const FString& Name);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddPCGGraphParameterJson(const FString& GraphPath, const FString& Name, const FString& Type);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemovePCGGraphParameterJson(const FString& GraphPath, const FString& Name);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RenamePCGGraphParameterJson(const FString& GraphPath, const FString& OldName, const FString& NewName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString AddPCGDynamicInputPinJson(const FString& GraphPath, const FString& NodeName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RemovePCGDynamicInputPinJson(const FString& GraphPath, const FString& NodeName, int32 PinIndex);
+
+    // ==== C++ #49 2026-08-19 (control rig, LAST CR pair): Control Rig editor PREVIEW-animation play/stop
+    // (MCPReflection_ControlRigPreview.cpp). The CR editor preview mesh is a UDebugSkelMeshComponent (UnrealEd,
+    // public) in an EditorPreview world whose UAnimPreviewInstance (AnimGraph, public) drives single-node
+    // playback -- found via TObjectIterator (NO private FControlRigEditor toolkit headers). CR editor opens
+    // headless in this build. play<->stop = natural non-ledgered inverse pair. UnrealEd(public)+AnimGraph(#18
+    // private) already deps -> NO Build.cs change, NO export patch. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString PlayRigPreviewAnimationJson(const FString& PreviewMeshPath, const FString& AnimPath, float PlayRate, bool bLooping);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString StopRigPreviewAnimationJson(const FString& PreviewMeshPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetRigPreviewStateJson(const FString& PreviewMeshPath);
+
+    // ==== C++ #50 2026-08-19 (niagara, LAST niagara verb): stack-issue list + auto-fix
+    // (MCPReflection_NiagaraStack.cpp). Niagara stack issues are FStackIssue on UNiagaraStackEntry entries
+    // of the editor's UNiagaraStackViewModel(s); each fix is an FStackIssueFixDelegate (simple delegate).
+    // Reached via TObjectIterator once the caller opens the system editor (asset editors open headless).
+    // Niagara+NiagaraEditor already deps (#5). fix = repair op -> NON-LEDGERED. ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetNiagaraStackIssuesJson(const FString& SystemPath);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString FixNiagaraStackIssueJson(const FString& SystemPath, const FString& IssueIdentifier, int32 FixIndex, bool bFixAll);
+
+    // ==== C++ #51 2026-08-20 (pcg, EXECUTION INSPECTION): the ~13-feature blocked group, now feasible.
+    // (MCPReflection_PCGInspection.cpp). Not blocked: PCG_PROFILING_ENABLED == 1 whenever WITH_EDITOR
+    // (PCGCommon.h), so FPCGGraphExecutionInspection exists; every method on it is PCG_API. Reached from a
+    // UPCGComponent via Comp->GetExecutionState().GetInspection() (IPCGGraphExecutionState, PCG_API). Handlers
+    // take an ACTOR path (resolve actor in the editor world -> FindComponentByClass<UPCGComponent>, Wave-4 style).
+    // GetExecutedNodeStacks() hands us every (UPCGNode*, FPCGStack) pair after a generation (never construct a
+    // stack). All are transient runtime reads / enable-disable-clear -> NON-LEDGERED, NO editor_level.undo folds
+    // (enable<->disable natural pair; clear idempotent) -> ZERO undo risk. Build.cs already has "PCG" (Wave-5). ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetPCGInspectionEnabledJson(const FString& ActorPath, bool bEnable);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetPCGInspectionJson(const FString& ActorPath, const FString& NodeName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString InspectPCGNodeOutputJson(const FString& ActorPath, const FString& NodeName);
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ClearPCGInspectionJson(const FString& ActorPath);
 };

@@ -452,6 +452,93 @@ else:
             return json.dumps(_exec(_SET_CVAR_BODY, {"name": name, "value": value}), indent=2)
         except Exception as e:
             return f"Error: {e}"
+    # ------------------------------------------------------------------ #
+    # get_console_command_info / console_command_exists — cvar OR command #
+    # Backed by MCPReflectionLibrary.get_console_object_info_json         #
+    # (IConsoleManager::FindConsoleObject -> cvars AND registered exec    #
+    # commands). Falls back to the cvar-only string getter until the      #
+    # plugin DLL is rebuilt with MCPReflection_SmallCats.cpp.             #
+    # ------------------------------------------------------------------ #
+    _OBJ_INFO_BODY = _CON_HELPERS + r'''
+name = PARAMS["name"]
+rl = getattr(unreal, "MCPReflectionLibrary", None)
+if rl is not None and hasattr(rl, "get_console_object_info_json"):
+    try:
+        info = json.loads(rl.get_console_object_info_json(name))
+    except Exception as _e:
+        info = {"error": "handler raised: %s" % _e}
+    if isinstance(info, dict) and info.get("error"):
+        print("@@UMCP@@" + json.dumps({"status": "error", "name": name, "message": info.get("error")}))
+    else:
+        info["status"] = "success"
+        info["source"] = "IConsoleManager.FindConsoleObject (cvars + registered exec commands)"
+        print("@@UMCP@@" + json.dumps(info))
+else:
+    # Fallback: no C++ handler yet -> cvar-only detection (registered exec COMMANDS not detectable here).
+    registered = _con_is_cvar(name)
+    out = {"status": "success", "name": name, "found": registered,
+           "is_variable": registered, "is_command": False, "degraded": True,
+           "note": ("MCPReflectionLibrary.get_console_object_info_json not present (rebuild the UnrealMCP "
+                    "plugin DLL with MCPReflection_SmallCats.cpp). Falling back to the cvar-only string "
+                    "getter: registered exec COMMANDS cannot be detected until the C++ handler lands.")}
+    if registered:
+        parsed = _con_parse(name, _con_echo(name + " ?"))
+        out["current_value"] = parsed.get("value") or _con_typed(name).get("string")
+        out["set_by"] = parsed.get("set_by") or _con_source(name)
+        out["help"] = parsed.get("help")
+    print("@@UMCP@@" + json.dumps(out))
+'''
+
+    @mcp.tool()
+    def get_console_command_info(ctx, name: str) -> str:
+        """Metadata for ONE console object (cvar OR registered exec command) by exact name. Read-only.
+
+        name: exact console-object name, e.g. 'r.ScreenPercentage' (cvar) or 'Slate.CrashReporterPreview'
+              / a registered IConsoleCommand.
+
+        Backed by unreal.MCPReflectionLibrary.get_console_object_info_json, which resolves the object via
+        IConsoleManager::FindConsoleObject — so it now covers BOTH cvars and registered exec commands
+        (the old cvar-only path missed commands). Returns: found, is_variable, is_command, help (the
+        console object's GetHelp), flags (notable EConsoleVariableFlags: ReadOnly/Cheat/Scalability/...),
+        is_enabled, and — for cvars only — current_value, set_by (LastSetBy provenance) and the
+        is_bool/int/float/string type hints. No console execution occurs (pure lookup).
+
+        Not detectable (documented, not faked): FSelfRegisteringExec / stat / show style commands are NOT
+        IConsoleObjects, so found=false for those. Until the plugin DLL is rebuilt with
+        MCPReflection_SmallCats.cpp this degrades to a cvar-only check (degraded=true in the payload)."""
+        try:
+            return json.dumps(_exec(_OBJ_INFO_BODY, {"name": name}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def console_command_exists(ctx, name: str) -> str:
+        """Check whether a name is a registered console object — cvar OR exec command. Read-only, no run.
+
+        name: exact console-object name to test.
+
+        Existence = IConsoleManager::FindConsoleObject(name) != null (via the C++ handler), which covers
+        registered cvars AND registered IConsoleCommands. Returns exists, is_variable, is_command.
+
+        Limitation (not faked): FSelfRegisteringExec / stat / show style commands are not console objects
+        and cannot be existence-checked without running them, so they report exists=false. Until the
+        plugin DLL is rebuilt with MCPReflection_SmallCats.cpp this degrades to a cvar-only check
+        (degraded=true; registered exec commands then also report exists=false)."""
+        try:
+            info = _exec(_OBJ_INFO_BODY, {"name": name})
+            slim = {"status": info.get("status", "success"), "name": name,
+                    "exists": bool(info.get("found")),
+                    "is_variable": bool(info.get("is_variable")),
+                    "is_command": bool(info.get("is_command"))}
+            if info.get("degraded"):
+                slim["degraded"] = True
+                slim["note"] = info.get("note")
+            if info.get("_log_warnings"):
+                slim["_log_warnings"] = info.get("_log_warnings")
+            return json.dumps(slim, indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. set_console_variable
     # adds ONE new ledger op "set_cvar" {name, prior_value, prior_set_by}; inverse = execute
     # "<name> <prior_value>". Reported to the coordinator to fold into editor_level.undo.

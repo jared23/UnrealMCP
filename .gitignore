@@ -31,3 +31,13 @@ scratchpad/
 docs/drafts/
 *.bak
 *.bak-*
+
+# Design/scaffolding docs stay local — only READMEs ship publicly (design docs mislead other people's LLMs)
+*.md
+!README.md
+!**/README.md
+!**/README_*.md
+
+# Transient build/debug artifacts (never public)
+*.deferred_crash
+Build Errors*.txt
