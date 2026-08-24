@@ -196,6 +196,87 @@ def _mark(dt):
 '''
 
     # ------------------------------------------------------------------ #
+    # create_data_table — new UDataTable with a row struct (non-modal)     #
+    # ------------------------------------------------------------------ #
+    _CREATE_BODY = _DTW_HELPERS + r'''
+name = str(PARAMS.get("name") or "").strip()
+package_path = str(PARAMS.get("package_path") or "/Game/MCP_Scratch").rstrip("/")
+rs_spec = PARAMS.get("row_struct")
+if not name:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "name is required"}))
+elif not rs_spec:
+    print("@@UMCP@@" + json.dumps({"status": "error",
+        "message": "row_struct is required (path to a UserDefinedStruct asset, or a native struct object path like /Script/Engine.<StructName>)"}))
+else:
+    full = package_path + "/" + name
+    if unreal.EditorAssetLibrary.does_asset_exist(full):
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": "asset already exists: %s" % full}))
+    else:
+        rs = None
+        try:
+            rs = unreal.EditorAssetLibrary.load_asset(rs_spec)
+        except Exception:
+            rs = None
+        if rs is None:
+            try:
+                rs = unreal.load_object(None, rs_spec)
+            except Exception:
+                rs = None
+        if rs is None or not isinstance(rs, unreal.ScriptStruct):
+            print("@@UMCP@@" + json.dumps({"status": "error",
+                "message": "could not resolve row_struct as a ScriptStruct: %s" % rs_spec}))
+        else:
+            dir_existed = unreal.EditorAssetLibrary.does_directory_exist(package_path)
+            fac = unreal.DataTableFactory()
+            fac_ok = True
+            try:
+                fac.set_editor_property("struct", rs)
+            except Exception as e:
+                fac_ok = False
+                print("@@UMCP@@" + json.dumps({"status": "error",
+                    "message": "row_struct is not usable as a DataTable row struct: %s" % str(e)[:160]}))
+            if fac_ok:
+                tools = unreal.AssetToolsHelpers.get_asset_tools()
+                dt = tools.create_asset(name, package_path, unreal.DataTable, fac)
+                if dt is None:
+                    print("@@UMCP@@" + json.dumps({"status": "error", "message": "create_asset returned None"}))
+                else:
+                    try: unreal.EditorAssetLibrary.save_asset(full, only_if_is_dirty=False)
+                    except Exception: pass
+                    created_dir = None if dir_existed else package_path
+                    _ledger().append({"op": "create_asset", "asset_path": dt.get_path_name(),
+                        "package_path": package_path, "created_dir": created_dir})
+                    rb = dt.get_editor_property("row_struct")
+                    print("@@UMCP@@" + json.dumps({"status": "success",
+                        "data_table_path": dt.get_path_name(), "name": name,
+                        "row_struct": (rb.get_name() if rb else None), "row_count": 0,
+                        "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def create_data_table(ctx, name: str, row_struct: str,
+                          package_path: str = "/Game/MCP_Scratch") -> str:
+        """Create a new UDataTable asset with the given row struct (ledgered write; NON-MODAL).
+
+        name:         asset name for the new DataTable.
+        row_struct:   the row struct: a UserDefinedStruct asset path (e.g. /Game/Data/MyRowStruct) OR a
+                      native struct object path (e.g. /Script/Engine.<StructName>). Must resolve to a
+                      UScriptStruct; ideally one derived from FTableRowBase.
+        package_path: destination content path (default /Game/MCP_Scratch).
+
+        Creates via DataTableFactory with its Struct PRE-SET, then plain create_asset (which does NOT
+        call the factory's ConfigureProperties, so NO struct-picker modal pops) + save. Refuses if an
+        asset already exists at the target path. Rows are added separately via add_data_table_row.
+
+        Ledgered write op 'create_asset' {asset_path, package_path, created_dir} — the unified
+        editor_level.undo deletes the created table (and the scratch dir if this call created it)."""
+        params = {"name": name, "row_struct": row_struct, "package_path": package_path}
+        try:
+            return json.dumps(_exec(_CREATE_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
     # add_data_table_row — author a new row (JSON round-trip; ledgered)    #
     # ------------------------------------------------------------------ #
     _ADD_BODY = _DTW_HELPERS + r'''

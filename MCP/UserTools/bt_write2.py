@@ -1014,21 +1014,85 @@ else:
                                   "PROTOCOL forbids PIE.",
     }
 
+    # ---- C++ #23: BT RUNTIME (needs a live PIE world). Sent LEAN (raw code, no _wrap footprint). ----
+    def _bt_lean_exec(body, params):
+        p = dict(params or {})
+        b64 = base64.b64encode(json.dumps(p).encode("utf-8")).decode("ascii")
+        header = ('import base64 as _b64, json as _json\n'
+                  'PARAMS = _json.loads(_b64.b64decode("%s").decode("utf-8"))\n' % b64)
+        resp = send_command("execute_python", {"code": header + body})
+        if not isinstance(resp, dict) or resp.get("status") != "success":
+            raise RuntimeError(f"execute_python did not succeed: {resp}")
+        out = resp.get("result", {}).get("output", "").replace("\r\n", "\n")
+        for line in reversed(out.splitlines()):
+            if MARKER in line:
+                return json.loads(line.split(MARKER, 1)[1])
+        raise RuntimeError(f"no {MARKER} payload in output:\n{out}")
+
+    # Resolve the target actor in the live PIE world (by name/label, or the first AIController) then leave it in _t.
+    _RT_HEAD = (
+        "import unreal, json\n"
+        "ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)\n"
+        "les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)\n"
+        "gw = ues.get_game_world() if les.is_in_play_in_editor() else None\n"
+        "m = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+        "if gw is None:\n"
+        "    print('@@UMCP@@' + json.dumps({'status':'error','message':'not in PIE — play_in_editor, poll get_pie_status until in_pie, then retry'}))\n"
+        "elif m is None:\n"
+        "    print('@@UMCP@@' + json.dumps({'status':'error','message':'MCPReflectionLibrary unavailable'}))\n"
+        "else:\n"
+        "    _name = PARAMS.get('actor') or ''\n"
+        "    _t = None\n"
+        "    _acts = unreal.GameplayStatics.get_all_actors_of_class(gw, unreal.Actor)\n"
+        "    if _name:\n"
+        "        for _a in _acts:\n"
+        "            try:\n"
+        "                if _a.get_name() == _name or (_name.lower() in _a.get_name().lower()) or _a.get_actor_label() == _name:\n"
+        "                    _t = _a; break\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "    else:\n"
+        "        for _a in _acts:\n"
+        "            if isinstance(_a, unreal.AIController):\n"
+        "                _t = _a; break\n"
+        "    if _t is None:\n"
+        "        print('@@UMCP@@' + json.dumps({'status':'error','message':'no target actor/AIController found (actor=%s)' % (_name or '(first AIController)')}))\n"
+        "    else:\n")
+
     @mcp.tool()
     def get_bt_runtime(ctx, actor: str = None, include_blackboard: bool = True) -> str:
-        """DEFERRED (runtime/PIE-only). Inspect a running BehaviorTreeComponent on an actor. Returns a
-        structured refusal (no mutation, no editor I/O) explaining why it needs a live game world."""
-        return json.dumps({"status": "deferred", "tool": "get_bt_runtime", "mutated": False,
-                           "reason": _DEFERRED["get_bt_runtime"]}, indent=2)
+        """Inspect a RUNNING BehaviorTreeComponent on an actor in the live PIE world (C++ #23 handler):
+        is_running, active_node, active_tasks/trees, and (optional) the blackboard snapshot.
+
+        REQUIRES PIE — play_in_editor, poll get_pie_status until in_pie, then call this.
+        actor: substring/name/label match (empty = the first AIController). include_blackboard: default true."""
+        try:
+            body = _RT_HEAD + "        print('@@UMCP@@' + json.dumps(json.loads(m.get_behavior_tree_runtime_json(_t, bool(PARAMS.get('include_blackboard', True))))))\n"
+            return json.dumps(_bt_lean_exec(body, {"actor": actor, "include_blackboard": include_blackboard}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
 
     @mcp.tool()
     def control_bt_runtime(ctx, action: str = "start", actor: str = None) -> str:
-        """DEFERRED (runtime/PIE-only). Start/stop/pause a running BehaviorTree. Structured refusal."""
-        return json.dumps({"status": "deferred", "tool": "control_bt_runtime", "mutated": False,
-                           "reason": _DEFERRED["control_bt_runtime"]}, indent=2)
+        """Control a RUNNING BehaviorTree on an actor in the live PIE world (C++ #23 handler).
+        action: start | restart | stop | pause | resume. REQUIRES PIE (see get_bt_runtime).
+        actor: substring/name/label match (empty = the first AIController)."""
+        try:
+            body = _RT_HEAD + "        print('@@UMCP@@' + json.dumps(json.loads(m.control_behavior_tree_runtime_json(_t, PARAMS.get('action') or 'start'))))\n"
+            return json.dumps(_bt_lean_exec(body, {"actor": actor, "action": action}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
 
     @mcp.tool()
     def set_bt_dynamic_subtree(ctx, inject_tag: str = None, subtree: str = None, actor: str = None) -> str:
-        """DEFERRED (runtime/PIE-only). Inject a dynamic subtree at a gameplay tag. Structured refusal."""
-        return json.dumps({"status": "deferred", "tool": "set_bt_dynamic_subtree", "mutated": False,
-                           "reason": _DEFERRED["set_bt_dynamic_subtree"]}, indent=2)
+        """Inject a dynamic subtree at a runtime gameplay tag on a RUNNING BehaviorTreeComponent (C++ #23:
+        UBehaviorTreeComponent::SetDynamicSubtree). REQUIRES PIE (see get_bt_runtime).
+        inject_tag: a REGISTERED gameplay tag. subtree: a /Game BehaviorTree asset path (empty = clear).
+        actor: substring/name/label match (empty = the first AIController)."""
+        try:
+            body = _RT_HEAD + (
+                "        _sub = unreal.EditorAssetLibrary.load_asset(PARAMS.get('subtree')) if PARAMS.get('subtree') else None\n"
+                "        print('@@UMCP@@' + json.dumps(json.loads(m.set_behavior_tree_dynamic_subtree_json(_t, PARAMS.get('inject_tag') or '', _sub))))\n")
+            return json.dumps(_bt_lean_exec(body, {"actor": actor, "inject_tag": inject_tag, "subtree": subtree}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"

@@ -359,3 +359,286 @@ else:
             return json.dumps(_exec(_ADD_INSTANCES_BODY, params), indent=2)
         except Exception as e:
             return f"Error: {e}"
+
+    # ================================================================== #
+    # FOLIAGE COMPLETION — clear/remove (reversible) + read/validate      #
+    # ================================================================== #
+    # Extra foliage helpers (append to the reused _FOLIAGE_HELPERS). No ''' / no backslashes.
+    _FOLIAGE_HELPERS2 = r'''
+def _fol_tf_key(loc, rot, scl):
+    return "%.2f_%.2f_%.2f_%.2f_%.2f_%.2f_%.3f_%.3f_%.3f" % (loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll, scl.x, scl.y, scl.z)
+def _fol_snapshot(mesh):
+    # Per-component snapshot of every instance transform for foliage ISM comps of THIS mesh.
+    # Keyed by component path so a before/after diff around a type-scoped remove yields EXACTLY the
+    # removed (target-type) instances -- correct even when two FoliageTypes share the same mesh
+    # (each FoliageType has its own component; no Python type back-ref exists on the component).
+    mp = mesh.get_path_name() if mesh else None
+    snap = {}
+    for a in _fol_ifas():
+        for c in (a.get_components_by_class(unreal.InstancedStaticMeshComponent) or []):
+            try:
+                sm = c.get_editor_property("static_mesh")
+            except Exception:
+                sm = None
+            if sm is None or mp is None or sm.get_path_name() != mp:
+                continue
+            lst = []
+            try:
+                cnt = c.get_instance_count()
+            except Exception:
+                cnt = 0
+            for i in range(cnt):
+                try:
+                    t = c.get_instance_transform(i, True)
+                except Exception:
+                    continue
+                loc = t.translation; scl = t.scale3d; rot = t.rotation.rotator()
+                lst.append({"location": [loc.x, loc.y, loc.z],
+                            "rotation": [rot.pitch, rot.yaw, rot.roll],
+                            "scale": [scl.x, scl.y, scl.z],
+                            "_k": _fol_tf_key(loc, rot, scl)})
+            snap[c.get_path_name()] = lst
+    return snap
+def _fol_removed(before, after):
+    out = []
+    for key, lst in before.items():
+        akeys = set(x["_k"] for x in after.get(key, []))
+        for it in lst:
+            if it["_k"] not in akeys:
+                out.append({"location": it["location"], "rotation": it["rotation"], "scale": it["scale"]})
+    return out
+def _fol_types_in_level():
+    info = {}
+    for a in _fol_ifas():
+        an = a.get_name()
+        for c in (a.get_components_by_class(unreal.InstancedStaticMeshComponent) or []):
+            try:
+                sm = c.get_editor_property("static_mesh")
+            except Exception:
+                sm = None
+            mp = sm.get_path_name() if sm is not None else "<none>"
+            try:
+                cnt = c.get_instance_count()
+            except Exception:
+                cnt = 0
+            rec = info.get(mp)
+            if rec is None:
+                rec = {"static_mesh": mp, "total_instances": 0, "components": 0, "ifas": []}
+                info[mp] = rec
+            rec["total_instances"] += cnt
+            rec["components"] += 1
+            if an not in rec["ifas"]:
+                rec["ifas"].append(an)
+    return info
+'''
+
+    _FOL_EXT_PREFIX = _COERCE_HELPERS + _FOLIAGE_HELPERS + _FOLIAGE_HELPERS2
+
+    # ------------------------------------------------------------------ #
+    # clear_foliage_instances — remove all instances of a type (revers.)  #
+    # ------------------------------------------------------------------ #
+    _CLEAR_INSTANCES_BODY = _FOL_EXT_PREFIX + r'''
+type_path = PARAMS["foliage_type_path"]
+ftype = unreal.EditorAssetLibrary.load_asset(type_path) if type_path else None
+world = _fol_world()
+if ftype is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "foliage_type not found: %s" % type_path}))
+elif not isinstance(ftype, unreal.FoliageType):
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "asset is not a FoliageType: %s" % type_path}))
+elif world is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "no editor world"}))
+else:
+    mesh = ftype.get_editor_property("mesh")
+    mesh_count_before = _fol_type_count(mesh)
+    before = _fol_snapshot(mesh)
+    cdo = unreal.InstancedFoliageActor.get_default_object()
+    with unreal.ScopedEditorTransaction("MCP clear_foliage_instances"):
+        cdo.remove_all_instances(world, ftype)
+    after = _fol_snapshot(mesh)
+    removed = _fol_removed(before, after)
+    mesh_count_after = _fol_type_count(mesh)
+    if not removed:
+        print("@@UMCP@@" + json.dumps({"status": "success", "foliage_type": type_path,
+            "mesh": (mesh.get_path_name() if mesh else None), "instances_cleared": 0,
+            "note": "no instances of this type in the level; nothing to clear", "ledgered": False}))
+    else:
+        _ledger().append({"op": "clear_foliage_instances", "foliage_type_path": type_path,
+            "count": len(removed), "transforms": removed})
+        print("@@UMCP@@" + json.dumps({"status": "success", "foliage_type": type_path,
+            "mesh": (mesh.get_path_name() if mesh else None),
+            "instances_cleared": len(removed),
+            "mesh_instance_count_before": mesh_count_before,
+            "mesh_instance_count_after": mesh_count_after,
+            "undo_op": "clear_foliage_instances", "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def clear_foliage_instances(ctx, foliage_type_path: str) -> str:
+        """Remove ALL placed instances of a foliage type from the active level (type-scoped: other
+        foliage types are untouched). The FoliageType asset itself is kept.
+
+        foliage_type_path: asset path of a FoliageType whose instances to clear.
+
+        Ledgered write (op 'clear_foliage_instances'): BEFORE removing, every instance transform
+        (location/rotation/scale, world space) is captured, so `undo` re-adds them exactly via
+        InstancedFoliageActor.add_instances. Clearing when there are no instances is a no-op (not
+        ledgered)."""
+        params = {"foliage_type_path": foliage_type_path}
+        try:
+            return json.dumps(_exec(_CLEAR_INSTANCES_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # remove_foliage_type — clear instances + soft-delete the type asset  #
+    # ------------------------------------------------------------------ #
+    _REMOVE_TYPE_BODY = _FOL_EXT_PREFIX + r'''
+type_path = PARAMS["foliage_type_path"]
+orig_pkg = type_path.split(".")[0]
+name = orig_pkg.split("/")[-1]
+trash_dir = "/Game/_MCP_Trash"
+trash_pkg = trash_dir + "/" + name
+ftype = unreal.EditorAssetLibrary.load_asset(type_path) if type_path else None
+world = _fol_world()
+if ftype is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "foliage_type not found: %s" % type_path}))
+elif not isinstance(ftype, unreal.FoliageType):
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "asset is not a FoliageType: %s" % type_path}))
+elif world is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "no editor world"}))
+else:
+    mesh = ftype.get_editor_property("mesh")
+    mesh_path = mesh.get_path_name() if mesh else None
+    # capture a few tuning props for reporting (asset is soft-deleted intact, so restore = rename back)
+    props = {}
+    for pn in ("density", "radius", "random_yaw", "align_to_normal", "z_offset", "ground_slope_angle"):
+        try:
+            props[pn] = str(ftype.get_editor_property(pn))
+        except Exception:
+            pass
+    created_trash_dir = not unreal.EditorAssetLibrary.does_directory_exist(trash_dir)
+    if created_trash_dir:
+        unreal.EditorAssetLibrary.make_directory(trash_dir)
+    # 1) remove instances (releases refs from the level's IFA), capturing EXACTLY this type's
+    #    instances via a before/after per-component diff; 2) soft-delete asset via rename to trash.
+    before = _fol_snapshot(mesh)
+    cdo = unreal.InstancedFoliageActor.get_default_object()
+    with unreal.ScopedEditorTransaction("MCP remove_foliage_type (clear instances)"):
+        cdo.remove_all_instances(world, ftype)
+    after = _fol_snapshot(mesh)
+    captured = _fol_removed(before, after)
+    prior_count = len(captured)
+    ftype = None
+    moved = False
+    if unreal.EditorAssetLibrary.does_asset_exist(trash_pkg):
+        print("@@UMCP@@" + json.dumps({"status": "error",
+            "message": "trash target already exists: %s (aborting to avoid overwrite)" % trash_pkg}))
+    else:
+        moved = unreal.EditorAssetLibrary.rename_asset(orig_pkg, trash_pkg)
+        if not moved:
+            print("@@UMCP@@" + json.dumps({"status": "error",
+                "message": "soft-delete rename failed (%s -> %s); instances already cleared" % (orig_pkg, trash_pkg)}))
+        else:
+            _ledger().append({"op": "remove_foliage_type", "original_path": orig_pkg,
+                "trash_path": trash_pkg, "created_trash_dir": created_trash_dir,
+                "mesh_path": mesh_path, "count": prior_count, "transforms": captured})
+            print("@@UMCP@@" + json.dumps({"status": "success", "foliage_type": orig_pkg,
+                "soft_deleted_to": trash_pkg, "mesh": mesh_path,
+                "instances_cleared": prior_count, "captured_props": {k: str(v) for k, v in props.items()},
+                "undo_op": "remove_foliage_type", "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def remove_foliage_type(ctx, foliage_type_path: str) -> str:
+        """Fully remove a foliage type: clear all its placed instances, then SOFT-DELETE the
+        FoliageType asset (renamed into /Game/_MCP_Trash -- never hard-deleted).
+
+        foliage_type_path: asset path of the FoliageType to remove.
+
+        Ledgered write (op 'remove_foliage_type'): captures the instance transforms and the trash
+        location, so `undo` renames the asset back to its original path AND re-adds every instance.
+        Aborts (before deleting) if the trash target already exists."""
+        params = {"foliage_type_path": foliage_type_path}
+        try:
+            return json.dumps(_exec(_REMOVE_TYPE_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # get_foliage_info — READ: types + instance counts in the level       #
+    # ------------------------------------------------------------------ #
+    _GET_FOLIAGE_INFO_BODY = _FOL_EXT_PREFIX + r'''
+world = _fol_world()
+ifas = _fol_ifas()
+types = _fol_types_in_level()
+total = 0
+for rec in types.values():
+    total += rec["total_instances"]
+print("@@UMCP@@" + json.dumps({"status": "success",
+    "world": (world.get_name() if world else None),
+    "instanced_foliage_actors": [a.get_name() for a in ifas],
+    "ifa_count": len(ifas),
+    "foliage_types": list(types.values()),
+    "distinct_meshes": len(types),
+    "total_instances": total}))
+'''
+
+    @mcp.tool()
+    def get_foliage_info(ctx) -> str:
+        """READ all foliage in the active level: the InstancedFoliageActor(s) present, and per
+        distinct static-mesh a record {static_mesh, total_instances, components, ifas}, plus totals.
+
+        Read-only (not ledgered)."""
+        try:
+            return json.dumps(_exec(_GET_FOLIAGE_INFO_BODY, {}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # validate_foliage — READ: foliage health                             #
+    # ------------------------------------------------------------------ #
+    _VALIDATE_FOLIAGE_BODY = _FOL_EXT_PREFIX + r'''
+world = _fol_world()
+ifas = _fol_ifas()
+types = _fol_types_in_level()
+warnings = []
+issues = []
+empty_ifas = []
+for a in ifas:
+    tot = 0
+    for c in (a.get_components_by_class(unreal.InstancedStaticMeshComponent) or []):
+        try:
+            tot += c.get_instance_count()
+        except Exception:
+            pass
+    if tot == 0:
+        empty_ifas.append(a.get_name())
+if empty_ifas:
+    warnings.append("empty InstancedFoliageActor(s) with 0 instances: %s" % empty_ifas)
+missing_mesh = [rec for rec in types.values() if rec["static_mesh"] == "<none>"]
+if missing_mesh:
+    issues.append("%d foliage component(s) have no static_mesh assigned" % len(missing_mesh))
+zero_types = [rec["static_mesh"] for rec in types.values() if rec["total_instances"] == 0 and rec["static_mesh"] != "<none>"]
+if zero_types:
+    warnings.append("foliage component(s) present with 0 instances for mesh(es): %s" % zero_types)
+total = 0
+for rec in types.values():
+    total += rec["total_instances"]
+print("@@UMCP@@" + json.dumps({"status": "success",
+    "world": (world.get_name() if world else None),
+    "ifa_count": len(ifas), "distinct_meshes": len(types), "total_instances": total,
+    "empty_ifas": empty_ifas,
+    "valid": (len(issues) == 0), "issues": issues, "warnings": warnings}))
+'''
+
+    @mcp.tool()
+    def validate_foliage(ctx) -> str:
+        """READ / health-check foliage in the active level: flags foliage components with no
+        static_mesh (hard issue), empty InstancedFoliageActors, and components with 0 instances
+        (warnings). Reports IFA count, distinct meshes, and total instance count.
+
+        Read-only (not ledgered). 'valid' is False when any hard issue is present."""
+        try:
+            return json.dumps(_exec(_VALIDATE_FOLIAGE_BODY, {}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"

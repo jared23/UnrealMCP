@@ -1056,6 +1056,160 @@ print("@@UMCP@@" + json.dumps({"status": "success", "property": prop, "prior_val
         except Exception as e:
             return f"Error: {e}"
 
+    # ================================================================== #
+    # GENERIC KEY ADD (any channel type)                                 #
+    # ================================================================== #
+
+    # Shared: coerce a raw value to the channel's key type by class name.
+    _ADDKEY_COERCE = r'''
+def _coerce_key_value(ch, raw):
+    cn = ch.get_class().get_name()
+    if "Bool" in cn:
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw)
+    if "Integer" in cn or "Byte" in cn:
+        try: return int(raw)
+        except Exception: return int(float(raw))
+    if "String" in cn or "Text" in cn:
+        return str(raw)
+    try:
+        return float(raw)
+    except Exception:
+        return raw
+def _add_one_key(ch, frame, raw, interp):
+    k = ch.add_key(unreal.FrameNumber(int(frame)), _coerce_key_value(ch, raw))
+    im = _enum_of(_INTERP, interp) if interp is not None else None
+    if im is not None:
+        try: k.set_interpolation_mode(im)
+        except Exception: pass
+    return k
+'''
+
+    # ------------------------------------------------------------------ #
+    # add_key  (generic single key on any channel)                       #
+    # ------------------------------------------------------------------ #
+    _ADD_KEY_GENERIC_BODY = _SEQEDIT_HELPERS + _ADDKEY_COERCE + r'''
+seq, err = _load_seq(PARAMS["sequence_path"])
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err})); raise SystemExit
+sec, tr, err = _locate_section(seq, PARAMS.get("binding"), PARAMS.get("track_index", 0), PARAMS.get("section_index", 0))
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err, "available_bindings": _binding_names(seq)})); raise SystemExit
+ch, chans, err = _get_channel(sec, PARAMS["channel_index"])
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err})); raise SystemExit
+frame = int(PARAMS["frame"])
+existing = _key_by_frame(ch, frame)
+had = existing is not None
+prior_value = existing.get_value() if had else None
+with unreal.ScopedEditorTransaction("MCP seq_add_key"):
+    k = _add_one_key(ch, frame, PARAMS["value"], PARAMS.get("interpolation"))
+_ledger().append({"op": "seq_add_key", "asset_path": PARAMS["sequence_path"], "binding": PARAMS.get("binding"),
+                  "track_index": int(PARAMS.get("track_index", 0)), "section_index": int(PARAMS.get("section_index", 0)),
+                  "channel_index": int(PARAMS["channel_index"]), "frame": frame, "had_key": had, "prior_value": prior_value})
+cname = None
+try: cname = str(ch.get_editor_property("channel_name"))
+except Exception: pass
+print("@@UMCP@@" + json.dumps({"status": "success", "channel": cname, "channel_type": ch.get_class().get_name(),
+    "frame": frame, "had_key": had, "prior_value": prior_value, "new_value": k.get_value(),
+    "num_keys": ch.get_num_keys(), "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def add_key(ctx, sequence_path: str, channel_index: int, frame: int, value,
+                binding: str = None, track_index: int = 0, section_index: int = 0,
+                interpolation: str = None) -> str:
+        """Add (or overwrite) one keyframe on ANY channel of a LevelSequence section, addressed by index.
+
+        Unlike add_keyframe (which keys the 9 fixed transform channels), this targets an arbitrary channel
+        by channel_index -- works for property/visibility/float/bool/int/string channels etc. The value is
+        coerced to the channel's key type by class name (Bool->bool, Integer/Byte->int, String/Text->str,
+        else float).
+
+        sequence_path: object/package path of the LevelSequence.
+        binding:       binding display/internal name; omit for master/root tracks.
+        track_index/section_index/channel_index: positional locators (see module addressing).
+        frame:         DISPLAY-rate frame number to key at.
+        value:         key value (coerced to the channel type).
+        interpolation: optional 'constant'/'linear'/'cubic'/'none' (applied to float/double keys).
+
+        Uses section.get_all_channels()[channel_index].add_key(unreal.FrameNumber(frame), value). Verify
+        with sequencer_read.list_sequence_tracks(include_keys=True) or evaluate_channels.
+
+        Ledgered op 'seq_add_key' {asset_path, binding, track_index, section_index, channel_index, frame,
+        had_key, prior_value}. Inverse: locate the channel; if had_key, re-add prior_value at frame
+        (add_key overwrites in place); else remove the key now at frame (ch.remove_key). FAITHFUL for a
+        fresh key and for overwriting an existing key's value."""
+        params = {"sequence_path": sequence_path, "channel_index": channel_index, "frame": frame,
+                  "value": value, "binding": binding, "track_index": track_index,
+                  "section_index": section_index, "interpolation": interpolation}
+        try:
+            return json.dumps(_exec(_ADD_KEY_GENERIC_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # add_keys  (batch of keys onto one section's channels)              #
+    # ------------------------------------------------------------------ #
+    _ADD_KEYS_BATCH_BODY = _SEQEDIT_HELPERS + _ADDKEY_COERCE + r'''
+seq, err = _load_seq(PARAMS["sequence_path"])
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err})); raise SystemExit
+sec, tr, err = _locate_section(seq, PARAMS.get("binding"), PARAMS.get("track_index", 0), PARAMS.get("section_index", 0))
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err, "available_bindings": _binding_names(seq)})); raise SystemExit
+entries = PARAMS.get("entries") or []
+if not entries:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "no entries given (need [{channel_index, frame, value, interpolation?}])"})); raise SystemExit
+chans = list(sec.get_all_channels() or [])
+recs = []; written = []; errs = []
+with unreal.ScopedEditorTransaction("MCP seq_add_keys_batch"):
+    for e in entries:
+        ci = int(e.get("channel_index", 0))
+        if ci < 0 or ci >= len(chans):
+            errs.append({"channel_index": ci, "error": "channel_index out of range (channel_count=%d)" % len(chans)}); continue
+        ch = chans[ci]; frame = int(e["frame"])
+        existing = _key_by_frame(ch, frame)
+        had = existing is not None
+        prior_value = existing.get_value() if had else None
+        k = _add_one_key(ch, frame, e["value"], e.get("interpolation"))
+        recs.append({"channel_index": ci, "frame": frame, "had_key": had, "prior_value": prior_value})
+        written.append({"channel_index": ci, "frame": frame, "value": k.get_value()})
+if recs:
+    _ledger().append({"op": "seq_add_keys_batch", "asset_path": PARAMS["sequence_path"], "binding": PARAMS.get("binding"),
+                      "track_index": int(PARAMS.get("track_index", 0)), "section_index": int(PARAMS.get("section_index", 0)),
+                      "entries": recs})
+print("@@UMCP@@" + json.dumps({"status": "success", "keys_written": written, "errors": errs,
+    "count": len(written), "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def add_keys(ctx, sequence_path: str, entries: list,
+                 binding: str = None, track_index: int = 0, section_index: int = 0) -> str:
+        """Add a BATCH of keyframes onto one section's channels in a single transaction.
+
+        sequence_path: object/package path of the LevelSequence.
+        binding/track_index/section_index: locate the section (see module addressing).
+        entries:       list of {channel_index, frame, value, interpolation?}. Each keys one channel of the
+                       located section at one frame (value coerced to the channel's type; interpolation
+                       optional per entry).
+
+        All keys are added inside one unreal.ScopedEditorTransaction and recorded as a single ledger op so
+        the whole batch reverts together. Per-entry channel-range errors are reported (not fatal). Verify
+        with sequencer_read.list_sequence_tracks(include_keys=True).
+
+        Ledgered op 'seq_add_keys_batch' {asset_path, binding, track_index, section_index,
+        entries:[{channel_index, frame, had_key, prior_value}]}. Inverse: replay each recorded entry's
+        single-key inverse in LIFO order -- if had_key restore prior_value (add_key overwrites), else
+        remove the key at that frame. FAITHFUL."""
+        params = {"sequence_path": sequence_path, "entries": entries, "binding": binding,
+                  "track_index": track_index, "section_index": section_index}
+        try:
+            return json.dumps(_exec(_ADD_KEYS_BATCH_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
     # ------------------------------------------------------------------ #
     # DEFERRED (refused-not-faked):
     #   remove_section / remove_track -- reachable (track.remove_section / binding.remove_track /
@@ -1069,6 +1223,11 @@ print("@@UMCP@@" + json.dumps({"status": "success", "property": prop, "prior_val
     #   (a full capture+rebuild of channel-only sections is feasible but out of scope to validate here).
     #   Removing a section/track WE created is already reversible via the add-side undos in
     #   level_sequence_write.py (add_transform_track) and sequencer_write_ext.py (add_seq_* ops).
+    #   UPDATE: generic remove_track / remove_section NOW SHIP in sequencer_write_ext.py using a
+    #   best-effort JSON SNAPSHOT (class/range/row/blend/easing + per-channel defaults/extrapolation +
+    #   all keys with interp/tangents + audio/skeletal/timewarp asset refs) captured pre-removal and
+    #   replayed by the inverse (ops seq_remove_track / seq_remove_section). Residual gaps (documented
+    #   there): camera-cut section binding-id and subsequence inner-sequence links are not round-tripped.
     #
     # This module registers NO `undo` tool (editor_level.py owns the unified `undo`). 13 NEW ledger ops
     # (seq_remove_key, seq_set_key_time, seq_set_key_value, seq_set_key_interp, seq_set_key_tangent,

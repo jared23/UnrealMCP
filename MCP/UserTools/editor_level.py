@@ -94,6 +94,13 @@ def register_tools(mcp, utils):
         """Run a snippet in Unreal (with Output-Log auto-capture) and parse its MARKER
         payload. Any new Warning/Error log lines are attached as result['_log_warnings']."""
         resp = send_command("execute_python", {"code": _wrap(code)})
+        # Drain the editor's Python cyclic-GC heap after each op (esp. StateTree undo folds) so a UE GC's
+        # PyGC_Collect (FPythonScriptPlugin::OnPreGarbageCollect) can't AV traversing our leftover cyclic
+        # garbage. Root cause localized 2026-08-18; see statetree_write2.py _query for details.
+        try:
+            send_command("execute_python", {"code": "import gc\ngc.collect()"})
+        except Exception:
+            pass
         if not isinstance(resp, dict) or resp.get("status") != "success":
             raise RuntimeError(f"execute_python did not succeed: {resp}")
         out = resp.get("result", {}).get("output", "").replace("\r\n", "\n")
@@ -122,6 +129,217 @@ def register_tools(mcp, utils):
         header = ('import base64 as _b64, json as _json\n'
                   'PARAMS = _json.loads(_b64.b64decode("%s").decode("utf-8"))\n' % b64)
         return _query(header + body)
+
+    # ================= LEAN StateTree UNDO path (crash #2 fix, 2026-08-18) =================
+    # Re-calling the StateTree C++ handlers from inside the giant _UNDO_BODY (the heavy _COERCE_HELPERS + huge
+    # elif chain = a big Python-heap footprint) detonates crash #2 (a residual PyGC AV) on a LATER command. So
+    # st_* inverses are applied via SMALL, data-driven, no-`def` snippets instead: peek the top ledger entry,
+    # compute the inverse C++ call(s) CLIENT-side, apply them + repair + save + pop in one lean command. Non-st
+    # ops still use _UNDO_BODY. Root-cause writeup: [[statetree-authoring-recipe]].
+    def _lean_query(code):
+        try:
+            send_command("execute_python", {"code": "import gc\ngc.collect()"})
+        except Exception:
+            pass
+        resp = send_command("execute_python", {"code": code})
+        try:
+            send_command("execute_python", {"code": "import gc\ngc.collect()"})
+        except Exception:
+            pass
+        if not isinstance(resp, dict) or resp.get("status") != "success":
+            raise RuntimeError(f"execute_python did not succeed: {resp}")
+        out = resp.get("result", {}).get("output", "").replace("\r\n", "\n")
+        for line in reversed(out.splitlines()):
+            if MARKER in line:
+                return json.loads(line.split(MARKER, 1)[1])
+        raise RuntimeError(f"no {MARKER} payload in output:\n{out}")
+
+    def _lean_exec(body, params):
+        params = dict(params or {})
+        params.setdefault("_session", session)
+        b64 = base64.b64encode(json.dumps(params).encode("utf-8")).decode("ascii")
+        header = ('import base64 as _b64, json as _json\n'
+                  'PARAMS = _json.loads(_b64.b64decode("%s").decode("utf-8"))\n' % b64)
+        return _lean_query(header + body)
+
+    # Client-side: map an st_* ledger entry -> ([[handler_name, args], ...], token). No editor call.
+    def _st_inverse(e):
+        op = e.get("op")
+        if op == "st_set_node_property":
+            return [["set_state_tree_node_property_json", [e.get("state_name") or "", e.get("kind"),
+                     e.get("index"), e.get("prop"), str(e.get("prev")), e.get("container") or ""]]], "st-node-property-restored"
+        if op == "st_set_transition_property":
+            return [["set_state_tree_transition_property_json", [e.get("state_name"), e.get("index"),
+                     e.get("prop"), str(e.get("prev"))]]], "st-transition-property-restored"
+        if op == "st_set_color":
+            return [["set_state_tree_color_json", [e.get("state_name"), "", str(e.get("prev"))]]], "st-color-restored"
+        if op == "st_add_parameter":
+            return [["remove_state_tree_parameter", [e.get("name")]]], "st-parameter-removed"
+        if op == "st_set_parameter":
+            return [["set_state_tree_parameter", [e.get("name"), str(e.get("prev"))]]], "st-parameter-restored"
+        if op == "st_remove_parameter":
+            calls = [["add_state_tree_parameter", [e.get("name"), e.get("type") or "float"]]]
+            if e.get("value") is not None:
+                calls.append(["set_state_tree_parameter", [e.get("name"), str(e.get("value"))]])
+            return calls, "st-parameter-re-added"
+        if op == "st_add_binding":
+            return [["remove_state_tree_binding", [e.get("target_struct_id"), e.get("target_property")]]], "st-binding-removed"
+        if op == "st_add_task_completion":  # C++ #21: inverse = remove the binding at the listener target
+            return [["remove_state_tree_binding", [e.get("target_struct_id"), e.get("target_property")]]], "st-task-completion-removed"
+        if op == "st_bind_delegate":        # C++ #21: inverse = remove the property binding at the listener path
+            return [["remove_state_tree_binding", [e.get("listener_struct_id"), e.get("listener_path")]]], "st-delegate-removed"
+        if op == "st_remove_binding":
+            if e.get("source_struct_id"):
+                return [["add_state_tree_binding", [e.get("source_struct_id"), e.get("source_property"),
+                         e.get("target_struct_id"), e.get("target_property")]]], "st-binding-re-added"
+            return [], "st-binding-source-absent"
+        return None, None
+
+    # Client-side: map a pcg_* SCHEMA/PIN ledger entry -> (graph_path, [[handler_name, args],...], token).
+    # These inverses call the Wave-5 C++ handlers, which fire UPCGGraph::NotifyGraphChanged ->
+    # FCoreUObjectDelegates::OnObjectPropertyChanged.Broadcast on a standalone graph. Broadcasting that
+    # from INSIDE the giant (deeply-if/elif-nested) _UNDO_BODY overflows the CPython C-stack (python311
+    # crash). Routing them through a LEAN snippet (shallow stack) is safe -- same fix as the st_* ops.
+    def _pcg_schema_inverse(e):
+        op = e.get("op"); gp = e.get("graph_path")
+        if op == "pcg_remove_graph_parameter":
+            return gp, [["remove_pcg_graph_parameter_json", [gp, e.get("name")]]], "pcg-graph-param-add-undone"
+        if op == "pcg_add_graph_parameter":
+            _ty = e.get("type"); _vto = e.get("value_type_object") or ""
+            if _ty == "struct":
+                _sm = {"Vector2D": "vector2d", "Vector": "vector", "Rotator": "rotator",
+                       "Transform": "transform", "Quat": "quat", "LinearColor": "linearcolor"}
+                _ty = _sm.get(_vto.split(".")[-1], "vector")
+            return gp, [["add_pcg_graph_parameter_json", [gp, e.get("name"), _ty]]], "pcg-graph-param-remove-undone"
+        if op == "pcg_rename_graph_parameter":
+            return gp, [["rename_pcg_graph_parameter_json", [gp, e.get("old_name"), e.get("new_name")]]], "pcg-graph-param-rename-undone"
+        if op == "pcg_remove_dynamic_input_pin":
+            _pi = e.get("pin_index")
+            _pi = int(_pi) if _pi is not None else -1
+            return gp, [["remove_pcg_dynamic_input_pin_json", [gp, e.get("node_name"), _pi]]], "pcg-dynamic-pin-add-undone"
+        if op == "pcg_add_dynamic_input_pin":
+            return gp, [["add_pcg_dynamic_input_pin_json", [gp, e.get("node_name")]]], "pcg-dynamic-pin-remove-undone"
+        return None, None, None
+
+    # Lean peek: return the top ledger entry (for this session) without mutating it.
+    _ST_PEEK = r'''
+import json, builtins
+_root = getattr(builtins, "_UMCP_LEDGERS", None)
+_sid = PARAMS.get("_session", "default")
+_led = _root.get(_sid) if isinstance(_root, dict) else None
+print("@@UMCP@@" + json.dumps({"entry": (_led[-1] if _led else None), "depth": (len(_led) if _led is not None else 0)}))
+'''
+
+    # Lean apply: run the precomputed inverse call(s) on the StateTree, repair, save, pop the top ledger entry.
+    _ST_UNDO_APPLY = r'''
+import unreal, json, builtins
+_p = PARAMS
+_st = unreal.EditorAssetLibrary.load_asset(_p["asset_path"])
+_m = getattr(unreal, "MCPReflectionLibrary", None)
+if _st is None or _m is None:
+    print("@@UMCP@@" + json.dumps({"status": "success", "result": "statetree-or-handler-absent"}))
+else:
+    with unreal.ScopedEditorTransaction("MCP undo " + _p.get("_op", "st")):
+        for _c in _p["_calls"]:
+            _h = getattr(_m, _c[0], None)
+            if _h is not None:
+                _h(_st, *_c[1])
+    if hasattr(_m, "repair_state_tree_nodes"):
+        try:
+            _m.repair_state_tree_nodes(_st)
+        except Exception:
+            pass
+    unreal.EditorLoadingAndSavingUtils.save_packages([_st.get_outermost()], False)
+    _root = getattr(builtins, "_UMCP_LEDGERS", None)
+    _sid = _p.get("_session", "default")
+    _led = _root.get(_sid) if isinstance(_root, dict) else None
+    if _led:
+        _led.pop()
+    print("@@UMCP@@" + json.dumps({"status": "success", "result": _p.get("_token"), "ledger_depth": (len(_led) if _led is not None else 0)}))
+'''
+
+    # Lean apply for pcg_* SCHEMA/PIN inverses: run the Wave-5 C++ handler(s) in a SHALLOW script (NOT the
+    # giant _UNDO_BODY), save the graph, pop the ledger, record redo. Avoids the python311 C-stack overflow.
+    _PCG_SCHEMA_UNDO = r'''
+import unreal, json, builtins
+_p = PARAMS
+_m = getattr(unreal, "MCPReflectionLibrary", None)
+_gp = _p.get("graph_path")
+if _m is None:
+    print("@@UMCP@@" + json.dumps({"status": "success", "result": "pcg-handler-absent"}))
+else:
+    _err = None
+    for _c in _p["_calls"]:
+        _h = getattr(_m, _c[0], None)
+        if _h is not None:
+            try:
+                _rr = _h(*_c[1])
+            except Exception as _e:
+                _err = str(_e)[:120]
+    _g = unreal.EditorAssetLibrary.load_asset(_gp) if _gp else None
+    if _g is not None:
+        try:
+            unreal.EditorLoadingAndSavingUtils.save_packages([_g.get_outermost()], False)
+        except Exception:
+            pass
+    _root = getattr(builtins, "_UMCP_LEDGERS", None)
+    _sid = _p.get("_session", "default")
+    _led = _root.get(_sid) if isinstance(_root, dict) else None
+    if _led:
+        _led.pop()
+    try:
+        _rroot = getattr(builtins, "_UMCP_REDO", None)
+        if _rroot is None:
+            _rroot = {}; builtins._UMCP_REDO = _rroot
+        _rroot.setdefault(_sid, []).append(_p.get("_entry"))
+    except Exception:
+        pass
+    _res = _p.get("_token") if _err is None else ("restore-failed: " + _err)
+    print("@@UMCP@@" + json.dumps({"status": "success", "result": _res, "ledger_depth": (len(_led) if _led is not None else 0)}))
+'''
+
+    # Lean apply for the BP-based st_set_component_tree inverse (subobject loop inline; no `def`).
+    _ST_UNDO_COMPTREE = r'''
+import unreal, json, builtins
+_p = PARAMS
+_e = _p["entry"]
+_bp = unreal.EditorAssetLibrary.load_asset(_e.get("blueprint_path"))
+_m = getattr(unreal, "MCPReflectionLibrary", None)
+_tok = "blueprint-or-handler-absent"
+if _bp is not None and _m is not None and hasattr(_m, "set_state_tree_component_tree_json"):
+    _subsys = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    _handles = _subsys.k2_gather_subobject_data_for_blueprint(_bp) or []
+    _cn = _e.get("component_name")
+    _comp = None
+    for _h in _handles:
+        try:
+            _d = _subsys.k2_find_subobject_data_from_handle(_h)
+            _o = unreal.SubobjectDataBlueprintFunctionLibrary.get_object(_d) if _d else None
+        except Exception:
+            _o = None
+        if _o is not None and isinstance(_o, unreal.StateTreeComponent) and _o.get_name() == _cn:
+            _comp = _o
+            break
+    if _comp is None:
+        _tok = "component-absent"
+    else:
+        _pst = _e.get("prev_state_tree")
+        _tree = unreal.EditorAssetLibrary.load_asset(_pst) if (_pst and _pst != "None") else None
+        with unreal.ScopedEditorTransaction("MCP undo st_set_component_tree"):
+            _m.set_state_tree_component_tree_json(_comp, _e.get("property_name"), _tree, "")
+            try:
+                unreal.BlueprintEditorLibrary.compile_blueprint(_bp)
+            except Exception:
+                pass
+        unreal.EditorLoadingAndSavingUtils.save_packages([_bp.get_outermost()], False)
+        _tok = "st-component-tree-restored"
+_root = getattr(builtins, "_UMCP_LEDGERS", None)
+_sid = _p.get("_session", "default")
+_led = _root.get(_sid) if isinstance(_root, dict) else None
+if _led:
+    _led.pop()
+print("@@UMCP@@" + json.dumps({"status": "success", "result": _tok, "ledger_depth": (len(_led) if _led is not None else 0)}))
+'''
 
     # Shared Unreal-side helpers (prepended to bodies that need them). No ''' / no backslashes.
     # _settable(v)->(json_value, restorable): convert an Unreal value to a JSON form we can
@@ -850,6 +1068,27 @@ def _save_niag(sysobj, ap):
         unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
     except Exception:
         pass
+def _st_save(p):
+    # Non-validating save for StateTree undo folds. EditorAssetLibrary.save_asset triggers asset VALIDATION
+    # (InternalPromptForCheckoutAndSave) which hard-crashes on MCP-written StateTrees; save_packages persists
+    # without it. (Root-caused 2026-08-18.)
+    try:
+        a = unreal.EditorAssetLibrary.load_asset(p)
+        if a is None:
+            return False
+        # C++ #20 THE FIX: repair malformed nodes (empty Instance struct + zero ID from import_text authoring)
+        # before saving -- that malformation crashes the StateTree compiler/serializer on save. Idempotent;
+        # guarded until the C++ handler lands.
+        if isinstance(a, unreal.StateTree):
+            _rl = getattr(unreal, "MCPReflectionLibrary", None)
+            if _rl is not None and hasattr(_rl, "repair_state_tree_nodes"):
+                try:
+                    _rl.repair_state_tree_nodes(a)
+                except Exception:
+                    pass
+        return bool(unreal.EditorLoadingAndSavingUtils.save_packages([a.get_outermost()], False))
+    except Exception:
+        return False
 def _bt_resolve(bt, path):
     # Walk a BehaviorTree's composite children by dot-index path ("" / "root" -> root_node). Mirrors
     # bt_write.py._resolve_comp so the BT-node undo inverses can re-find the parent to pop from.
@@ -919,6 +1158,30 @@ def _mg_finish(mat, ap):
         except Exception: pass
     try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
     except Exception: pass
+def _mf_fn(ap):
+    # cross-module (material_function_write.py) undo: load a base MaterialFunction (not an instance).
+    m = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+    return m if isinstance(m, unreal.MaterialFunction) else None
+def _mf_mfi(ap):
+    # cross-module (material_function_write.py) undo: load a MaterialFunctionInstance.
+    m = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+    return m if isinstance(m, unreal.MaterialFunctionInstance) else None
+def _mf_find(mf, nm):
+    if mf is None or not nm or _MG is None:
+        return None
+    for e in (_MG.get_material_function_expressions(mf) or []):
+        if e and e.get_name() == nm:
+            return e
+    return None
+def _mf_update(mf, ap):
+    if _MG is not None and mf is not None:
+        try: _MG.update_material_function(mf)
+        except Exception: pass
+    try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+    except Exception: pass
+def _mf_save(ap):
+    try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+    except Exception: pass
 def _crg_ctrl(ap, gname):
     # cross-module (controlrig_graph_write.py) undo: resolve the RigVM controller for the named graph.
     bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
@@ -947,6 +1210,15 @@ def _crg_ctrl(ap, gname):
         # A specific graph was requested but not found anywhere -> fail safe (skip with a note in the
         # undo branch) rather than silently mutating the wrong (top) graph.
         return None
+    except Exception:
+        return None
+def _modular_ctrl(ap):
+    # cross-module (controlrig_cpp.py) undo: resolve the UModularRigController for a MODULAR control rig.
+    bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+    if bp is None or not isinstance(bp, unreal.ControlRigBlueprint):
+        return None
+    try:
+        return bp.get_modular_rig_controller()
     except Exception:
         return None
 # --- sequencer_edit.py (G1-A) undo helpers: locator + enum maps + key-state restorer ---
@@ -1141,6 +1413,629 @@ def _keytype_cls(short):
     if cn is None:
         return None
     return _try(lambda: unreal.load_object(None, "/Script/AIModule." + cn))
+# ---- StateTree undo helpers (statetree_write.py inverses; see statetree-authoring-recipe) ----
+ST_PROP = {"task": "tasks", "condition": "enter_conditions", "consideration": "considerations",
+           "evaluator": "evaluators", "global_task": "global_tasks"}
+def _st_find_ed(st):
+    for i in range(0, 16):
+        try:
+            o = unreal.find_object(st, "StateTreeEditorData_%d" % i)
+            if o is not None:
+                return o
+        except Exception:
+            pass
+    try:
+        o = unreal.find_object(st, "StateTreeEditorData")
+        if o is not None:
+            return o
+    except Exception:
+        pass
+    return None
+def _st_iter(ed):
+    out = []
+    def rec(s):
+        out.append(s)
+        for c in list(s.get_editor_property("children") or []):
+            if c is not None:
+                rec(c)
+    for r in list(ed.get_editor_property("sub_trees") or []):
+        if r is not None:
+            rec(r)
+    return out
+def _st_find(ed, name):
+    if not name:
+        return None
+    for s in _st_iter(ed):
+        try:
+            if str(s.get_editor_property("name")) == name:
+                return s
+        except Exception:
+            pass
+    return None
+def _st_append(obj, prop, item):
+    arr = obj.get_editor_property(prop); arr.append(item); obj.set_editor_property(prop, arr)
+def _st_import_node(export_text):
+    en = unreal.StateTreeEditorNode()
+    try:
+        en.import_text(export_text)
+    except Exception:
+        pass
+    return en
+def _st_owner(ed, kind, state_name):
+    if kind in ("evaluator", "global_task"):
+        return ed
+    return _st_find(ed, state_name)
+def _st_rebuild_state(ed, snap):
+    s = unreal.new_object(unreal.StateTreeState, ed)
+    s.set_editor_property("name", snap.get("name"))
+    for key, prop in (("tasks", "tasks"), ("conditions", "enter_conditions"), ("considerations", "considerations")):
+        for tx in (snap.get(key) or []):
+            if tx:
+                _st_append(s, prop, _st_import_node(tx))
+    for cs in (snap.get("children") or []):
+        _st_append(s, "children", _st_rebuild_state(ed, cs))
+    return s
+def _st_import_transition(tx):
+    tr = unreal.StateTreeTransition()
+    try:
+        tr.import_text(tx)
+    except Exception:
+        pass
+    return tr
+ST_STATE_ENUM = {"type": "StateTreeStateType", "selection_behavior": "StateTreeStateSelectionBehavior"}
+def _st_coerce_state(prop, prior_s):
+    if prop in ST_STATE_ENUM:
+        e = getattr(unreal, ST_STATE_ENUM[prop], None)
+        return getattr(e, str(prior_s), None) if e is not None else prior_s
+    if prop == "weight":
+        try:
+            return float(prior_s)
+        except Exception:
+            return 0.0
+    return str(prior_s)
+# ---- asset_ops.py undo helpers (reference-preserving rename inverse) ----
+def _ao_dirof(p):
+    return str(p).rsplit("/", 1)[0]
+def _ao_nameof(p):
+    return str(p).rsplit("/", 1)[-1]
+def _ao_rename(src, dst_dir, nm):
+    o = unreal.EditorAssetLibrary.load_asset(src)
+    if o is None:
+        return False
+    ard = unreal.AssetRenameData()
+    ard.set_editor_property("asset", o)
+    ard.set_editor_property("new_package_path", dst_dir)
+    ard.set_editor_property("new_name", nm)
+    ok = unreal.AssetToolsHelpers.get_asset_tools().rename_assets([ard])
+    try:
+        unreal.EditorAssetLibrary.save_asset(dst_dir + "/" + nm, only_if_is_dirty=False)
+    except Exception:
+        pass
+    return bool(ok)
+# ---- widgets_write2.py undo helpers (ported verbatim; self-describing marker-dict priors) ----
+def _ww_find_widget(wb, name):
+    try:
+        wt = unreal.find_object(wb, "WidgetTree")
+    except Exception:
+        wt = None
+    if wt is None:
+        return None
+    try:
+        w = unreal.find_object(wt, name)
+    except Exception:
+        w = None
+    return w if isinstance(w, unreal.Widget) else None
+def _ww_compile_save(wb, path):
+    try:
+        unreal.BlueprintEditorLibrary.compile_blueprint(wb)
+    except Exception:
+        pass
+    try:
+        unreal.EditorAssetLibrary.save_asset(path, only_if_is_dirty=False)
+    except Exception:
+        pass
+def _ww_v2(a):
+    return unreal.Vector2D(float(a[0]), float(a[1]))
+def _ww_mk_margin(a):
+    if isinstance(a, (int, float)):
+        return unreal.Margin(float(a), float(a), float(a), float(a))
+    if isinstance(a, (list, tuple)):
+        if len(a) == 4:
+            return unreal.Margin(float(a[0]), float(a[1]), float(a[2]), float(a[3]))
+        if len(a) == 2:
+            return unreal.Margin(float(a[0]), float(a[1]), float(a[0]), float(a[1]))
+        if len(a) == 1:
+            return unreal.Margin(float(a[0]), float(a[0]), float(a[0]), float(a[0]))
+    return None
+def _ww_mk_anchors(a):
+    an = unreal.Anchors()
+    if isinstance(a, (list, tuple)):
+        if len(a) == 4:
+            an.minimum = unreal.Vector2D(float(a[0]), float(a[1])); an.maximum = unreal.Vector2D(float(a[2]), float(a[3])); return an
+        if len(a) == 2:
+            an.minimum = unreal.Vector2D(float(a[0]), float(a[1])); an.maximum = unreal.Vector2D(float(a[0]), float(a[1])); return an
+    return None
+def _ww_mk_childsize(val, rule):
+    scs = unreal.SlateChildSize()
+    try:
+        scs.set_editor_property("value", float(val))
+    except Exception:
+        pass
+    if rule is not None:
+        r = getattr(unreal.SlateSizeRule, str(rule), None) or getattr(unreal.SlateSizeRule, str(rule).upper(), None)
+        if r is not None:
+            try:
+                scs.set_editor_property("size_rule", r)
+            except Exception:
+                pass
+    return scs
+def _ww_enum_coerce(current, name):
+    cls = type(current) if isinstance(current, unreal.EnumBase) else None
+    if cls is None:
+        return None
+    for cand in (str(name), str(name).upper()):
+        e = getattr(cls, cand, None)
+        if e is not None:
+            return e
+    return None
+def _ww_desr(current, value):
+    if isinstance(value, dict):
+        if "__v2__" in value: return _ww_v2(value["__v2__"])
+        if "__v3__" in value:
+            a = value["__v3__"]; return unreal.Vector(float(a[0]), float(a[1]), float(a[2]))
+        if "__margin__" in value: return _ww_mk_margin(value["__margin__"])
+        if "__anchors__" in value: return _ww_mk_anchors(value["__anchors__"])
+        if "__childsize__" in value:
+            a = value["__childsize__"]; return _ww_mk_childsize(a[0], a[1] if len(a) > 1 else None)
+        if "__lincolor__" in value:
+            a = value["__lincolor__"]; return unreal.LinearColor(float(a[0]), float(a[1]), float(a[2]), float(a[3]))
+        if "__color__" in value:
+            a = value["__color__"]; return unreal.Color(r=int(a[0]), g=int(a[1]), b=int(a[2]), a=int(a[3]))
+        if "__enum__" in value:
+            e = _ww_enum_coerce(current, value["__enum__"]); return e if e is not None else current
+        if "__object__" in value:
+            p = value["__object__"]; return unreal.EditorAssetLibrary.load_asset(p) if p else None
+    if isinstance(current, unreal.EnumBase):
+        e = _ww_enum_coerce(current, value); return e if e is not None else current
+    if isinstance(current, unreal.Text):
+        return str(value)
+    if isinstance(current, unreal.Name):
+        return unreal.Name(str(value))
+    if isinstance(current, bool):
+        return bool(value)
+    return value
+def _ww_slot_get(slot, prop):
+    g = getattr(slot, "get_" + prop, None)
+    if g is not None:
+        try:
+            return g()
+        except Exception:
+            pass
+    try:
+        return slot.get_editor_property(prop)
+    except Exception:
+        return None
+def _ww_slot_set(slot, prop, val):
+    s = getattr(slot, "set_" + prop, None)
+    if s is not None:
+        try:
+            s(val); return True
+        except Exception:
+            pass
+    try:
+        slot.set_editor_property(prop, val); return True
+    except Exception:
+        return False
+def _scg_nname(n):
+    try:
+        return n.get_name()
+    except Exception:
+        return None
+def _scg_children(n):
+    try:
+        return list(n.get_editor_property("child_nodes") or [])
+    except Exception:
+        return []
+def _scg_load_cue(path):
+    try:
+        o = unreal.load_object(None, path)
+        if o is not None:
+            return o
+    except Exception:
+        pass
+    try:
+        return unreal.EditorAssetLibrary.load_asset(path)
+    except Exception:
+        return None
+def _scg_resolve(cue, ident):
+    if not ident or cue is None:
+        return None
+    pth = str(ident) if ":" in str(ident) else (cue.get_path_name() + ":" + str(ident))
+    try:
+        o = unreal.load_object(None, pth)
+        if isinstance(o, unreal.SoundNode):
+            return o
+    except Exception:
+        pass
+    found = {"n": None}
+    seen = set()
+    def _w(n):
+        if n is None or found["n"] is not None:
+            return
+        nm = _scg_nname(n)
+        if nm in seen:
+            return
+        seen.add(nm)
+        if nm == str(ident):
+            found["n"] = n
+            return
+        for c in _scg_children(n):
+            _w(c)
+    try:
+        _w(cue.get_editor_property("first_node"))
+    except Exception:
+        pass
+    return found["n"]
+def _scg_write_children(node, names, cue):
+    arr = unreal.Array(unreal.SoundNode)
+    for nm in (names or []):
+        if nm is None:
+            continue
+        r = _scg_resolve(cue, nm)
+        if r is not None:
+            try:
+                arr.append(r)
+            except Exception:
+                pass
+    node.set_editor_property("child_nodes", arr)
+def _scg_restore_prop(node, key, cap):
+    k = cap.get("kind")
+    if k == "none":
+        node.set_editor_property(key, None)
+    elif k == "scalar":
+        node.set_editor_property(key, cap.get("value"))
+    elif k == "enum":
+        node.set_editor_property(key, getattr(getattr(unreal, cap.get("enum_type")), cap.get("member")))
+    elif k == "object":
+        _p = cap.get("path")
+        node.set_editor_property(key, unreal.EditorAssetLibrary.load_asset(_p) if _p else None)
+    elif k in ("name", "text"):
+        node.set_editor_property(key, cap.get("value"))
+def _scg_save(cue):
+    try:
+        unreal.EditorAssetLibrary.save_asset(cue.get_path_name(), only_if_is_dirty=False)
+    except Exception:
+        pass
+def _mg_save(path):
+    try:
+        _o = unreal.EditorAssetLibrary.load_asset(path)
+        if _o is not None:
+            unreal.EditorLoadingAndSavingUtils.save_packages([_o.get_outermost()], False)
+    except Exception:
+        pass
+def _ms_fobb(path):
+    # load a MetaSound + return an edit-in-place builder (find_or_begin_building), or None.
+    try:
+        ms = unreal.EditorAssetLibrary.load_asset(path)
+        if ms is None:
+            return None
+        es = unreal.get_editor_subsystem(unreal.MetaSoundEditorSubsystem)
+        b, r = es.find_or_begin_building(ms)
+        return b
+    except Exception:
+        return None
+def _ms_node(guid):
+    h = unreal.MetaSoundNodeHandle()
+    h.import_text("(NodeID=" + str(guid) + ")")
+    return h
+def _ms_lit(text):
+    lit = unreal.MetasoundFrontendLiteral()
+    try:
+        if text:
+            lit.import_text(text)
+    except Exception:
+        pass
+    return lit
+def _ms_save(path):
+    try:
+        unreal.EditorAssetLibrary.save_asset(path, only_if_is_dirty=False)
+    except Exception:
+        pass
+_PCG_IN_TOK = ("input", "__input__", "in", "inputnode")
+_PCG_OUT_TOK = ("output", "__output__", "out", "outputnode")
+def _pcg_load_graph(p):
+    a = unreal.EditorAssetLibrary.load_asset(p) if p else None
+    if a is None or not isinstance(a, unreal.PCGGraph):
+        return None
+    return a
+def _pcg_resolve_node(g, node_id):
+    if node_id is None or g is None:
+        return None
+    key = str(node_id); kl = key.lower()
+    if kl in _PCG_IN_TOK:
+        return g.get_input_node()
+    if kl in _PCG_OUT_TOK:
+        return g.get_output_node()
+    for n in list(g.get_editor_property("nodes") or []):
+        try:
+            if n.get_name() == key:
+                return n
+        except Exception:
+            pass
+    for getter in (g.get_input_node, g.get_output_node):
+        try:
+            nn = getter()
+            if nn is not None and nn.get_name() == key:
+                return nn
+        except Exception:
+            pass
+    return None
+def _pcg_save(g):
+    try:
+        unreal.EditorLoadingAndSavingUtils.save_packages([g.get_outermost()], False)
+    except Exception:
+        pass
+def _pcg_enum_name(v):
+    s = str(v)
+    if "." in s and ":" in s:
+        return s.split(".")[-1].split(":")[0].strip()
+    return s
+def _pcg_coerce(current, value):
+    if value is None:
+        return None
+    if isinstance(value, dict) and "__object__" in value:
+        _p = value["__object__"]
+        return unreal.EditorAssetLibrary.load_asset(_p) if _p else None
+    if isinstance(value, dict) and "__enum__" in value and isinstance(current, unreal.EnumBase):
+        try:
+            return getattr(type(current), value["__enum__"])
+        except Exception:
+            return current
+    if isinstance(current, unreal.Vector) and isinstance(value, (list, tuple)) and len(value) >= 3:
+        return unreal.Vector(float(value[0]), float(value[1]), float(value[2]))
+    if isinstance(current, unreal.Vector2D) and isinstance(value, (list, tuple)) and len(value) >= 2:
+        return unreal.Vector2D(float(value[0]), float(value[1]))
+    if isinstance(current, unreal.Rotator) and isinstance(value, (list, tuple)) and len(value) >= 3:
+        return unreal.Rotator(pitch=float(value[0]), yaw=float(value[1]), roll=float(value[2]))
+    if (isinstance(current, unreal.LinearColor) or isinstance(current, unreal.Color)) and isinstance(value, (list, tuple)) and len(value) >= 3:
+        _aa = float(value[3]) if len(value) > 3 else 1.0
+        if isinstance(current, unreal.LinearColor):
+            return unreal.LinearColor(float(value[0]), float(value[1]), float(value[2]), _aa)
+        return unreal.Color(r=int(value[0]), g=int(value[1]), b=int(value[2]), a=int(_aa))
+    if isinstance(current, unreal.EnumBase) and isinstance(value, str):
+        try:
+            return getattr(type(current), value)
+        except Exception:
+            return value
+    if (current is None or isinstance(current, unreal.Object)) and isinstance(value, str):
+        _obj = None
+        try:
+            _obj = unreal.EditorAssetLibrary.load_asset(value)
+        except Exception:
+            _obj = None
+        if _obj is not None:
+            return _obj
+        if isinstance(current, unreal.Object):
+            return None
+        return value
+    if isinstance(current, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+    if isinstance(current, int) and not isinstance(current, bool):
+        try:
+            return int(value)
+        except Exception:
+            return current
+    if isinstance(current, float):
+        try:
+            return float(value)
+        except Exception:
+            return current
+    return value
+def _pcg_resolve_settings_class(name):
+    base = getattr(unreal, "PCGSettings", None)
+    if base is None or not name:
+        return None
+    def _ok(c):
+        try:
+            return isinstance(c, type) and issubclass(c, base) and c is not base
+        except Exception:
+            return False
+    cand = getattr(unreal, name, None)
+    if _ok(cand):
+        return cand
+    compact = str(name).replace("_", "").replace(" ", "").lower()
+    for nm in dir(unreal):
+        c = getattr(unreal, nm, None)
+        if _ok(c) and nm.lower() in (compact, "pcg" + compact, compact + "settings", "pcg" + compact + "settings"):
+            return c
+    for nm in dir(unreal):
+        c = getattr(unreal, nm, None)
+        if _ok(c) and compact in nm.lower():
+            return c
+    return None
+def _sq_find_binding(seq, sel):
+    for b in (seq.get_bindings() or []):
+        dn = None; nm = None
+        try:
+            dn = str(b.get_display_name())
+        except Exception:
+            pass
+        try:
+            nm = str(b.get_name())
+        except Exception:
+            pass
+        if sel in (dn, nm):
+            return b
+    return None
+def _sq_container(seq, binding_name):
+    if binding_name in (None, ""):
+        return seq
+    return _sq_find_binding(seq, binding_name)
+def _sq_exact_tracks(container, cls):
+    try:
+        return list(container.find_tracks_by_exact_type(cls) or [])
+    except Exception:
+        out = []
+        for t in (container.get_tracks() or []):
+            try:
+                if t.get_class() == cls or t.get_class().get_name() == cls.__name__:
+                    out.append(t)
+            except Exception:
+                pass
+        return out
+def _sq_track_list(seq, binding_sel):
+    if binding_sel in (None, ""):
+        return list(seq.get_tracks() or []), None
+    b = _sq_find_binding(seq, binding_sel)
+    if b is None:
+        return None, "binding not found: %s" % binding_sel
+    return list(b.get_tracks() or []), None
+def _sq_locate_track(seq, binding_sel, track_index):
+    tl, err = _sq_track_list(seq, binding_sel)
+    if err:
+        return None, err
+    ti = int(track_index)
+    if ti < 0 or ti >= len(tl):
+        return None, "track_index %d out of range (track_count=%d)" % (ti, len(tl))
+    return tl[ti], None
+def _sq_locate_section(seq, binding_sel, track_index, section_index):
+    tr, err = _sq_locate_track(seq, binding_sel, track_index)
+    if err:
+        return None, None, err
+    secs = list(tr.get_sections() or [])
+    si = int(section_index)
+    if si < 0 or si >= len(secs):
+        return None, tr, "section_index %d out of range (section_count=%d)" % (si, len(secs))
+    return secs[si], tr, None
+def _sq_emap(cls, pairs):
+    m = {}
+    for nm, attr in pairs:
+        v = getattr(cls, attr, None)
+        if v is not None:
+            m[nm] = v
+    return m
+_SQ_INTERP = _sq_emap(unreal.RichCurveInterpMode, [("constant", "RCIM_CONSTANT"), ("linear", "RCIM_LINEAR"), ("cubic", "RCIM_CUBIC")])
+_SQ_TANMODE = _sq_emap(unreal.RichCurveTangentMode, [("auto", "RCTM_AUTO"), ("user", "RCTM_USER"), ("break", "RCTM_BREAK")])
+_SQ_EXTRAP = _sq_emap(unreal.RichCurveExtrapolation, [("constant", "RCCE_CONSTANT"), ("cycle", "RCCE_CYCLE"), ("cycle_with_offset", "RCCE_CYCLE_WITH_OFFSET"), ("oscillate", "RCCE_OSCILLATE"), ("linear", "RCCE_LINEAR")])
+_SQ_BLEND = _sq_emap(unreal.MovieSceneBlendType, [("absolute", "ABSOLUTE"), ("additive", "ADDITIVE"), ("relative", "RELATIVE"), ("additive_from_base", "ADDITIVE_FROM_BASE"), ("override", "OVERRIDE")])
+def _sq_name_of(m, v):
+    for k2, vv in m.items():
+        try:
+            if vv == v:
+                return k2
+        except Exception:
+            pass
+    return None
+def _sq_enum_of(m, name):
+    if name is None:
+        return None
+    return m.get(str(name).strip().lower())
+def _sq_jval(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return str(v)
+        except Exception:
+            return None
+def _sq_rebuild_channel(ch, cd):
+    try:
+        if cd.get("has_default"):
+            ch.set_default(cd.get("default"))
+    except Exception:
+        pass
+    try:
+        pe = _sq_enum_of(_SQ_EXTRAP, cd.get("pre")); po = _sq_enum_of(_SQ_EXTRAP, cd.get("post"))
+        if pe is not None: ch.set_pre_infinity_extrapolation(pe)
+        if po is not None: ch.set_post_infinity_extrapolation(po)
+    except Exception:
+        pass
+    for kd in cd.get("keys", []):
+        try:
+            k = ch.add_key(unreal.FrameNumber(int(kd["frame"])), kd["value"])
+        except Exception:
+            continue
+        try:
+            im = _sq_enum_of(_SQ_INTERP, kd.get("interp"))
+            if im is not None: k.set_interpolation_mode(im)
+            tm = _sq_enum_of(_SQ_TANMODE, kd.get("tanmode"))
+            if tm is not None: k.set_tangent_mode(tm)
+            if kd.get("arrive") is not None: k.set_arrive_tangent(float(kd["arrive"]))
+            if kd.get("leave") is not None: k.set_leave_tangent(float(kd["leave"]))
+        except Exception:
+            pass
+def _sq_rebuild_section(sec, sd):
+    try:
+        if sd.get("has_start") and sd.get("has_end"):
+            sec.set_range(int(sd["start"]), int(sd["end"]))
+        else:
+            if sd.get("has_start") and sd.get("start") is not None: sec.set_start_frame(int(sd["start"]))
+            if sd.get("has_end") and sd.get("end") is not None: sec.set_end_frame(int(sd["end"]))
+    except Exception:
+        pass
+    try:
+        if sd.get("row") is not None: sec.set_row_index(int(sd["row"]))
+    except Exception:
+        pass
+    try:
+        be = _sq_enum_of(_SQ_BLEND, sd.get("blend"))
+        if be is not None: sec.set_blend_type(be)
+    except Exception:
+        pass
+    try:
+        if sd.get("ease_in") is not None: sec.set_ease_in_duration(int(sd["ease_in"]))
+        if sd.get("ease_out") is not None: sec.set_ease_out_duration(int(sd["ease_out"]))
+    except Exception:
+        pass
+    refs = sd.get("refs") or {}
+    try:
+        if refs.get("sound"):
+            sec.set_sound(unreal.EditorAssetLibrary.load_asset(refs["sound"]))
+        if refs.get("animation"):
+            p = sec.get_editor_property("params"); p.set_editor_property("animation", unreal.EditorAssetLibrary.load_asset(refs["animation"])); sec.set_editor_property("params", p)
+        if refs.get("play_rate") is not None:
+            v = unreal.MovieSceneTimeWarpVariant(); v.set_fixed_play_rate(float(refs["play_rate"])); sec.set_editor_property("time_warp", v)
+    except Exception:
+        pass
+    chans = list(sec.get_all_channels() or [])
+    for i, cd in enumerate(sd.get("channels", [])):
+        if i < len(chans):
+            _sq_rebuild_channel(chans[i], cd)
+def _sq_rebuild_track(tr, td):
+    for sd in td.get("sections", []):
+        try:
+            sec = tr.add_section()
+        except Exception:
+            continue
+        _sq_rebuild_section(sec, sd)
+def _sq_keyframe_val(k):
+    return int(k.get_time().frame_number.value)
+def _sq_inv_add_key(ent):
+    seq = unreal.EditorAssetLibrary.load_asset(ent["asset_path"])
+    if seq is None:
+        return
+    sec, tr, err = _sq_locate_section(seq, ent.get("binding"), ent.get("track_index", 0), ent.get("section_index", 0))
+    if err or sec is None:
+        return
+    chans = list(sec.get_all_channels() or [])
+    ci = int(ent["channel_index"])
+    if ci < 0 or ci >= len(chans):
+        return
+    ch = chans[ci]
+    frame = int(ent["frame"])
+    target = None
+    for k in (ch.get_keys() or []):
+        if _sq_keyframe_val(k) == frame:
+            target = k; break
+    if ent.get("had_key"):
+        ch.add_key(unreal.FrameNumber(frame), ent.get("prior_value"))
+    else:
+        if target is not None:
+            ch.remove_key(target)
 for _ in range(count):
     if not led:
         break
@@ -1945,6 +2840,195 @@ for _ in range(count):
             _save_niag(sysobj, ap)
             undone.append({**entry, "result": "emitter-re-added"})
             sysobj = None; src = None
+    elif op == "set_niagara_renderer_property":
+        # cross-module (niagara_write2.py, C++ #19): re-set the renderer property to the captured prior value. FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None or not hasattr(mrl, "set_niagara_renderer_property"):
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.set_niagara_renderer_property(ap, entry.get("emitter"), int(entry.get("renderer_index") or 0),
+                entry.get("property"), entry.get("prev_value_json") or "")
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-renderer-property-restored"})
+            sysobj = None
+    elif op == "set_niagara_renderer_binding":
+        # cross-module (niagara_write2.py, C++ #19): restore prior renderer binding source. FAITHFUL (best-effort).
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None or not hasattr(mrl, "set_niagara_renderer_binding"):
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.set_niagara_renderer_binding(ap, entry.get("emitter"), int(entry.get("renderer_index") or 0),
+                entry.get("binding"), entry.get("prev_source") or "")
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-renderer-binding-restored"})
+            sysobj = None
+    elif op == "duplicate_niagara_emitter":
+        # cross-module (niagara_write2.py, C++ #19): remove the duplicated emitter handle (by id). FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        hid = entry.get("handle_id")
+        if sysobj is None or mrl is None or not hasattr(mrl, "remove_emitter_from_system") or not hid:
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.remove_emitter_from_system(sysobj, str(hid))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-duplicate-emitter-removed"})
+            sysobj = None
+    elif op == "reorder_niagara_emitter":
+        # cross-module (niagara_write2.py, C++ #19): reorder the handle back to its prior index. FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        pi = entry.get("prev_index")
+        if sysobj is None or mrl is None or not hasattr(mrl, "reorder_niagara_emitter_handle") or pi is None:
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.reorder_niagara_emitter_handle(sysobj, entry.get("emitter"), int(pi))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-reorder-restored"})
+            sysobj = None
+    elif op == "set_niagara_module_enabled":
+        # cross-module (niagara_runtime_cpp.py, C++ #24): re-set the module's prior enabled flag. FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None or not hasattr(mrl, "set_niagara_module_enabled"):
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.set_niagara_module_enabled(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), bool(entry.get("prev_enabled")))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-module-enabled-restored"})
+            sysobj = None
+    elif op == "reorder_niagara_module":
+        # cross-module (niagara_runtime_cpp.py, C++ #29): reorder the module back to its prior index via the SAFE
+        # V2 handler (correct index math; the old MoveModule-in-place ReorderNiagaraModule crashed and is retired). FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        pi = entry.get("prev_index")
+        if sysobj is None or mrl is None or not hasattr(mrl, "reorder_niagara_module_v2") or pi is None:
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        else:
+            mrl.reorder_niagara_module_v2(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), int(pi))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-module-reorder-restored"})
+            sysobj = None
+    elif op == "set_niagara_dynamic_input":
+        # cross-module (niagara_runtime_cpp.py, C++ #26): clear the created dynamic-input override. FAITHFUL (fresh input).
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None or not hasattr(mrl, "clear_niagara_input_override"):
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        elif entry.get("had_override"):
+            undone.append({**entry, "result": "had-prior-override-skipped-lossy"})
+        else:
+            mrl.clear_niagara_input_override(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), entry.get("input"))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-dynamic-input-cleared"})
+            sysobj = None
+    elif op == "set_niagara_stack_value":
+        # cross-module (niagara_runtime_cpp.py, C++ #26): re-set a prior LOCAL value, else clear the fresh override. FAITHFUL.
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None:
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        elif entry.get("had_override") and entry.get("prev_value") not in (None, "") and hasattr(mrl, "set_niagara_stack_value"):
+            mrl.set_niagara_stack_value(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), entry.get("input"), "local", entry.get("prev_value"))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-stack-value-restored"})
+            sysobj = None
+        elif hasattr(mrl, "clear_niagara_input_override"):
+            mrl.clear_niagara_input_override(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), entry.get("input"))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-stack-value-cleared"})
+            sysobj = None
+        else:
+            undone.append({**entry, "result": "handler-absent"})
+    elif op == "set_niagara_curve":
+        # cross-module (niagara_runtime_cpp.py, C++ #26): clear the created curve-DI override. FAITHFUL (fresh input).
+        ap = entry.get("asset_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sysobj is None or mrl is None or not hasattr(mrl, "clear_niagara_input_override"):
+            undone.append({**entry, "result": "system-or-handler-absent"})
+        elif entry.get("had_override"):
+            undone.append({**entry, "result": "had-prior-override-skipped-lossy"})
+        else:
+            mrl.clear_niagara_input_override(ap, entry.get("emitter"), entry.get("script_usage") or "",
+                entry.get("module"), entry.get("input"))
+            _save_niag(sysobj, ap)
+            undone.append({**entry, "result": "niagara-curve-cleared"})
+            sysobj = None
+    elif op == "niagara_add_scratch_pad":
+        # cross-module (niagara_graph_cpp.py, C++ #27): remove the scratch-pad script we added (by name). FAITHFUL (best-effort).
+        ap = entry.get("system_path")
+        sysobj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        nm = str(entry.get("script_name") or "")
+        if sysobj is None or not nm:
+            undone.append({**entry, "result": "system-or-name-absent"})
+        else:
+            try:
+                _sp = list(sysobj.get_editor_property("scratch_pad_scripts") or [])
+                _keep = [s for s in _sp if s is not None and str(s.get_name()) != nm]
+                if len(_keep) != len(_sp):
+                    sysobj.set_editor_property("scratch_pad_scripts", _keep)
+                    try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                    except Exception: pass
+                    undone.append({**entry, "result": "niagara-scratch-pad-removed"})
+                else:
+                    undone.append({**entry, "result": "scratch-pad-not-found"})
+            except Exception:
+                undone.append({**entry, "result": "scratch-pad-remove-failed"})
+            sysobj = None
+    elif op == "niagara_add_graph_node":
+        # cross-module (niagara_graph_cpp.py, C++ #27): delete the graph node we added (by guid). FAITHFUL.
+        sp = entry.get("script_path"); mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if not sp or mrl is None or not hasattr(mrl, "delete_niagara_graph_node") or not entry.get("node_guid"):
+            undone.append({**entry, "result": "script-or-handler-absent"})
+        else:
+            mrl.delete_niagara_graph_node(sp, str(entry.get("node_guid")))
+            try: unreal.EditorAssetLibrary.save_asset(sp, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "niagara-graph-node-removed"})
+    elif op == "niagara_build_graph":
+        # cross-module (niagara_graph_cpp.py, C++ #27): delete each node the build created. FAITHFUL.
+        sp = entry.get("script_path"); mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if not sp or mrl is None or not hasattr(mrl, "delete_niagara_graph_node"):
+            undone.append({**entry, "result": "script-or-handler-absent"})
+        else:
+            _bn = 0
+            for _g in (entry.get("node_guids") or []):
+                try: mrl.delete_niagara_graph_node(sp, str(_g)); _bn = _bn + 1
+                except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(sp, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "niagara-build-graph-reverted-" + str(_bn)})
+    elif op == "niagara_delete_graph_node":
+        # cross-module (niagara_graph_cpp.py, C++ #27): no clean programmatic re-create; editor native undo only.
+        undone.append({**entry, "result": "delete-graph-node-non-invertible-native-undo-only"})
+    elif op == "niagara_layout_graph":
+        # cross-module (niagara_graph_cpp.py, C++ #27): restore the captured prior node positions. FAITHFUL.
+        sp = entry.get("script_path"); mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        pp = entry.get("prior_positions") or {}
+        if not sp or mrl is None or not hasattr(mrl, "layout_niagara_graph") or not pp:
+            undone.append({**entry, "result": "script-or-handler-absent"})
+        else:
+            mrl.layout_niagara_graph(sp, json.dumps({"restore_positions": pp}))
+            try: unreal.EditorAssetLibrary.save_asset(sp, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "niagara-layout-restored"})
     elif op == "add_user_param":
         # cross-module (niagara_write.py, C++ #10): remove the user parameter we added. FAITHFUL.
         ap = entry.get("asset_path")
@@ -3424,6 +4508,46 @@ for _ in range(count):
                 undone.append({**entry, "result": "bt-comp-decorator-reverted"})
             else:
                 undone.append({**entry, "result": "bt-child-index-stale"})
+    elif op == "bt_reparent":
+        # cross-module (bt_write3.py): move the reparented child slot back to its old parent/index. FAITHFUL
+        # (the exact slot with its wrapped node + decorators + decorator_ops round-trips). Same-parent vs
+        # cross-parent split; uses the recorded final new_index and pop-then-insert so indices stay correct.
+        ap = entry.get("asset_path")
+        bt = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        src = _bt_resolve(bt, entry.get("new_parent_path")) if bt is not None else None
+        dst = _bt_resolve(bt, entry.get("old_parent_path")) if bt is not None else None
+        sidx = entry.get("new_index"); didx = entry.get("old_index")
+        npp = str(entry.get("new_parent_path") or "").strip() or "root"
+        opp = str(entry.get("old_parent_path") or "").strip() or "root"
+        if bt is None or src is None or dst is None or sidx is None or didx is None:
+            undone.append({**entry, "result": "bt-reparent-target-absent"})
+        elif npp == opp:
+            kids = list(src.get_editor_property("children") or [])
+            if 0 <= sidx < len(kids):
+                slot = kids.pop(sidx)
+                ins = didx if 0 <= didx <= len(kids) else len(kids)
+                kids.insert(ins, slot)
+                src.set_editor_property("children", kids)
+                try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                except Exception: pass
+                undone.append({**entry, "result": "bt-reparented-back"})
+            else:
+                undone.append({**entry, "result": "bt-reparent-index-stale"})
+        else:
+            skids = list(src.get_editor_property("children") or [])
+            if 0 <= sidx < len(skids):
+                slot = skids.pop(sidx)
+                dkids = list(dst.get_editor_property("children") or [])
+                ins = didx if 0 <= didx <= len(dkids) else len(dkids)
+                dkids.insert(ins, slot)
+                src.set_editor_property("children", skids)
+                dst.set_editor_property("children", dkids)
+                try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                except Exception: pass
+                undone.append({**entry, "result": "bt-reparented-back"})
+            else:
+                undone.append({**entry, "result": "bt-reparent-index-stale"})
+        bt = None; src = None; dst = None
     elif op == "bb_remove_key":
         # cross-module (bt_write2.py): re-insert the removed BlackboardData key at its index.
         ap = entry.get("asset_path")
@@ -3951,6 +5075,110 @@ for _ in range(count):
             try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
             except Exception: pass
             undone.append({**entry, "result": "rigvm-local-variable-removed"})
+    elif op == "collapse_rig_vm_nodes":
+        # cross-module (controlrig_graph_write.py): remove the collapse node + re-import the original subgraph. FAITHFUL.
+        ap = entry.get("asset_path"); _c = _crg_ctrl(ap, entry.get("graph_name"))
+        _snap = entry.get("snapshot")
+        if _c is None or not _snap:
+            undone.append({**entry, "result": "cr-graph-or-snapshot-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo collapse_rig_vm_nodes"):
+                try: _c.remove_node_by_name(unreal.Name(str(entry.get("collapse_node_name"))), True, False)
+                except Exception: pass
+                _c.import_nodes_from_text(_snap, True, False)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "rigvm-collapse-reverted"})
+    elif op == "expand_rig_vm_node":
+        # cross-module (controlrig_graph_write.py): remove the expanded children + re-import the library node. FAITHFUL.
+        ap = entry.get("asset_path"); _c = _crg_ctrl(ap, entry.get("graph_name"))
+        _snap = entry.get("snapshot")
+        if _c is None or not _snap:
+            undone.append({**entry, "result": "cr-graph-or-snapshot-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo expand_rig_vm_node"):
+                for _en in (entry.get("expanded_names") or []):
+                    try: _c.remove_node_by_name(unreal.Name(str(_en)), True, False)
+                    except Exception: pass
+                _c.import_nodes_from_text(_snap, True, False)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "rigvm-expand-reverted"})
+    elif op == "promote_rig_vm_node":
+        # cross-module (controlrig_graph_write.py): remove the promoted node + re-import the original node. FAITHFUL.
+        ap = entry.get("asset_path"); _c = _crg_ctrl(ap, entry.get("graph_name"))
+        _snap = entry.get("snapshot")
+        if _c is None or not _snap:
+            undone.append({**entry, "result": "cr-graph-or-snapshot-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo promote_rig_vm_node"):
+                try: _c.remove_node_by_name(unreal.Name(str(entry.get("new_node_name"))), True, False)
+                except Exception: pass
+                _c.import_nodes_from_text(_snap, True, False)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "rigvm-promote-reverted"})
+    elif op == "add_rig_module":
+        # cross-module (controlrig_cpp.py): delete the module we installed (ALSO the mirror_rig_module inverse). FAITHFUL.
+        ap = entry.get("asset_path"); _mc = _modular_ctrl(ap)
+        if _mc is None:
+            undone.append({**entry, "result": "cr-modular-controller-absent"})
+        else:
+            try: _mc.delete_module(unreal.Name(str(entry.get("module_name"))), True)
+            except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "modular-module-deleted"})
+    elif op == "connect_rig_module_connector":
+        # cross-module (controlrig_cpp.py): disconnect the connector we connected (prior target not captured). BEST-EFFORT.
+        ap = entry.get("asset_path"); _mc = _modular_ctrl(ap)
+        if _mc is None:
+            undone.append({**entry, "result": "cr-modular-controller-absent"})
+        else:
+            _ck = unreal.RigElementKey(type=unreal.RigElementType.CONNECTOR, name=unreal.Name(str(entry.get("connector_name"))))
+            try: _mc.disconnect_connector(_ck, True)
+            except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "modular-connector-disconnected(best-effort)"})
+    elif op == "auto_connect_rig_modules":
+        # cross-module (controlrig_cpp.py): LOSSY inverse — disconnect the listed modules' connectors. BEST-EFFORT.
+        ap = entry.get("asset_path"); _mc = _modular_ctrl(ap)
+        if _mc is None:
+            undone.append({**entry, "result": "cr-modular-controller-absent"})
+        else:
+            _dn = 0
+            for _mn in (entry.get("module_names") or []):
+                try:
+                    for _k in (_mc.get_connectors_for_module(unreal.Name(str(_mn))) or []):
+                        try: _mc.disconnect_connector(_k, True); _dn = _dn + 1
+                        except Exception: pass
+                except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "modular-autoconnect-reverted-lossy-" + str(_dn)})
+    elif op == "set_rig_module_config":
+        # cross-module (controlrig_cpp.py): reset the config override we set (prior value not captured). FAITHFUL.
+        ap = entry.get("asset_path"); _mc = _modular_ctrl(ap)
+        if _mc is None:
+            undone.append({**entry, "result": "cr-modular-controller-absent"})
+        else:
+            try: _mc.reset_config_value_in_module(unreal.Name(str(entry.get("module_name"))), unreal.Name(str(entry.get("variable_name"))), True)
+            except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "modular-config-reset"})
+    elif op == "bind_rig_module_variable":
+        # cross-module (controlrig_cpp.py): unbind the module variable we bound. FAITHFUL.
+        ap = entry.get("asset_path"); _mc = _modular_ctrl(ap)
+        if _mc is None:
+            undone.append({**entry, "result": "cr-modular-controller-absent"})
+        else:
+            try: _mc.un_bind_module_variable(unreal.Name(str(entry.get("module_name"))), unreal.Name(str(entry.get("variable_name"))), True)
+            except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "modular-variable-unbound"})
     elif op == "add_event_dispatcher":
         # cross-module (blueprints_write.py): remove the event dispatcher we added (by name). FAITHFUL.
         bp = unreal.EditorAssetLibrary.load_asset(entry.get("bp_path")) if entry.get("bp_path") else None
@@ -4100,10 +5328,4009 @@ for _ in range(count):
             try: unreal.EditorAssetLibrary.save_asset(entry.get("bp_path"), only_if_is_dirty=False)
             except Exception: pass
             undone.append({**entry, "result": "event-node-removed"})
+    elif op == "st_create":
+        # cross-module (statetree_write.py): delete the created StateTree asset. FAITHFUL.
+        ap = entry.get("asset_path")
+        try:
+            if ap and unreal.EditorAssetLibrary.does_asset_exist(ap):
+                unreal.EditorAssetLibrary.delete_asset(ap)
+            undone.append({**entry, "result": "statetree-deleted"})
+        except Exception as e:
+            undone.append({**entry, "result": "delete-failed", "err": str(e)})
+    elif op == "st_add_state":
+        # cross-module (statetree_write.py): remove the state we added, by name. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        target = _st_find(ed, entry.get("state_name")) if ed is not None else None
+        if ed is None or target is None:
+            undone.append({**entry, "result": "state-absent"})
+        else:
+            subs = list(ed.get_editor_property("sub_trees") or [])
+            if target in subs:
+                ed.set_editor_property("sub_trees", [x for x in subs if x != target])
+            else:
+                for s in _st_iter(ed):
+                    kk = list(s.get_editor_property("children") or [])
+                    if target in kk:
+                        s.set_editor_property("children", [x for x in kk if x != target]); break
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "state-removed"})
+    elif op == "st_add_node":
+        # cross-module (statetree_write.py): pop the node we appended at (state,kind,index). FAITHFUL.
+        ap = entry.get("asset_path"); kind = entry.get("kind"); idx = entry.get("index")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        owner = _st_owner(ed, kind, entry.get("state_name")) if ed is not None else None
+        if owner is None or kind not in ST_PROP or idx is None:
+            undone.append({**entry, "result": "node-owner-absent"})
+        else:
+            arr = list(owner.get_editor_property(ST_PROP[kind]) or [])
+            if 0 <= idx < len(arr):
+                del arr[idx]; owner.set_editor_property(ST_PROP[kind], arr)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "node-removed"})
+    elif op == "st_remove_node":
+        # cross-module (statetree_write.py): re-import the removed node at its index. FAITHFUL.
+        ap = entry.get("asset_path"); kind = entry.get("kind"); idx = entry.get("index"); tx = entry.get("export_text")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        owner = _st_owner(ed, kind, entry.get("state_name")) if ed is not None else None
+        if owner is None or kind not in ST_PROP or not tx:
+            undone.append({**entry, "result": "node-owner-or-capture-absent"})
+        else:
+            arr = list(owner.get_editor_property(ST_PROP[kind]) or [])
+            if idx is None or idx > len(arr):
+                idx = len(arr)
+            arr.insert(idx, _st_import_node(tx)); owner.set_editor_property(ST_PROP[kind], arr)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "node-restored"})
+    elif op == "st_remove_state":
+        # cross-module (statetree_write.py): rebuild the snapshotted state subtree under its parent. FAITHFUL.
+        ap = entry.get("asset_path"); snap = entry.get("snapshot"); parent = entry.get("parent")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        if ed is None or not snap:
+            undone.append({**entry, "result": "editor-data-or-snapshot-absent"})
+        else:
+            news = _st_rebuild_state(ed, snap)
+            par = _st_find(ed, parent) if (parent and parent != "(root)") else None
+            if par is not None:
+                _st_append(par, "children", news)
+            else:
+                _st_append(ed, "sub_trees", news)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "state-rebuilt"})
+    elif op == "st_add_transition":
+        # cross-module (statetree_write.py): remove the transition we appended at (state,index). FAITHFUL.
+        ap = entry.get("asset_path"); idx = entry.get("index")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        state = _st_find(ed, entry.get("state_name")) if ed is not None else None
+        if state is None or idx is None:
+            undone.append({**entry, "result": "state-absent"})
+        else:
+            arr = list(state.get_editor_property("transitions") or [])
+            if 0 <= idx < len(arr):
+                del arr[idx]; state.set_editor_property("transitions", arr)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "transition-removed"})
+    elif op == "st_remove_transition":
+        # cross-module (statetree_write.py): re-import the removed transition at its index. FAITHFUL.
+        ap = entry.get("asset_path"); idx = entry.get("index"); tx = entry.get("export_text")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        state = _st_find(ed, entry.get("state_name")) if ed is not None else None
+        if state is None or not tx:
+            undone.append({**entry, "result": "state-or-capture-absent"})
+        else:
+            arr = list(state.get_editor_property("transitions") or [])
+            if idx is None or idx > len(arr):
+                idx = len(arr)
+            arr.insert(idx, _st_import_transition(tx)); state.set_editor_property("transitions", arr)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": "transition-restored"})
+    elif op == "st_set_state_prop":
+        # cross-module (statetree_write.py): restore the prior state property value. FAITHFUL.
+        ap = entry.get("asset_path"); prop = entry.get("property")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        state = _st_find(ed, entry.get("state_name")) if ed is not None else None
+        if state is None or not prop:
+            undone.append({**entry, "result": "state-absent"})
+        else:
+            try:
+                state.set_editor_property(prop, _st_coerce_state(prop, entry.get("prior")))
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                undone.append({**entry, "result": "state-prop-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)})
+    elif op == "st_set_schema":
+        # cross-module (statetree_write.py): restore the prior schema class (or leave if none captured). FAITHFUL.
+        ap = entry.get("asset_path"); pc = entry.get("prior_schema_class")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        ed = _st_find_ed(st) if st is not None else None
+        if ed is None:
+            undone.append({**entry, "result": "editor-data-absent"})
+        else:
+            cls = getattr(unreal, pc, None) if pc else None
+            if cls is not None:
+                ed.set_editor_property("schema", unreal.new_object(cls, ed))
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            undone.append({**entry, "result": ("schema-restored" if cls is not None else "no-prior-schema")})
+    elif op == "asset_move_batch":
+        # cross-module (asset_ops.py): rename each moved asset back (to -> from), LIFO. FAITHFUL.
+        n = 0
+        for it in reversed(entry.get("moves") or []):
+            if _ao_rename(it.get("to"), _ao_dirof(it.get("from")), _ao_nameof(it.get("from"))):
+                n += 1
+        undone.append({**entry, "result": "asset-move-reverted", "restored": n})
+    elif op == "asset_soft_delete":
+        # cross-module (asset_ops.py): rename each asset back out of _MCP_Trash (to -> from). FAITHFUL.
+        n = 0
+        for it in reversed(entry.get("items") or []):
+            if _ao_rename(it.get("to"), _ao_dirof(it.get("from")), _ao_nameof(it.get("from"))):
+                n += 1
+        undone.append({**entry, "result": "asset-soft-delete-restored", "restored": n})
+    elif op == "widget_set_prop":
+        # cross-module (widgets_write2.py): re-set the widget UPROPERTY to its captured prior. FAITHFUL.
+        wb = unreal.EditorAssetLibrary.load_asset(entry.get("wbp_path")) if entry.get("wbp_path") else None
+        w = _ww_find_widget(wb, entry.get("widget_name")) if wb is not None else None
+        prop = entry.get("property")
+        if w is None or not prop:
+            undone.append({**entry, "result": "widget-absent"})
+        else:
+            try:
+                w.set_editor_property(prop, _ww_desr(w.get_editor_property(prop), entry.get("prior")))
+                _ww_compile_save(wb, entry.get("wbp_path"))
+                undone.append({**entry, "result": "widget-prop-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "widget_set_slot_prop":
+        # cross-module (widgets_write2.py): re-apply the captured prior to the widget's slot. FAITHFUL.
+        wb = unreal.EditorAssetLibrary.load_asset(entry.get("wbp_path")) if entry.get("wbp_path") else None
+        w = _ww_find_widget(wb, entry.get("widget_name")) if wb is not None else None
+        prop = entry.get("property")
+        slot = w.slot if (w is not None and hasattr(w, "slot")) else None
+        if slot is None or not prop:
+            undone.append({**entry, "result": "widget-or-slot-absent"})
+        else:
+            _ww_slot_set(slot, prop, _ww_desr(_ww_slot_get(slot, prop), entry.get("prior")))
+            _ww_compile_save(wb, entry.get("wbp_path"))
+            undone.append({**entry, "result": "widget-slot-prop-restored"})
+    elif op == "widget_reparent":
+        # cross-module (widgets_write2.py): reparent the widget back under its prior parent. FAITHFUL (hierarchy).
+        wb = unreal.EditorAssetLibrary.load_asset(entry.get("wbp_path")) if entry.get("wbp_path") else None
+        w = _ww_find_widget(wb, entry.get("widget_name")) if wb is not None else None
+        prior_parent = _ww_find_widget(wb, entry.get("prior_parent_name")) if wb is not None else None
+        if w is None or prior_parent is None or not isinstance(prior_parent, unreal.PanelWidget):
+            undone.append({**entry, "result": "widget-or-prior-parent-absent"})
+        else:
+            try:
+                cur = w.get_parent()
+                if cur is not None:
+                    cur.remove_child(w)
+                prior_parent.add_child(w)
+                _ww_compile_save(wb, entry.get("wbp_path"))
+                undone.append({**entry, "result": "widget-reparented-back"})
+            except Exception as e:
+                undone.append({**entry, "result": "reparent-failed", "err": str(e)[:120]})
+    elif op == "mi_set_parent":
+        # cross-module (materials_write2.py): restore the MIC's prior parent material. FAITHFUL.
+        ap = entry.get("asset_path")
+        mic = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if mic is None:
+            undone.append({**entry, "result": "material-instance-absent"})
+        else:
+            MEL = unreal.MaterialEditingLibrary
+            pp = entry.get("prior_parent_path")
+            par = unreal.EditorAssetLibrary.load_asset(pp) if pp else None
+            with unreal.ScopedEditorTransaction("MCP undo mi_set_parent"):
+                MEL.set_material_instance_parent(mic, par)
+                MEL.update_material_instance(mic)
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            mic = None
+            undone.append({**entry, "result": "mi-parent-restored"})
+    elif op == "mi_clear_param":
+        # cross-module (materials_write2.py): re-apply the prior override value that was cleared. FAITHFUL.
+        ap = entry.get("asset_path")
+        mic = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if mic is None:
+            undone.append({**entry, "result": "material-instance-absent"})
+        else:
+            G = unreal.MaterialParameterAssociation.GLOBAL_PARAMETER
+            MEL = unreal.MaterialEditingLibrary
+            nm = entry.get("parameter_name"); kind = entry.get("param_kind"); prior = entry.get("prior_value")
+            with unreal.ScopedEditorTransaction("MCP undo mi_clear_param"):
+                if kind == "scalar":
+                    MEL.set_material_instance_scalar_parameter_value(mic, nm, float(prior), G)
+                elif kind == "vector":
+                    aa = float(prior[3]) if (isinstance(prior, (list, tuple)) and len(prior) > 3) else 1.0
+                    MEL.set_material_instance_vector_parameter_value(mic, nm, unreal.LinearColor(float(prior[0]), float(prior[1]), float(prior[2]), aa), G)
+                elif kind == "texture":
+                    tex = unreal.EditorAssetLibrary.load_asset(prior) if prior else None
+                    MEL.set_material_instance_texture_parameter_value(mic, nm, tex, G)
+                elif kind == "static_switch":
+                    MEL.set_material_instance_static_switch_parameter_value(mic, nm, bool(prior), G)
+                MEL.update_material_instance(mic)
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            mic = None
+            undone.append({**entry, "result": "mi-param-reoverridden"})
+    elif op == "mi_set_static_switch":
+        # cross-module (materials_write2.py): restore prior static-switch value, or clear override if it was unset before. FAITHFUL.
+        ap = entry.get("asset_path")
+        mic = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if mic is None:
+            undone.append({**entry, "result": "material-instance-absent"})
+        else:
+            G = unreal.MaterialParameterAssociation.GLOBAL_PARAMETER
+            MEL = unreal.MaterialEditingLibrary
+            nm = entry.get("parameter_name"); prior = entry.get("prior_value")
+            with unreal.ScopedEditorTransaction("MCP undo mi_set_static_switch"):
+                if entry.get("was_overridden"):
+                    MEL.set_material_instance_static_switch_parameter_value(mic, nm, bool(prior), G)
+                else:
+                    MEL.set_material_instance_parameter_override(mic, nm, False, G)
+                MEL.update_material_instance(mic)
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            mic = None
+            undone.append({**entry, "result": "mi-static-switch-restored"})
+    elif op == "set_material_property":
+        # cross-module (materials_write2.py): restore a base Material render property (one recompile). FAITHFUL.
+        ap = entry.get("asset_path")
+        mat = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if mat is None:
+            undone.append({**entry, "result": "material-absent"})
+        else:
+            prop = entry.get("property"); kind = entry.get("kind"); prior = entry.get("prior")
+            pv = prior
+            if kind == "enum":
+                ecls = getattr(unreal, entry.get("enum_class"), None)
+                pv = getattr(ecls, prior, None) if ecls is not None else None
+            if kind == "enum" and pv is None:
+                undone.append({**entry, "result": "enum-member-unresolved"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo set_material_property"):
+                    mat.set_editor_property(prop, pv)
+                try:
+                    unreal.MaterialEditingLibrary.recompile_material(mat)
+                except Exception:
+                    pass
+                try:
+                    unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                except Exception:
+                    pass
+                mat = None
+                undone.append({**entry, "result": "material-property-restored"})
+    elif op == "set_bp_var_props":
+        # cross-module (blueprints_write2.py): restore prior variable category/replication. FAITHFUL.
+        bp = unreal.EditorAssetLibrary.load_asset(entry.get("bp_path")) if entry.get("bp_path") else None
+        if bp is None:
+            undone.append({**entry, "result": "blueprint-absent"})
+        else:
+            BEL = unreal.BlueprintEditorLibrary
+            vn = unreal.Name(entry.get("var_name"))
+            with unreal.ScopedEditorTransaction("MCP undo set_bp_var_props"):
+                if entry.get("changed_category"):
+                    BEL.set_blueprint_variable_category(bp, vn, unreal.Text(str(entry.get("prior_category"))))
+                if entry.get("changed_replication") and entry.get("prior_replication"):
+                    rv = getattr(unreal.BlueprintVariableReplication, entry.get("prior_replication"), None)
+                    if rv is not None:
+                        BEL.set_blueprint_variable_replication(bp, vn, rv)
+            try:
+                BEL.compile_blueprint(bp)
+            except Exception:
+                pass
+            try:
+                unreal.EditorAssetLibrary.save_asset(entry.get("bp_path"), only_if_is_dirty=False)
+            except Exception:
+                pass
+            bp = None
+            undone.append({**entry, "result": "bp-var-props-restored"})
+    elif op == "set_bp_class_default":
+        # cross-module (blueprints_write2.py): restore prior CDO default value (one compile). FAITHFUL when restorable.
+        bp = unreal.EditorAssetLibrary.load_asset(entry.get("bp_path")) if entry.get("bp_path") else None
+        if bp is None:
+            undone.append({**entry, "result": "blueprint-absent"})
+        elif not entry.get("restorable"):
+            undone.append({**entry, "result": "prior-not-restorable; skipped"})
+        else:
+            BEL = unreal.BlueprintEditorLibrary
+            gcls = BEL.generated_class(bp)
+            cdo = unreal.get_default_object(gcls) if gcls is not None else None
+            prop = entry.get("property")
+            if cdo is None:
+                undone.append({**entry, "result": "cdo-unresolvable"})
+            else:
+                try:
+                    cur = cdo.get_editor_property(prop)
+                    with unreal.ScopedEditorTransaction("MCP undo set_bp_class_default"):
+                        cdo.set_editor_property(prop, _coerce(cur, entry.get("prior")))
+                    try:
+                        BEL.compile_blueprint(bp)
+                    except Exception:
+                        pass
+                    try:
+                        unreal.EditorAssetLibrary.save_asset(entry.get("bp_path"), only_if_is_dirty=False)
+                    except Exception:
+                        pass
+                    undone.append({**entry, "result": "bp-class-default-restored"})
+                except Exception as e:
+                    undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+                cdo = None
+    elif op == "rename_bp_function":
+        # cross-module (blueprints_write2.py): rename the function graph back. FAITHFUL.
+        bp = unreal.EditorAssetLibrary.load_asset(entry.get("bp_path")) if entry.get("bp_path") else None
+        if bp is None:
+            undone.append({**entry, "result": "blueprint-absent"})
+        else:
+            BEL = unreal.BlueprintEditorLibrary
+            g = None
+            try:
+                g = BEL.find_graph(bp, entry.get("new_name"))
+            except Exception:
+                g = None
+            if g is None:
+                undone.append({**entry, "result": "renamed-graph-not-found"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo rename_bp_function"):
+                    BEL.rename_graph(g, entry.get("old_name"))
+                try:
+                    BEL.compile_blueprint(bp)
+                except Exception:
+                    pass
+                try:
+                    unreal.EditorAssetLibrary.save_asset(entry.get("bp_path"), only_if_is_dirty=False)
+                except Exception:
+                    pass
+                bp = None
+                undone.append({**entry, "result": "bp-function-renamed-back"})
+    elif op == "seq_add_track":
+        # cross-module (sequencer_write_ext.py): remove the generic track we appended (master or binding).
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            cont = _sq_container(seq, entry.get("binding_name"))
+            cls = getattr(unreal, str(entry.get("track_class") or ""), None)
+            if cont is None or cls is None:
+                undone.append({**entry, "result": "seq-container-or-class-absent"})
+            else:
+                ts = _sq_exact_tracks(cont, cls)
+                if len(ts) > int(entry.get("prior_exact_count") or 0):
+                    with unreal.ScopedEditorTransaction("MCP undo seq_add_track"):
+                        cont.remove_track(ts[-1])
+                    undone.append({**entry, "result": "seq-add-track-undone"})
+                else:
+                    undone.append({**entry, "result": "seq-add-track-count-stale"})
+            seq = None
+    elif op == "seq_remove_track":
+        # cross-module (sequencer_write_ext.py): re-add the removed track and rebuild it from snapshot.
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        snap = entry.get("snapshot") or {}
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            cont = _sq_container(seq, entry.get("binding_name"))
+            cls = getattr(unreal, str(entry.get("track_class") or ""), None)
+            if cont is None or cls is None:
+                undone.append({**entry, "result": "seq-container-or-class-absent"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo seq_remove_track"):
+                    tr = cont.add_track(cls)
+                    if tr is not None:
+                        _sq_rebuild_track(tr, snap)
+                undone.append({**entry, "result": "seq-track-rebuilt"})
+            seq = None
+    elif op == "seq_add_section":
+        # cross-module (sequencer_write_ext.py): remove the section we appended to the located track.
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            tr, err = _sq_locate_track(seq, entry.get("binding_name"), entry.get("track_index", 0))
+            if err or tr is None:
+                undone.append({**entry, "result": "seq-track-absent"})
+            else:
+                secs = list(tr.get_sections() or [])
+                if len(secs) > int(entry.get("prior_section_count") or 0):
+                    with unreal.ScopedEditorTransaction("MCP undo seq_add_section"):
+                        tr.remove_section(secs[-1])
+                    undone.append({**entry, "result": "seq-add-section-undone"})
+                else:
+                    undone.append({**entry, "result": "seq-add-section-count-stale"})
+            seq = None
+    elif op == "seq_remove_section":
+        # cross-module (sequencer_write_ext.py): re-add the removed section and rebuild it from snapshot.
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        snap = entry.get("snapshot") or {}
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            tr, err = _sq_locate_track(seq, entry.get("binding_name"), entry.get("track_index", 0))
+            if err or tr is None:
+                undone.append({**entry, "result": "seq-track-absent"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo seq_remove_section"):
+                    sec = tr.add_section()
+                    if sec is not None:
+                        _sq_rebuild_section(sec, snap)
+                undone.append({**entry, "result": "seq-section-rebuilt"})
+            seq = None
+    elif op == "seq_add_event_section":
+        # cross-module (sequencer_write_ext.py): remove the event section (and the event track if we added it).
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            ev_cls = getattr(unreal, "MovieSceneEventTrack", None)
+            ts = _sq_exact_tracks(seq, ev_cls) if ev_cls is not None else []
+            ti = int(entry.get("track_index") or 0)
+            tr = ts[ti] if ti < len(ts) else (ts[-1] if ts else None)
+            if tr is None:
+                undone.append({**entry, "result": "seq-event-track-absent"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo seq_add_event_section"):
+                    secs = list(tr.get_sections() or [])
+                    if len(secs) > int(entry.get("prior_section_count") or 0):
+                        tr.remove_section(secs[-1])
+                    if entry.get("added_track"):
+                        seq.remove_track(tr)
+                undone.append({**entry, "result": "seq-event-section-undone"})
+            seq = None
+    elif op == "seq_add_timewarp":
+        # cross-module (sequencer_write_ext.py): remove the timewarp track (+ its rate section) we appended.
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            cls = getattr(unreal, "MovieSceneTimeWarpTrack", None)
+            ts = _sq_exact_tracks(seq, cls) if cls is not None else []
+            if cls is not None and len(ts) > int(entry.get("prior_exact_count") or 0):
+                with unreal.ScopedEditorTransaction("MCP undo seq_add_timewarp"):
+                    seq.remove_track(ts[-1])
+                undone.append({**entry, "result": "seq-timewarp-undone"})
+            else:
+                undone.append({**entry, "result": "seq-timewarp-count-stale"})
+            seq = None
+    elif op == "seq_add_key":
+        # cross-module (sequencer_edit.py): restore the key that add_key created or overwrote.
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            seq = None
+            with unreal.ScopedEditorTransaction("MCP undo seq_add_key"):
+                _sq_inv_add_key(entry)
+            undone.append({**entry, "result": "seq-add-key-undone"})
+    elif op == "seq_add_keys_batch":
+        # cross-module (sequencer_edit.py): restore every key the batch created or overwrote (reverse order).
+        ap = entry.get("asset_path")
+        seq = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if seq is None:
+            undone.append({**entry, "result": "seq-asset-absent"})
+        else:
+            seq = None
+            with unreal.ScopedEditorTransaction("MCP undo seq_add_keys_batch"):
+                for ent in reversed(entry.get("entries", []) or []):
+                    ee = dict(ent)
+                    ee["asset_path"] = entry.get("asset_path")
+                    ee["binding"] = entry.get("binding")
+                    ee["track_index"] = entry.get("track_index", 0)
+                    ee["section_index"] = entry.get("section_index", 0)
+                    _sq_inv_add_key(ee)
+            undone.append({**entry, "result": "seq-add-keys-batch-undone"})
+    elif op == "rename_folder":
+        # cross-module (editor_complete.py): move the outliner subtree back from new -> old. FAITHFUL
+        # (re-path each moved actor, matched by get_name(), preserving the nested suffix).
+        old = entry.get("old"); new = entry.get("new"); moved = entry.get("moved") or []
+        eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        if eas is None or old is None or new is None:
+            undone.append({**entry, "result": "editor-actor-subsystem-or-fields-absent"})
+        else:
+            mset = set(moved)
+            acted = 0
+            with unreal.ScopedEditorTransaction("MCP undo rename_folder"):
+                for a in (eas.get_all_level_actors() or []):
+                    if not a:
+                        continue
+                    try:
+                        if a.get_name() not in mset:
+                            continue
+                        fp = str(a.get_folder_path() or "")
+                    except Exception:
+                        continue
+                    if fp == new:
+                        a.set_folder_path(unreal.Name(old)); acted += 1
+                    elif fp.startswith(new + "/"):
+                        a.set_folder_path(unreal.Name(old + fp[len(new):])); acted += 1
+            undone.append({**entry, "result": "folder-renamed-back", "moved_back": acted})
+    elif op == "rename_struct_field":
+        # cross-module (structs_write.py): rename the field back (new_name -> old) via C++ RenameStructField. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "rename_struct_field"):
+            undone.append({**entry, "result": "struct-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo rename_struct_field"):
+                mrl.rename_struct_field(obj, entry.get("name"), entry.get("prior_name"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            obj = None
+            undone.append({**entry, "result": "struct-field-renamed-back"})
+    elif op == "change_struct_field_type":
+        # cross-module (structs_write.py): restore the field's prior type via C++ ChangeStructFieldType. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "change_struct_field_type"):
+            undone.append({**entry, "result": "struct-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo change_struct_field_type"):
+                mrl.change_struct_field_type(obj, entry.get("name"), json.dumps(entry.get("prior_type_json") or {}))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            obj = None
+            undone.append({**entry, "result": "struct-field-type-restored"})
+    elif op == "set_struct_field_default":
+        # cross-module (structs_write.py): restore the field's prior default via C++ SetStructFieldDefault. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_struct_field_default"):
+            undone.append({**entry, "result": "struct-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo set_struct_field_default"):
+                mrl.set_struct_field_default(obj, entry.get("name"), entry.get("prior_default") or "")
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            obj = None
+            undone.append({**entry, "result": "struct-field-default-restored"})
+    elif op == "set_struct_field_tooltip":
+        # cross-module (structs_write.py): restore the field's prior tooltip via C++ SetStructFieldTooltip. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_struct_field_tooltip"):
+            undone.append({**entry, "result": "struct-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo set_struct_field_tooltip"):
+                mrl.set_struct_field_tooltip(obj, entry.get("name"), entry.get("prior_tooltip") or "")
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            obj = None
+            undone.append({**entry, "result": "struct-field-tooltip-restored"})
+    elif op == "add_anim_slot":
+        # cross-module (anim_slots_write.py): if slot existed restore prior group, else remove it. FAITHFUL.
+        ap = entry.get("skeleton_path")
+        sk = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sk is None or mrl is None or not hasattr(mrl, "add_skeleton_slot"):
+            undone.append({**entry, "result": "skeleton-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo add_anim_slot"):
+                if entry.get("existed"):
+                    mrl.add_skeleton_slot(sk, entry.get("slot_name"), entry.get("prior_group"))
+                else:
+                    mrl.remove_skeleton_slot(sk, entry.get("slot_name"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            sk = None
+            undone.append({**entry, "result": "anim-slot-add-undone"})
+    elif op == "remove_anim_slot":
+        # cross-module (anim_slots_write.py): re-add the removed slot to its prior group. FAITHFUL.
+        ap = entry.get("skeleton_path")
+        sk = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sk is None or mrl is None or not hasattr(mrl, "add_skeleton_slot"):
+            undone.append({**entry, "result": "skeleton-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo remove_anim_slot"):
+                mrl.add_skeleton_slot(sk, entry.get("slot_name"), entry.get("prior_group"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            sk = None
+            undone.append({**entry, "result": "anim-slot-restored"})
+    elif op == "rename_anim_slot":
+        # cross-module (anim_slots_write.py): rename the slot back. FAITHFUL.
+        ap = entry.get("skeleton_path")
+        sk = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sk is None or mrl is None or not hasattr(mrl, "rename_skeleton_slot"):
+            undone.append({**entry, "result": "skeleton-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo rename_anim_slot"):
+                mrl.rename_skeleton_slot(sk, entry.get("new_name"), entry.get("old_name"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            sk = None
+            undone.append({**entry, "result": "anim-slot-renamed-back"})
+    elif op == "add_anim_slot_group":
+        # cross-module (anim_slots_write.py): remove the group we added (only if we actually added it). FAITHFUL.
+        ap = entry.get("skeleton_path")
+        sk = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sk is None or mrl is None or not hasattr(mrl, "remove_skeleton_slot_group"):
+            undone.append({**entry, "result": "skeleton-or-handler-absent"})
+        elif not entry.get("added"):
+            undone.append({**entry, "result": "anim-slot-group-was-preexisting; noop"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo add_anim_slot_group"):
+                mrl.remove_skeleton_slot_group(sk, entry.get("group_name"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            sk = None
+            undone.append({**entry, "result": "anim-slot-group-add-undone"})
+    elif op == "remove_anim_slot_group":
+        # cross-module (anim_slots_write.py): re-add the group + all its captured slots. FAITHFUL.
+        ap = entry.get("skeleton_path")
+        sk = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if sk is None or mrl is None or not hasattr(mrl, "add_skeleton_slot_group"):
+            undone.append({**entry, "result": "skeleton-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo remove_anim_slot_group"):
+                mrl.add_skeleton_slot_group(sk, entry.get("group_name"))
+                for s in (entry.get("prior_slots") or []):
+                    mrl.add_skeleton_slot(sk, s, entry.get("group_name"))
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            sk = None
+            undone.append({**entry, "result": "anim-slot-group-restored"})
+    elif op == "create_outliner_folder":
+        # cross-module (editor_folders_write.py): delete the folder we created (only if we created it). FAITHFUL (empty).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "delete_outliner_folder"):
+            undone.append({**entry, "result": "handler-absent"})
+        elif not entry.get("created"):
+            undone.append({**entry, "result": "outliner-folder-was-preexisting; noop"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo create_outliner_folder"):
+                mrl.delete_outliner_folder(entry.get("folder_path"))
+            undone.append({**entry, "result": "outliner-folder-create-undone"})
+    elif op == "delete_outliner_folder":
+        # cross-module (editor_folders_write.py): recreate the folder (faithful for EMPTY folders only).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "create_outliner_folder"):
+            undone.append({**entry, "result": "handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo delete_outliner_folder"):
+                mrl.create_outliner_folder(entry.get("folder_path"))
+            undone.append({**entry, "result": "outliner-folder-recreated"})
+    elif op in ("anim_add_state", "anim_add_transition", "anim_set_entry_state", "anim_set_transition_property",
+                "anim_remove_state", "anim_remove_transition", "anim_set_node_pin_exposure",
+                "anim_bind_node_function", "anim_build_state_machine", "anim_create_layer_interface",
+                "anim_add_state_machine", "anim_add_layer"):
+        # cross-module (anim_statemachine_write.py): AnimGraph inverses re-call the C++ handler with captured priors.
+        # Some edges are documented-lossy (rule-graph / prior-null entry not restored). No compile here (GC-safe) — save only.
+        ap = entry.get("asset_path")
+        ab = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or (ab is None and op != "anim_create_layer_interface"):
+            undone.append({**entry, "result": "animbp-or-handler-absent"})
+        else:
+            _m = entry.get("machine"); _res = "anim-inverse-applied"
+            try:
+                with unreal.ScopedEditorTransaction("MCP undo " + op):
+                    if op == "anim_add_state":
+                        mrl.remove_anim_state(ab, _m, entry.get("state"))
+                    elif op == "anim_add_transition":
+                        mrl.remove_anim_transition(ab, _m, entry.get("from_state"), entry.get("to_state"))
+                    elif op == "anim_add_state_machine":
+                        # C++ #19: faithful remover (DestroyNode drops the SM node + its sub-graph + recompiles).
+                        if hasattr(mrl, "remove_anim_state_machine_node"):
+                            mrl.remove_anim_state_machine_node(ab, _m); _res = "anim-state-machine-removed"
+                        else:
+                            _res = "anim-state-machine-remover-absent; deferred"
+                    elif op == "anim_add_layer":
+                        # C++ #19: faithful remover (RemoveGraph on the named anim layer graph).
+                        if hasattr(mrl, "remove_anim_layer_node"):
+                            mrl.remove_anim_layer_node(ab, entry.get("layer_name")); _res = "anim-layer-removed"
+                        else:
+                            _res = "anim-layer-remover-absent; deferred"
+                    elif op == "anim_set_entry_state":
+                        if entry.get("prior_entry_state"):
+                            mrl.set_anim_entry_state(ab, _m, entry.get("prior_entry_state"))
+                        else:
+                            _res = "anim-entry-prior-null; not-recleared"
+                    elif op == "anim_set_transition_property":
+                        mrl.set_anim_transition_property(ab, _m, entry.get("from_state"), entry.get("to_state"), entry.get("property"), entry.get("prior_value"))
+                    elif op == "anim_remove_state":
+                        mrl.add_anim_state(ab, _m, entry.get("state"))
+                        for _tr in (entry.get("prior_transitions") or []):
+                            try:
+                                mrl.add_anim_transition(ab, _m, _tr.get("from_state") or _tr.get("from"), _tr.get("to_state") or _tr.get("to"))
+                            except Exception:
+                                pass
+                        _res = "anim-state-readded; rules-lossy"
+                    elif op == "anim_remove_transition":
+                        mrl.add_anim_transition(ab, _m, entry.get("from_state"), entry.get("to_state"))
+                        for _pk, _pv in (("PriorityOrder", entry.get("prior_priority_order")), ("CrossfadeDuration", entry.get("prior_crossfade_duration")), ("bDisabled", entry.get("prior_disabled"))):
+                            if _pv is not None:
+                                try:
+                                    mrl.set_anim_transition_property(ab, _m, entry.get("from_state"), entry.get("to_state"), _pk, json.dumps(_pv))
+                                except Exception:
+                                    pass
+                        _res = "anim-transition-readded; rules-lossy"
+                    elif op == "anim_set_node_pin_exposure":
+                        mrl.set_anim_node_pin_exposure(ab, entry.get("node_guid"), entry.get("property"), bool(entry.get("prior_exposed")))
+                    elif op == "anim_bind_node_function":
+                        mrl.bind_anim_node_function(ab, entry.get("node_guid"), entry.get("slot"), entry.get("prior_function") or "")
+                    elif op == "anim_build_state_machine":
+                        _spec = entry.get("spec") or {}
+                        for _tr in (_spec.get("transitions") or []):
+                            try:
+                                mrl.remove_anim_transition(ab, _m, _tr.get("from"), _tr.get("to"))
+                            except Exception:
+                                pass
+                        for _st in (_spec.get("states") or []):
+                            try:
+                                mrl.remove_anim_state(ab, _m, _st if isinstance(_st, str) else _st.get("name"))
+                            except Exception:
+                                pass
+                        _res = "anim-build-partly-undone; machine-node-deferred"
+                    elif op == "anim_create_layer_interface":
+                        _pp = entry.get("package_path")
+                        if _pp and unreal.EditorAssetLibrary.does_asset_exist(_pp):
+                            _nm = _pp.split("/")[-1].split(".")[0]
+                            unreal.EditorAssetLibrary.rename_asset(_pp, "/Game/MCP_Scratch/_MCP_Trash/" + _nm)
+                        _res = "anim-layer-interface-trashed"
+                if ab is not None and ap:
+                    try:
+                        unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+                    except Exception:
+                        pass
+            except Exception as _e:
+                _res = "anim-inverse-failed: " + str(_e)[:100]
+            ab = None
+            undone.append({**entry, "result": _res})
+    elif op == "set_rig_preview_mesh":
+        # cross-module (controlrig_write2.py): restore the CR blueprint's prior preview mesh. FAITHFUL.
+        ap = entry.get("asset_path")
+        bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if bp is None:
+            undone.append({**entry, "result": "controlrig-absent"})
+        else:
+            _pm = entry.get("prior_mesh_path")
+            _mesh = unreal.EditorAssetLibrary.load_asset(_pm) if _pm else None
+            with unreal.ScopedEditorTransaction("MCP undo set_rig_preview_mesh"):
+                try:
+                    bp.set_preview_mesh(_mesh, True)
+                except Exception:
+                    pass
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            bp = None
+            undone.append({**entry, "result": "rig-preview-mesh-restored"})
+    elif op == "create_rig_vm_function":
+        # cross-module (controlrig_write2.py): remove the RigVM function we added to the library. FAITHFUL.
+        ap = entry.get("asset_path")
+        bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if bp is None:
+            undone.append({**entry, "result": "controlrig-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo create_rig_vm_function"):
+                try:
+                    _lib = bp.get_local_function_library()
+                    bp.get_controller(_lib).remove_function_from_library(unreal.Name(entry.get("function_name")), True, False)
+                except Exception:
+                    pass
+            try:
+                unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception:
+                pass
+            bp = None
+            undone.append({**entry, "result": "rig-vm-function-removed"})
+    elif op == "select_rig_elements":
+        # cross-module (controlrig_write2.py): restore the prior hierarchy selection (transient; best-effort).
+        ap = entry.get("asset_path")
+        bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if bp is None:
+            undone.append({**entry, "result": "controlrig-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo select_rig_elements"):
+                try:
+                    _hc = bp.get_hierarchy_controller()
+                    _hc.clear_selection()
+                    for _k in (entry.get("prior_keys") or []):
+                        try:
+                            _et = getattr(unreal.RigElementType, str(_k.get("type")).upper(), None)
+                            if _et is not None:
+                                _hc.select_element(unreal.RigElementKey(type=_et, name=unreal.Name(_k.get("name"))), True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            bp = None
+            undone.append({**entry, "result": "rig-selection-restored"})
+    elif op == "set_rig_autosave":
+        # cross-module (controlrig_write2.py): restore the prior auto-VM-recompile flag. FAITHFUL.
+        ap = entry.get("asset_path")
+        bp = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if bp is None:
+            undone.append({**entry, "result": "controlrig-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo set_rig_autosave"):
+                try:
+                    bp.set_auto_vm_recompile(bool(entry.get("prior_value")))
+                except Exception:
+                    pass
+            bp = None
+            undone.append({**entry, "result": "rig-autosave-restored"})
+    elif op == "spawn_niagara_effect":
+        # cross-module (niagara_write2.py): destroy the NiagaraActor we spawned. FAITHFUL.
+        target = _find_by_name(entry.get("actor_name"))
+        if target:
+            with unreal.ScopedEditorTransaction("MCP undo spawn_niagara_effect"):
+                eas.destroy_actor(target)
+            undone.append({**entry, "result": "niagara-actor-destroyed"})
+        else:
+            undone.append({**entry, "result": "already-absent"})
+    elif op == "control_niagara_effect":
+        # cross-module (niagara_write2.py): restore prior is_active state. FAITHFUL for activate/deactivate;
+        # best-effort for reset (no captured prior sim state).
+        target = _find_by_name(entry.get("actor_name"))
+        if target is None:
+            undone.append({**entry, "result": "actor-absent"})
+        else:
+            comp = None
+            cname = entry.get("component_name")
+            try:
+                comps = list(target.get_components_by_class(unreal.NiagaraComponent) or [])
+            except Exception:
+                comps = []
+            for c in comps:
+                if c.get_name() == cname:
+                    comp = c; break
+            if comp is None and comps:
+                comp = comps[0]
+            if comp is None:
+                undone.append({**entry, "result": "component-absent"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo control_niagara_effect"):
+                    try:
+                        if entry.get("prev_active"):
+                            comp.activate(True)
+                        else:
+                            comp.deactivate()
+                    except Exception:
+                        pass
+                undone.append({**entry, "result": "niagara-active-restored"})
+    elif op == "add_niagara_component":
+        # cross-module (niagara_write2.py): delete the instanced UNiagaraComponent we added. FAITHFUL.
+        target = _find_by_name(entry.get("actor_name"))
+        if target is None:
+            undone.append({**entry, "result": "actor-absent"})
+        else:
+            sods = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            handles = sods.k2_gather_subobject_data_for_instance(target) or []
+            root = handles[0] if handles else None
+            cname = entry.get("component_name")
+            victim = None
+            for h in handles:
+                d = sods.k2_find_subobject_data_from_handle(h)
+                o = unreal.SubobjectDataBlueprintFunctionLibrary.get_associated_object(d) if d else None
+                if o is not None and o.get_name() == cname:
+                    victim = h; break
+            if victim is None or root is None:
+                undone.append({**entry, "result": "component-absent"})
+            else:
+                with unreal.ScopedEditorTransaction("MCP undo add_niagara_component"):
+                    sods.k2_delete_subobject_from_instance(root, victim)
+                undone.append({**entry, "result": "niagara-component-removed"})
+    elif op == "st_set_node_property":
+        # cross-module (statetree_write2.py, C++ #18): re-set node property to captured prior value. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "set_state_tree_node_property_json"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_set_node_property"):
+                mrl.set_state_tree_node_property_json(st, entry.get("state_name") or "", entry.get("kind"),
+                    entry.get("index"), entry.get("prop"), str(entry.get("prev")), entry.get("container") or "")
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-node-property-restored"})
+    elif op == "st_set_transition_property":
+        # cross-module (statetree_write2.py, C++ #18): restore prior transition property. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "set_state_tree_transition_property_json"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_set_transition_property"):
+                mrl.set_state_tree_transition_property_json(st, entry.get("state_name"),
+                    entry.get("index"), entry.get("prop"), str(entry.get("prev")))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-transition-property-restored"})
+    elif op == "st_set_component_tree":
+        # cross-module (statetree_write2.py, C++ #18): restore the component's prior StateTree. FAITHFUL.
+        bpp = entry.get("blueprint_path")
+        bp = unreal.EditorAssetLibrary.load_asset(bpp) if bpp else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if bp is None or mrl is None or not hasattr(mrl, "set_state_tree_component_tree_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            sods = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            handles = sods.k2_gather_subobject_data_for_blueprint(bp) or []
+            cname = entry.get("component_name"); comp = None
+            for h in handles:
+                d = sods.k2_find_subobject_data_from_handle(h)
+                o = unreal.SubobjectDataBlueprintFunctionLibrary.get_associated_object(d) if d else None
+                if o is not None and o.get_name() == cname:
+                    comp = o; break
+            if comp is None:
+                undone.append({**entry, "result": "component-absent"})
+            else:
+                pst = entry.get("prev_state_tree")
+                tree = unreal.EditorAssetLibrary.load_asset(pst) if (pst and pst != "None") else None
+                with unreal.ScopedEditorTransaction("MCP undo st_set_component_tree"):
+                    mrl.set_state_tree_component_tree_json(comp, entry.get("property_name"), tree, "")
+                    try:
+                        unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+                    except Exception:
+                        pass
+                _st_save(bpp)
+                undone.append({**entry, "result": "st-component-tree-restored"})
+    elif op == "st_set_color":
+        # cross-module (statetree_write2.py, C++ #18): restore prior color guid. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "set_state_tree_color_json"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_set_color"):
+                mrl.set_state_tree_color_json(st, entry.get("state_name"), "", str(entry.get("prev")))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-color-restored"})
+    elif op == "st_add_parameter":
+        # cross-module (statetree_write2.py, C++ #18): remove the parameter we added. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "remove_state_tree_parameter"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_add_parameter"):
+                mrl.remove_state_tree_parameter(st, entry.get("name"))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-parameter-removed"})
+    elif op == "st_set_parameter":
+        # cross-module (statetree_write2.py, C++ #18): restore prior parameter value. FAITHFUL for scalars.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "set_state_tree_parameter"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_set_parameter"):
+                mrl.set_state_tree_parameter(st, entry.get("name"), str(entry.get("prev")))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-parameter-restored"})
+    elif op == "st_remove_parameter":
+        # cross-module (statetree_write2.py, C++ #18): re-add with captured type + value. FAITHFUL for scalars
+        # (struct/enum/object type-objects not round-tripped -- documented lossy edge).
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "add_state_tree_parameter"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            pt = entry.get("type") or "float"
+            with unreal.ScopedEditorTransaction("MCP undo st_remove_parameter"):
+                mrl.add_state_tree_parameter(st, entry.get("name"), pt)
+                pv = entry.get("value")
+                if pv is not None and hasattr(mrl, "set_state_tree_parameter"):
+                    try:
+                        mrl.set_state_tree_parameter(st, entry.get("name"), str(pv))
+                    except Exception:
+                        pass
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-parameter-re-added"})
+    elif op == "st_add_binding":
+        # cross-module (statetree_write2.py, C++ #18): remove the binding we added. FAITHFUL for a fresh add.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "remove_state_tree_binding"):
+            undone.append({**entry, "result": "statetree-or-handler-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_add_binding"):
+                mrl.remove_state_tree_binding(st, entry.get("target_struct_id"), entry.get("target_property"))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-binding-removed"})
+    elif op == "st_remove_binding":
+        # cross-module (statetree_write2.py, C++ #18): re-add the removed binding from captured source. FAITHFUL.
+        ap = entry.get("asset_path")
+        st = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if st is None or mrl is None or not hasattr(mrl, "add_state_tree_binding") or not entry.get("source_struct_id"):
+            undone.append({**entry, "result": "statetree-or-handler-or-source-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo st_remove_binding"):
+                mrl.add_state_tree_binding(st, entry.get("source_struct_id"), entry.get("source_property"),
+                    entry.get("target_struct_id"), entry.get("target_property"))
+            _st_save(ap)
+            st = None
+            undone.append({**entry, "result": "st-binding-re-added"})
+    elif op == "set_mpc_param":
+        # cross-module (materials_write3.py): reverse an MPC parameter add/update/delete. FAITHFUL
+        # (a re-added entry gets a fresh GUID -- name + default restored; Id is a protected field).
+        ap = entry.get("asset_path")
+        mpc = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        if mpc is None:
+            undone.append({**entry, "result": "mpc-absent"})
+        else:
+            kind = entry.get("param_kind"); nm = entry.get("parameter_name")
+            prop = "scalar_parameters" if kind == "scalar" else "vector_parameters"
+            arr = list(mpc.get_editor_property(prop) or [])
+            idx = -1
+            for i, e in enumerate(arr):
+                if str(e.get_editor_property("parameter_name")) == nm:
+                    idx = i; break
+            pv = entry.get("prior_value")
+            with unreal.ScopedEditorTransaction("MCP undo set_mpc_param"):
+                if entry.get("deleted"):
+                    ne = unreal.CollectionScalarParameter() if kind == "scalar" else unreal.CollectionVectorParameter()
+                    ne.set_editor_property("parameter_name", nm)
+                    ne.set_editor_property("default_value", float(pv) if kind == "scalar" else unreal.LinearColor(pv[0], pv[1], pv[2], pv[3]))
+                    arr.append(ne); mpc.set_editor_property(prop, arr)
+                    r = "mpc-param-re-added"
+                elif entry.get("existed"):
+                    if idx >= 0:
+                        arr[idx].set_editor_property("default_value", float(pv) if kind == "scalar" else unreal.LinearColor(pv[0], pv[1], pv[2], pv[3]))
+                        mpc.set_editor_property(prop, arr)
+                    r = "mpc-param-restored"
+                else:
+                    if idx >= 0:
+                        del arr[idx]; mpc.set_editor_property(prop, arr)
+                    r = "mpc-param-removed"
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            mpc = None
+            undone.append({**entry, "result": r})
+    elif op == "implement_blueprint_interface":
+        # cross-module (blueprints_iface_write.py, C++ #19): remove the interface we added. FAITHFUL.
+        bpp = entry.get("blueprint")
+        bp = unreal.EditorAssetLibrary.load_asset(bpp) if bpp else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if bp is None or mrl is None or not hasattr(mrl, "remove_blueprint_interface"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_blueprint_interface(bp, entry.get("interface"))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(bpp, only_if_is_dirty=False)
+            bp = None
+            undone.append({**entry, "result": "bp-interface-removed"})
+    elif op == "remove_blueprint_interface":
+        # cross-module (blueprints_iface_write.py, C++ #19): re-add the interface. LOSSY (graphs not restored).
+        bpp = entry.get("blueprint")
+        bp = unreal.EditorAssetLibrary.load_asset(bpp) if bpp else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if bp is None or mrl is None or not hasattr(mrl, "implement_blueprint_interface"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.implement_blueprint_interface(bp, entry.get("interface"))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(bpp, only_if_is_dirty=False)
+            bp = None
+            undone.append({**entry, "result": "bp-interface-re-added; graphs-lossy"})
+    elif op == "delete_material_expression":
+        # cross-module (material_graph_write2.py): recreate the deleted node + rewire own_inputs, expr consumers, prop consumers. FAITHFUL (recompile).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        if mat is None or _MG is None:
+            undone.append({**entry, "result": "material-absent"})
+        else:
+            _cls = getattr(unreal, entry.get("node_class") or "", None)
+            if _cls is None:
+                try: _cls = unreal.load_class(None, entry.get("node_class_path") or "")
+                except Exception: _cls = None
+            if _cls is None:
+                undone.append({**entry, "result": "expr-class-unresolved"})
+            else:
+                _pos = entry.get("node_pos") or [0, 0]
+                with unreal.ScopedEditorTransaction("MCP undo delete_material_expression"):
+                    _ne = _MG.create_material_expression(mat, _cls, int(_pos[0]), int(_pos[1]))
+                    if _ne is not None:
+                        for _k, _v in (entry.get("node_props") or {}).items():
+                            try: _ne.set_editor_property(_k, _mg_coerce(_v))
+                            except Exception: pass
+                        for _w in (entry.get("own_inputs") or []):
+                            _s = _mg_find(mat, _w.get("src_name"))
+                            if _s is not None:
+                                try: _MG.connect_material_expressions(_s, _w.get("out_name") or "", _ne, _w.get("input") or "")
+                                except Exception: pass
+                        for _c in (entry.get("consumers") or []):
+                            _co = _mg_find(mat, _c.get("consumer"))
+                            if _co is not None:
+                                try: _MG.connect_material_expressions(_ne, _c.get("out_name") or "", _co, _c.get("input") or "")
+                                except Exception: pass
+                        for _pc in (entry.get("prop_consumers") or []):
+                            _p = _mg_prop(_pc.get("material_property"))
+                            if _p is not None:
+                                try: _MG.connect_material_property(_ne, _pc.get("out_name") or "", _p)
+                                except Exception: pass
+                    _MG.recompile_material(mat)
+                _mg_finish(mat, ap); mat = None
+                undone.append({**entry, "result": "material-expr-recreated"})
+    elif op == "duplicate_material_expression":
+        # cross-module (material_graph_write2.py): delete the disconnected copy we created. FAITHFUL (no recompile -- it was disconnected).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        _e = _mg_find(mat, entry.get("new_name"))
+        if mat is None or _e is None or _MG is None:
+            undone.append({**entry, "result": "material-or-dup-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo duplicate_material_expression"):
+                _MG.delete_material_expression(mat, _e)
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            mat = None
+            undone.append({**entry, "result": "material-dup-deleted"})
+    elif op == "move_material_expression":
+        # cross-module (material_graph_write2.py): restore the node's prior graph position. FAITHFUL (no recompile).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        _e = _mg_find(mat, entry.get("node_name"))
+        if mat is None or _e is None:
+            undone.append({**entry, "result": "material-or-expr-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo move_material_expression"):
+                try:
+                    _e.set_editor_property("material_expression_editor_x", int(entry.get("prior_x") or 0))
+                    _e.set_editor_property("material_expression_editor_y", int(entry.get("prior_y") or 0))
+                except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            mat = None
+            undone.append({**entry, "result": "material-expr-moved-back"})
+    elif op == "layout_material_graph":
+        # cross-module (material_graph_write2.py): restore every node's prior position. FAITHFUL (no recompile).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        if mat is None:
+            undone.append({**entry, "result": "material-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo layout_material_graph"):
+                for _nm, _xy in (entry.get("prior_positions") or {}).items():
+                    _e = _mg_find(mat, _nm)
+                    if _e is not None and _xy:
+                        try:
+                            _e.set_editor_property("material_expression_editor_x", int(_xy[0]))
+                            _e.set_editor_property("material_expression_editor_y", int(_xy[1]))
+                        except Exception: pass
+            try: unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            except Exception: pass
+            mat = None
+            undone.append({**entry, "result": "material-layout-restored"})
+    elif op == "build_material_graph":
+        # cross-module (material_graph_write2.py): delete created nodes + restore conn_priors + (if cleared_first) recreate the whole prior graph. FAITHFUL (recompile).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        if mat is None or _MG is None:
+            undone.append({**entry, "result": "material-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo build_material_graph"):
+                for _nm in (entry.get("created") or []):
+                    _e = _mg_find(mat, _nm)
+                    if _e is not None:
+                        try: _MG.delete_material_expression(mat, _e)
+                        except Exception: pass
+                for _c in (entry.get("conn_priors") or []):
+                    if _c.get("kind") == "expr":
+                        _to = _mg_find(mat, _c.get("to_expr"))
+                        if _to is not None:
+                            try:
+                                if _c.get("had_prior"):
+                                    _s = _mg_find(mat, _c.get("prior_src_name"))
+                                    if _s is not None:
+                                        _MG.connect_material_expressions(_s, _c.get("prior_out_name") or "", _to, _c.get("to_input") or "")
+                                else:
+                                    _MG.disconnect_material_expressions(_to, _c.get("to_input") or "")
+                            except Exception: pass
+                    else:
+                        _p = _mg_prop(_c.get("material_property"))
+                        if _p is not None:
+                            try:
+                                if _c.get("had_prior"):
+                                    _s = _mg_find(mat, _c.get("prior_src_name"))
+                                    if _s is not None:
+                                        _MG.connect_material_property(_s, _c.get("prior_out_name") or "", _p)
+                                else:
+                                    _MG.disconnect_material_property(mat, _p)
+                            except Exception: pass
+                if entry.get("cleared_first"):
+                    _m = {}
+                    for _cap in (entry.get("cleared_nodes") or []):
+                        _cc = getattr(unreal, _cap.get("node_class") or "", None)
+                        if _cc is None:
+                            try: _cc = unreal.load_class(None, _cap.get("node_class_path") or "")
+                            except Exception: _cc = None
+                        if _cc is None:
+                            continue
+                        _cpos = _cap.get("node_pos") or [0, 0]
+                        _ne = _MG.create_material_expression(mat, _cc, int(_cpos[0]), int(_cpos[1]))
+                        if _ne is not None:
+                            for _k, _v in (_cap.get("node_props") or {}).items():
+                                try: _ne.set_editor_property(_k, _mg_coerce(_v))
+                                except Exception: pass
+                            _m[_cap.get("node_name")] = _ne
+                    for _cap in (entry.get("cleared_nodes") or []):
+                        _dst = _m.get(_cap.get("node_name"))
+                        if _dst is None:
+                            continue
+                        for _w in (_cap.get("own_inputs") or []):
+                            _s = _m.get(_w.get("src_name")) or _mg_find(mat, _w.get("src_name"))
+                            if _s is not None:
+                                try: _MG.connect_material_expressions(_s, _w.get("out_name") or "", _dst, _w.get("input") or "")
+                                except Exception: pass
+                    for _mp in (entry.get("cleared_matprops") or []):
+                        _s = _m.get(_mp.get("src_name")) or _mg_find(mat, _mp.get("src_name"))
+                        _p = _mg_prop(_mp.get("material_property"))
+                        if _s is not None and _p is not None:
+                            try: _MG.connect_material_property(_s, _mp.get("out_name") or "", _p)
+                            except Exception: pass
+                _MG.recompile_material(mat)
+            _mg_finish(mat, ap); mat = None
+            undone.append({**entry, "result": "material-build-reverted"})
+    elif op == "cleanup_material_graph":
+        # cross-module (material_graph_write2.py): recreate each removed node + rewire own_inputs among them. FAITHFUL (recompile).
+        ap = entry.get("asset_path"); mat = _mg_mat(ap)
+        if mat is None or _MG is None:
+            undone.append({**entry, "result": "material-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo cleanup_material_graph"):
+                _m = {}
+                for _cap in (entry.get("removed_nodes") or []):
+                    _cc = getattr(unreal, _cap.get("node_class") or "", None)
+                    if _cc is None:
+                        try: _cc = unreal.load_class(None, _cap.get("node_class_path") or "")
+                        except Exception: _cc = None
+                    if _cc is None:
+                        continue
+                    _cpos = _cap.get("node_pos") or [0, 0]
+                    _ne = _MG.create_material_expression(mat, _cc, int(_cpos[0]), int(_cpos[1]))
+                    if _ne is not None:
+                        for _k, _v in (_cap.get("node_props") or {}).items():
+                            try: _ne.set_editor_property(_k, _mg_coerce(_v))
+                            except Exception: pass
+                        _m[_cap.get("node_name")] = _ne
+                for _cap in (entry.get("removed_nodes") or []):
+                    _dst = _m.get(_cap.get("node_name"))
+                    if _dst is None:
+                        continue
+                    for _w in (_cap.get("own_inputs") or []):
+                        _s = _m.get(_w.get("src_name")) or _mg_find(mat, _w.get("src_name"))
+                        if _s is not None:
+                            try: _MG.connect_material_expressions(_s, _w.get("out_name") or "", _dst, _w.get("input") or "")
+                            except Exception: pass
+                _MG.recompile_material(mat)
+            _mg_finish(mat, ap); mat = None
+            undone.append({**entry, "result": "material-cleanup-restored"})
+    elif op == "mf_build_graph":
+        # cross-module (material_function_write.py): delete each created function expression. FAITHFUL (update_material_function).
+        ap = entry.get("asset_path"); mf = _mf_fn(ap)
+        if mf is None or _MG is None:
+            undone.append({**entry, "result": "material-function-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo mf_build_graph"):
+                for _nm in (entry.get("node_names") or []):
+                    _e = _mf_find(mf, _nm)
+                    if _e is not None:
+                        try: _MG.delete_material_expression_in_function(mf, _e)
+                        except Exception: pass
+            _mf_update(mf, ap); mf = None
+            undone.append({**entry, "result": "mf-build-deleted"})
+    elif op == "mf_layout":
+        # cross-module (material_function_write.py): restore each expression's prior position. FAITHFUL (no update).
+        ap = entry.get("asset_path"); mf = _mf_fn(ap)
+        if mf is None:
+            undone.append({**entry, "result": "material-function-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo mf_layout"):
+                for _pp in (entry.get("prior_positions") or []):
+                    _e = _mf_find(mf, _pp.get("name"))
+                    if _e is not None:
+                        try:
+                            _e.set_editor_property("material_expression_editor_x", int(_pp.get("x") or 0))
+                            _e.set_editor_property("material_expression_editor_y", int(_pp.get("y") or 0))
+                        except Exception: pass
+            _mf_save(ap); mf = None
+            undone.append({**entry, "result": "mf-layout-restored"})
+    elif op == "mf_add_node":
+        # cross-module (material_function_write.py): delete the FunctionInput/Output node we added. FAITHFUL (update_material_function).
+        ap = entry.get("asset_path"); mf = _mf_fn(ap)
+        _e = _mf_find(mf, entry.get("node_name"))
+        if mf is None or _e is None or _MG is None:
+            undone.append({**entry, "result": "material-function-or-node-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo mf_add_node"):
+                try: _MG.delete_material_expression_in_function(mf, _e)
+                except Exception: pass
+            _mf_update(mf, ap); mf = None
+            undone.append({**entry, "result": "mf-node-deleted"})
+    elif op == "mf_set_node_props":
+        # cross-module (material_function_write.py): restore each prior prop (input_type via FunctionInputType member name). FAITHFUL (update_material_function).
+        ap = entry.get("asset_path"); mf = _mf_fn(ap)
+        _e = _mf_find(mf, entry.get("node_name"))
+        if mf is None or _e is None:
+            undone.append({**entry, "result": "material-function-or-node-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo mf_set_node_props"):
+                for _k, _v in (entry.get("prior_props") or {}).items():
+                    try:
+                        if _k == "input_type":
+                            _fit = getattr(unreal.FunctionInputType, str(_v), None)
+                            if _fit is not None:
+                                _e.set_editor_property("input_type", _fit)
+                        else:
+                            _e.set_editor_property(_k, _v)
+                    except Exception: pass
+            _mf_update(mf, ap); mf = None
+            undone.append({**entry, "result": "mf-node-props-restored"})
+    elif op == "mf_cleanup":
+        # cross-module (material_function_write.py): recreate each removed node + rewire captured inputs. Best-effort (update_material_function).
+        ap = entry.get("asset_path"); mf = _mf_fn(ap)
+        if mf is None or _MG is None:
+            undone.append({**entry, "result": "material-function-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo mf_cleanup"):
+                _m = {}
+                for _rc in (entry.get("removed") or []):
+                    _cc = getattr(unreal, _rc.get("class") or "", None)
+                    if _cc is None:
+                        continue
+                    _ne = _MG.create_material_expression_in_function(mf, _cc, int(_rc.get("x") or 0), int(_rc.get("y") or 0))
+                    if _ne is not None:
+                        for _k, _v in (_rc.get("props") or {}).items():
+                            try: _ne.set_editor_property(_k, _v)
+                            except Exception: pass
+                        _m[_rc.get("name")] = _ne
+                for _rc in (entry.get("removed") or []):
+                    _dst = _m.get(_rc.get("name"))
+                    if _dst is None:
+                        continue
+                    for _ed in (_rc.get("inputs") or []):
+                        _src = _m.get(_ed.get("from")) or _mf_find(mf, _ed.get("from"))
+                        if _src is not None:
+                            try: _MG.connect_material_expressions(_src, "", _dst, _ed.get("pin") or "")
+                            except Exception: pass
+            _mf_update(mf, ap); mf = None
+            undone.append({**entry, "result": "mf-cleanup-restored"})
+    elif op == "set_mfi_param":
+        # cross-module (material_function_write.py): restore prior override value, or drop the entry if it did not exist before. FAITHFUL (no update).
+        ap = entry.get("asset_path"); mfi = _mf_mfi(ap)
+        _pt = entry.get("param_type")
+        _prop = {"scalar": "scalar_parameter_values", "vector": "vector_parameter_values", "texture": "texture_parameter_values"}.get(_pt)
+        if mfi is None or _prop is None:
+            undone.append({**entry, "result": "material-function-instance-absent"})
+        else:
+            _arr = list(mfi.get_editor_property(_prop) or [])
+            _nm = entry.get("parameter_name")
+            _idx = -1
+            for _i in range(len(_arr)):
+                _pi = None
+                try: _pi = _arr[_i].get_editor_property("parameter_info")
+                except Exception: _pi = None
+                if _pi is not None and str(_pi.get_editor_property("name")) == _nm:
+                    _idx = _i; break
+            with unreal.ScopedEditorTransaction("MCP undo set_mfi_param"):
+                if entry.get("existed"):
+                    if _idx >= 0:
+                        _pv = entry.get("prior_value")
+                        if _pt == "scalar":
+                            _val = float(_pv) if _pv is not None else 0.0
+                        elif _pt == "vector":
+                            _val = unreal.LinearColor(float(_pv[0]), float(_pv[1]), float(_pv[2]), float(_pv[3])) if _pv else None
+                        else:
+                            _val = unreal.EditorAssetLibrary.load_asset(_pv) if _pv else None
+                        try: _arr[_idx].set_editor_property("parameter_value", _val)
+                        except Exception: pass
+                        mfi.set_editor_property(_prop, _arr)
+                else:
+                    if _idx >= 0:
+                        _arr.pop(_idx)
+                        mfi.set_editor_property(_prop, _arr)
+            _mf_save(ap); mfi = None
+            undone.append({**entry, "result": "mfi-param-reverted"})
+    elif op == "set_bp_var_flags":
+        # cross-module (blueprints_write3.py): restore the member variable's prior editing flags via
+        # BlueprintEditorLibrary (prior holds ONLY the settable flags that changed). FAITHFUL. Ledger key blueprint_path.
+        bpp = entry.get("blueprint_path")
+        bp = unreal.EditorAssetLibrary.load_asset(bpp) if bpp else None
+        _bel = getattr(unreal, "BlueprintEditorLibrary", None)
+        if bp is None or _bel is None:
+            undone.append({**entry, "result": "blueprint-or-lib-absent"})
+        else:
+            prior = entry.get("prior") or {}
+            vn = entry.get("variable_name")
+            with unreal.ScopedEditorTransaction("MCP undo set_bp_var_flags"):
+                if "instance_editable" in prior:
+                    _bel.set_blueprint_variable_instance_editable(bp, unreal.Name(vn), bool(prior.get("instance_editable")))
+                if "expose_on_spawn" in prior:
+                    _bel.set_blueprint_variable_expose_on_spawn(bp, unreal.Name(vn), bool(prior.get("expose_on_spawn")))
+                if "expose_to_cinematics" in prior:
+                    _bel.set_blueprint_variable_expose_to_cinematics(bp, unreal.Name(vn), bool(prior.get("expose_to_cinematics")))
+                try:
+                    _bel.compile_blueprint(bp)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(bpp, only_if_is_dirty=False)
+            bp = None
+            undone.append({**entry, "result": "bp-var-flags-restored"})
+    elif op == "add_blueprint_component":
+        # cross-module (blueprint_components_cpp.py SCS): delete the component node we added. FAITHFUL (C++ handler compiles + marks dirty).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "delete_blueprint_component_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.delete_blueprint_component_json(ap, entry.get("component"))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-component-deleted"})
+    elif op == "set_blueprint_component_property":
+        # cross-module (blueprint_components_cpp.py SCS): re-apply the captured prior ExportText value (array-wrapped). FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_blueprint_component_property_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.set_blueprint_component_property_json(ap, entry.get("component"), entry.get("property"), json.dumps([entry.get("prev")]))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-component-property-restored"})
+    elif op == "delete_blueprint_component":
+        # cross-module (blueprint_components_cpp.py SCS): re-add the node (class+parent) + re-apply each prop_snapshot entry.
+        # LOSSY: promoted children do NOT un-promote back under it; container/complex props not snapshotted.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_component_to_blueprint_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            cn = entry.get("component")
+            try:
+                mrl.add_component_to_blueprint_json(ap, entry.get("component_class") or "", cn, entry.get("parent") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "set_blueprint_component_property_json"):
+                for _pk, _pv in (entry.get("prop_snapshot") or {}).items():
+                    try:
+                        mrl.set_blueprint_component_property_json(ap, cn, _pk, json.dumps([_pv]))
+                    except Exception:
+                        pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-component-re-added; children-promotion-lossy"})
+    elif op == "reparent_blueprint_component":
+        # cross-module (blueprint_components_cpp.py SCS): reparent the node back to its prior parent (empty => root). FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "reparent_blueprint_component_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.reparent_blueprint_component_json(ap, entry.get("component"), entry.get("prior_parent") or "")
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-component-reparented-back"})
+    elif op == "set_blueprint_root_component":
+        # cross-module (blueprint_components_cpp.py SCS): promote the prior root back to root, then reparent this
+        # node back to its prior parent. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_blueprint_root_component_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            _pr = entry.get("prior_root") or ""
+            if _pr:
+                try:
+                    mrl.set_blueprint_root_component_json(ap, _pr)
+                except Exception:
+                    pass
+            _npp = entry.get("node_prior_parent") or ""
+            if _npp and hasattr(mrl, "reparent_blueprint_component_json"):
+                try:
+                    mrl.reparent_blueprint_component_json(ap, entry.get("component"), _npp)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-root-component-restored"})
+    elif op == "delete_blueprint_node":
+        # cross-module (blueprint_graph_cpp.py K2): delete the node we added (by guid). FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "delete_blueprint_node_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.delete_blueprint_node_json(ap, entry.get("graph_name") or "", entry.get("node_guid"))
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-node-deleted"})
+    elif op == "break_blueprint_node_link":
+        # cross-module (blueprint_graph_cpp.py K2): break the specific link we created. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "break_blueprint_node_link_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.break_blueprint_node_link_json(ap, entry.get("graph_name") or "", entry.get("node_guid"),
+                    entry.get("pin"), entry.get("other_guid") or "", entry.get("other_pin") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-node-link-broken"})
+    elif op == "set_blueprint_pin_default":
+        # cross-module (blueprint_graph_cpp.py K2): restore the pin's prior default (object pin uses prev_object,
+        # else prev_value). FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_blueprint_pin_default_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            if entry.get("is_object_pin"):
+                _pv = entry.get("prev_object")
+            else:
+                _pv = entry.get("prev_value")
+            try:
+                mrl.set_blueprint_pin_default_json(ap, entry.get("graph_name") or "", entry.get("node_guid"),
+                    entry.get("pin"), str(_pv if _pv is not None else ""))
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-pin-default-restored"})
+    elif op == "reconnect_blueprint_links":
+        # cross-module (blueprint_graph_cpp.py K2): reconnect each captured broken endpoint to (node_guid, pin). FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "connect_blueprint_nodes_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            _gn = entry.get("graph_name") or ""
+            _ng = entry.get("node_guid"); _pin = entry.get("pin")
+            for _b in (entry.get("broken") or []):
+                try:
+                    mrl.connect_blueprint_nodes_json(ap, _gn, _ng, _pin, _b.get("other_guid"), _b.get("other_pin"))
+                except Exception:
+                    pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-node-links-reconnected"})
+    elif op == "readd_blueprint_node":
+        # cross-module (blueprint_graph_cpp.py K2): re-create the deleted node from captured {kind,class,x,y,...},
+        # re-apply captured input-pin defaults, reconnect captured links. LOSSY (best-effort; conversion nodes +
+        # internal node state do NOT round-trip).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        cap = entry.get("captured") or {}
+        if obj is None or mrl is None or not hasattr(mrl, "add_blueprint_node_json") or not cap:
+            undone.append({**entry, "result": "blueprint-or-handler-or-capture-absent"})
+        else:
+            _gn = entry.get("graph_name") or ""
+            _spec = {_k: _v for _k, _v in cap.items() if _k != "pins"}
+            _newg = None
+            try:
+                _r = mrl.add_blueprint_node_json(ap, _gn, json.dumps(_spec))
+                _rd = json.loads(_r) if isinstance(_r, str) else _r
+                if isinstance(_rd, dict):
+                    _newg = _rd.get("node_guid")
+            except Exception:
+                _newg = None
+            if _newg:
+                if hasattr(mrl, "set_blueprint_pin_default_json"):
+                    for _p in (cap.get("pins") or []):
+                        if str(_p.get("direction")) != "input":
+                            continue
+                        _dv = _p.get("default_object") or _p.get("default_value")
+                        if _dv:
+                            try:
+                                mrl.set_blueprint_pin_default_json(ap, _gn, _newg, _p.get("name"), str(_dv))
+                            except Exception:
+                                pass
+                if hasattr(mrl, "connect_blueprint_nodes_json"):
+                    for _p in (cap.get("pins") or []):
+                        _outp = str(_p.get("direction")) == "output"
+                        for _lk in (_p.get("linked_to") or []):
+                            try:
+                                if _outp:
+                                    mrl.connect_blueprint_nodes_json(ap, _gn, _newg, _p.get("name"), _lk.get("node_guid"), _lk.get("pin_name"))
+                                else:
+                                    mrl.connect_blueprint_nodes_json(ap, _gn, _lk.get("node_guid"), _lk.get("pin_name"), _newg, _p.get("name"))
+                            except Exception:
+                                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": ("bp-node-re-added; lossy" if _newg else "bp-node-readd-failed")})
+    elif op == "set_blueprint_node_property":
+        # cross-module (blueprint_graph_cpp.py K2): restore the node UPROPERTY's prior ExportText value. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_blueprint_node_property_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            _prv = entry.get("prev_value")
+            try:
+                mrl.set_blueprint_node_property_json(ap, entry.get("graph_name") or "", entry.get("node_guid"),
+                    entry.get("property"), str(_prv if _prv is not None else ""))
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-node-property-restored"})
+    elif op == "delete_blueprint_function":
+        # cross-module (blueprint_func_cpp.py): the forward CREATED/overrode a function graph; delete it. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "delete_blueprint_function_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.delete_blueprint_function_json(ap, entry.get("function_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-function-deleted"})
+    elif op == "remove_function_pin":
+        # cross-module (blueprint_func_cpp.py): remove the input/output signature pin the forward add created
+        # (is_output selects entry-output vs result-input). FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_function_pin_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_function_pin_json(ap, entry.get("function_name") or "", entry.get("pin_name") or "", bool(entry.get("is_output")))
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-function-pin-removed"})
+    elif op == "set_function_properties":
+        # cross-module (blueprint_func_cpp.py): re-apply the captured PRIOR function flags+metadata (props holds prior).
+        # FAITHFUL for the touched keys (a metadata key absent before is restored to '' -- see module docstring). compile after.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_function_properties_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.set_function_properties_json(ap, entry.get("function_name") or "", json.dumps(entry.get("props") or {}))
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-function-properties-restored"})
+    elif op == "remove_local_variable":
+        # cross-module (blueprint_func_cpp.py): remove the function-scoped local var the forward create added. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_local_variable_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_local_variable_json(ap, entry.get("function_name") or "", entry.get("var_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-local-variable-removed"})
+    elif op == "readd_blueprint_function":
+        # cross-module (blueprint_func_cpp.py): re-create the deleted function as an EMPTY graph, then re-add each
+        # captured input/output signature pin. LOSSY: body/wiring is NOT captured, and struct/object/enum pin types do
+        # not round-trip (captured type carries sub_category_object; the re-add parser wants type_path) -- scalars re-add.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        cap = entry.get("captured") or {}
+        if obj is None or mrl is None or not hasattr(mrl, "create_blueprint_function_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            _fn = entry.get("function_name") or ""
+            try:
+                mrl.create_blueprint_function_graph_json(ap, _fn, "")
+            except Exception:
+                pass
+            if hasattr(mrl, "add_function_input_json"):
+                for _p in (cap.get("inputs") or []):
+                    try:
+                        mrl.add_function_input_json(ap, _fn, _p.get("name") or "", json.dumps(_p.get("type") or {}))
+                    except Exception:
+                        pass
+            if hasattr(mrl, "add_function_output_json"):
+                for _p in (cap.get("outputs") or []):
+                    try:
+                        mrl.add_function_output_json(ap, _fn, _p.get("name") or "", json.dumps(_p.get("type") or {}))
+                    except Exception:
+                        pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-function-re-added; signature-only-lossy"})
+    elif op == "delete_event_graph":
+        # cross-module (blueprint_func_cpp.py): the forward CREATED an event graph (ubergraph page); delete it. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "delete_event_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.delete_event_graph_json(ap, entry.get("graph_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-event-graph-deleted"})
+    elif op == "rename_event_graph":
+        # cross-module (blueprint_func_cpp.py): rename the event graph back (old_name/new_name were pre-swapped at ledger time). FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "rename_event_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.rename_event_graph_json(ap, entry.get("old_name") or "", entry.get("new_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-event-graph-renamed-back"})
+    elif op == "recreate_event_graph":
+        # cross-module (blueprint_func_cpp.py): the forward DELETED an event graph; re-create an EMPTY graph of the same
+        # name. LOSSY: node contents are NOT restored. compile after.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "create_event_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.create_event_graph_json(ap, entry.get("graph_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-event-graph-recreated; empty-graph-lossy"})
+    elif op == "remove_event_dispatcher_input":
+        # cross-module (blueprint_func_cpp.py): remove the dispatcher-signature param the forward add created. FAITHFUL (compile after).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_event_dispatcher_input_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_event_dispatcher_input_json(ap, entry.get("dispatcher_name") or "", entry.get("pin_name") or "")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-dispatcher-input-removed"})
+    elif op == "restore_blueprint_graph":
+        # cross-module (blueprint_builders_cpp.py): re-import the captured PRIOR-graph build-spec via build mode
+        # (document-pattern wipe-and-rebuild). snapshot_json is ALREADY a JSON string. LOSSY: only reconstructable node
+        # kinds round-trip (unsupported kinds skipped -- see module docstring). compile after.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "build_blueprint_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.build_blueprint_graph_json(ap, entry.get("graph_name") or "", entry.get("snapshot_json") or "{}", "build")
+            except Exception:
+                pass
+            if hasattr(mrl, "compile_blueprint_by_path"):
+                try:
+                    mrl.compile_blueprint_by_path(ap)
+                except Exception:
+                    pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-graph-restored; unsupported-kinds-lossy"})
+    elif op == "restore_blueprint_node_positions":
+        # cross-module (blueprint_builders_cpp.py): re-arrange the graph to the captured prior positions via the SAME
+        # arrange handler with restore_positions. FAITHFUL. Node positions serialize directly -- NO compile.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "arrange_blueprint_graph_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.arrange_blueprint_graph_json(ap, entry.get("graph_name") or "", json.dumps({"restore_positions": entry.get("positions") or {}}))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-node-positions-restored"})
+    elif op == "set_blueprint_variable_flags":
+        # cross-module (blueprint_builders_cpp.py): re-apply the captured PRIOR variable flags (flags holds the prior
+        # 6-key dict). FAITHFUL. Var flags serialize directly -- NO compile.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_blueprint_variable_flags_json"):
+            undone.append({**entry, "result": "blueprint-or-handler-absent"})
+        else:
+            try:
+                mrl.set_blueprint_variable_flags_json(ap, entry.get("variable_name") or "", json.dumps(entry.get("flags") or {}))
+            except Exception:
+                pass
+            unreal.EditorAssetLibrary.save_asset(ap, only_if_is_dirty=False)
+            obj = None
+            undone.append({**entry, "result": "bp-variable-flags-restored"})
+    elif op == "set_widget_bp_parent":
+        # cross-module (widgets_write4.py "W-A"): reparent the WidgetBlueprint ASSET back to its prior parent
+        # class. FAITHFUL. (Structurally identical to reparent_blueprint but keys are asset_path/prior_parent.)
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        prior_cls = None
+        pp = entry.get("prior_parent")
+        if pp:
+            try:
+                prior_cls = unreal.load_object(None, pp)
+            except Exception:
+                prior_cls = None
+        if obj is None or prior_cls is None:
+            undone.append({**entry, "result": "widgetbp-or-prior-parent-absent"})
+        else:
+            try:
+                unreal.BlueprintEditorLibrary.reparent_blueprint(obj, prior_cls)
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-bp-reparented-back"})
+            except Exception as e:
+                undone.append({**entry, "result": "reparent-failed", "err": str(e)[:120]})
+    elif op == "set_widget_nav":
+        # cross-module (widgets_write4.py "W-A"): rebuild the widget's UWidgetNavigation from the captured
+        # whole-nav prior (None -> clear to default Escape; dict -> per-direction rule + widget_to_focus).
+        # FAITHFUL. Python-native (probed feasible: new_object(WidgetNavigation) + whole-struct set).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        w = _ww_find_widget(obj, entry.get("widget_name")) if obj is not None else None
+        if w is None:
+            undone.append({**entry, "result": "widget-absent"})
+        else:
+            try:
+                prior = entry.get("prior_nav_json")
+                if not prior:
+                    w.set_editor_property("navigation", None)
+                else:
+                    _ndirs = ["up", "down", "left", "right", "next", "previous"]
+                    _rmap = {"ESCAPE": "ESCAPE", "STOP": "STOP", "WRAP": "WRAP", "EXPLICIT": "EXPLICIT",
+                             "CUSTOM": "CUSTOM", "CUSTOMBOUNDARY": "CUSTOM_BOUNDARY",
+                             "CUSTOM_BOUNDARY": "CUSTOM_BOUNDARY"}
+                    nav = unreal.new_object(unreal.WidgetNavigation, outer=w)
+                    for dr in _ndirs:
+                        spec = prior.get(dr)
+                        if not spec:
+                            continue
+                        data = nav.get_editor_property(dr)
+                        _rk = str(spec.get("rule") or "ESCAPE").strip().upper().replace(" ", "")
+                        _rk = _rmap.get(_rk, _rk)
+                        r = getattr(unreal.UINavigationRule, _rk, None)
+                        if r is not None:
+                            data.set_editor_property("rule", r)
+                        wtf = spec.get("widget_to_focus") or ""
+                        if wtf:
+                            data.set_editor_property("widget_to_focus", wtf)
+                        nav.set_editor_property(dr, data)
+                    w.set_editor_property("navigation", nav)
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-nav-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "nav-restore-failed", "err": str(e)[:120]})
+    elif op == "widget_rename":
+        # cross-module (widget_edit_cpp.py "W-B"): rename the widget back (new_name -> old_name). FAITHFUL.
+        # The *_json handlers MarkModified only -> compile via _ww_compile_save to regenerate the widget class.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "rename_widget_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.rename_widget_json(ap, entry.get("new_name"), entry.get("old_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-renamed-back"})
+            except Exception as e:
+                undone.append({**entry, "result": "rename-failed", "err": str(e)[:120]})
+    elif op == "widget_set_root":
+        # cross-module (widget_edit_cpp.py "W-B"): point RootWidget back at the prior root. LOSSY when the tree
+        # previously had NO root (the empty-tree pre-state is not restorable via set_root -> new root left in place).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_root_widget_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        elif not entry.get("had_prev_root") or not entry.get("prev_root"):
+            undone.append({**entry, "result": "no-prior-root (lossy); left as-is"})
+        else:
+            try:
+                mrl.set_root_widget_json(ap, entry.get("prev_root"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-root-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "set-root-failed", "err": str(e)[:120]})
+    elif op == "widget_set_is_variable":
+        # cross-module (widget_edit_cpp.py "W-B"): restore the prior bIsVariable flag. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_widget_is_variable_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.set_widget_is_variable_json(ap, entry.get("widget_name"), bool(entry.get("prev_is_variable")))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-is-variable-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "set-is-variable-failed", "err": str(e)[:120]})
+    elif op == "widget_replace":
+        # cross-module (widget_edit_cpp.py "W-B"): replace the widget back to its prior class. LOSSY -- ReplaceWidgets
+        # only transfers class-compatible properties, so props unique to the swapped-in class are not recovered.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        oc = entry.get("old_class")
+        if obj is None or mrl is None or not hasattr(mrl, "replace_widget_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        elif not oc:
+            undone.append({**entry, "result": "cannot-restore (old class not captured)"})
+        else:
+            try:
+                mrl.replace_widget_json(ap, entry.get("widget_name"), oc)
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-replaced-back; props-lossy"})
+            except Exception as e:
+                undone.append({**entry, "result": "replace-failed", "err": str(e)[:120]})
+    elif op == "widget_wrap":
+        # cross-module (widget_edit_cpp.py "W-B"): UNWRAP compound -- reparent the child out of the wrapper panel,
+        # then drop the now-empty panel. FAITHFUL (hierarchy). RootWidget is not python-settable -> C++ set_root.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        child = _ww_find_widget(obj, entry.get("child_name")) if obj is not None else None
+        panel = _ww_find_widget(obj, entry.get("panel_name")) if obj is not None else None
+        if obj is None or mrl is None or not hasattr(mrl, "remove_widget_from_blueprint"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        elif child is None or panel is None:
+            undone.append({**entry, "result": "wrapper-panel-or-child-absent"})
+        else:
+            try:
+                try:
+                    panel.remove_child(child)
+                except Exception:
+                    pass
+                if entry.get("was_root"):
+                    if hasattr(mrl, "set_root_widget_json"):
+                        mrl.set_root_widget_json(ap, entry.get("child_name"))
+                elif entry.get("parent_name"):
+                    p = _ww_find_widget(obj, entry.get("parent_name"))
+                    ci = entry.get("child_index")
+                    if p is not None and isinstance(p, unreal.PanelWidget):
+                        try:
+                            p.insert_child_at(int(ci) if ci is not None else 0, child)
+                        except Exception:
+                            p.add_child(child)
+                mrl.remove_widget_from_blueprint(obj, entry.get("panel_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-unwrapped"})
+            except Exception as e:
+                undone.append({**entry, "result": "unwrap-failed", "err": str(e)[:120]})
+    elif op == "widget_set_named_slot":
+        # cross-module (widget_edit_cpp.py "W-B"): restore the slot's prior content, or clear it if it was empty. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        host = entry.get("host_name"); slot = entry.get("slot_name")
+        if obj is None or mrl is None or not hasattr(mrl, "set_named_slot_content_json") or not hasattr(mrl, "clear_named_slot_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                if entry.get("had_prev_content"):
+                    mrl.set_named_slot_content_json(ap, host, slot, entry.get("prev_content") or "")
+                else:
+                    mrl.clear_named_slot_json(ap, host, slot)
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "named-slot-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "named-slot-restore-failed", "err": str(e)[:120]})
+    elif op == "widget_clear_named_slot":
+        # cross-module (widget_edit_cpp.py "W-B"): re-slot the prior content (no-op if the slot was already empty). FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        host = entry.get("host_name"); slot = entry.get("slot_name")
+        if obj is None or mrl is None or not hasattr(mrl, "set_named_slot_content_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        elif not entry.get("had_prev_content"):
+            undone.append({**entry, "result": "slot-was-empty; no-op"})
+        else:
+            try:
+                mrl.set_named_slot_content_json(ap, host, slot, entry.get("prev_content") or "")
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "named-slot-content-re-slotted"})
+            except Exception as e:
+                undone.append({**entry, "result": "named-slot-restore-failed", "err": str(e)[:120]})
+    elif op == "widget_add_binding":
+        # cross-module (widget_edit_cpp.py "W-B"): restore the overwritten prior binding, or remove the added one. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        wn = entry.get("widget_name"); pn = entry.get("property_name")
+        if obj is None or mrl is None or not hasattr(mrl, "add_property_binding_json") or not hasattr(mrl, "remove_property_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                if entry.get("had_existing"):
+                    mrl.add_property_binding_json(ap, wn, pn, entry.get("prev_function") or "")
+                else:
+                    mrl.remove_property_binding_json(ap, wn, pn)
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "binding-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "binding-restore-failed", "err": str(e)[:120]})
+    elif op == "widget_remove_binding":
+        # cross-module (widget_edit_cpp.py "W-B"): re-add the removed binding with its captured function. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_property_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.add_property_binding_json(ap, entry.get("widget_name"), entry.get("property_name"), entry.get("prev_function") or "")
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "binding-re-added"})
+            except Exception as e:
+                undone.append({**entry, "result": "binding-re-add-failed", "err": str(e)[:120]})
+    elif op == "wanim_create_animation":
+        # cross-module (widget_anim_cpp.py "W-C"): drop the created UWidgetAnimation. FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_widget_animation_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_widget_animation_json(ap, entry.get("anim_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-animation-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-animation-failed", "err": str(e)[:120]})
+    elif op == "wanim_remove_animation":
+        # cross-module (widget_anim_cpp.py "W-C"): best-effort re-create the animation. LOSSY -- tracks/bindings/keys NOT restored.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "create_widget_animation_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.create_widget_animation_json(ap, entry.get("anim_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "widget-animation-recreated; tracks/bindings/keys-lossy"})
+            except Exception as e:
+                undone.append({**entry, "result": "recreate-animation-failed", "err": str(e)[:120]})
+    elif op == "wanim_add_binding":
+        # cross-module (widget_anim_cpp.py "W-C"): remove the added widget binding. FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_animation_widget_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_animation_widget_binding_json(ap, entry.get("anim_name"), entry.get("widget_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "animation-binding-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-binding-failed", "err": str(e)[:120]})
+    elif op == "wanim_remove_binding":
+        # cross-module (widget_anim_cpp.py "W-C"): re-add the removed widget binding (fresh GUID; tracks/keys NOT restored). LOSSY.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_animation_widget_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.add_animation_widget_binding_json(ap, entry.get("anim_name"), entry.get("widget_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "animation-binding-re-added; fresh-guid"})
+            except Exception as e:
+                undone.append({**entry, "result": "re-add-binding-failed", "err": str(e)[:120]})
+    elif op == "uicomp_add":
+        # cross-module (widget_uicomp_cpp.py "W-E"): detach the added UI component. FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_ui_component_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_ui_component_json(ap, entry.get("widget_name"), entry.get("component_class"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "ui-component-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-ui-component-failed", "err": str(e)[:120]})
+    elif op == "uicomp_remove":
+        # cross-module (widget_uicomp_cpp.py "W-E"): re-attach the removed UI component. LOSSY -- authored prop values NOT preserved.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_ui_component_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.add_ui_component_json(ap, entry.get("widget_name"), entry.get("component_class"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "ui-component-re-added; props-lossy"})
+            except Exception as e:
+                undone.append({**entry, "result": "re-add-ui-component-failed", "err": str(e)[:120]})
+    elif op == "wanim_add_track":
+        # cross-module (widget_anim_cpp.py "W-C"): remove the added property track (drops its sections). FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_animation_track_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_animation_track_json(ap, entry.get("anim_name"), entry.get("widget_name"), entry.get("track_type"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "animation-track-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-track-failed", "err": str(e)[:120]})
+    elif op == "wanim_add_key":
+        # cross-module (widget_anim_cpp.py "W-C"): reverse the key add. Fresh key -> remove it; if it REPLACED a
+        # prior key (had_key) -> re-key the captured prev_value. time_seconds = frame * tick_den / tick_num. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        _tnum = entry.get("tick_resolution_num"); _tden = entry.get("tick_resolution_den")
+        _ci = int(entry.get("channel_index") or 0)
+        if obj is None or mrl is None or entry.get("frame") is None or not _tnum:
+            undone.append({**entry, "result": "widgetbp-or-handler-or-frame-absent"})
+        else:
+            try:
+                _tsec = float(entry.get("frame")) * float(_tden) / float(_tnum)
+                if entry.get("had_key"):
+                    if hasattr(mrl, "add_animation_key_json"):
+                        mrl.add_animation_key_json(ap, entry.get("anim_name"), entry.get("widget_name"), entry.get("track_type"), _tsec, float(entry.get("prev_value")), _ci, "cubic")
+                        _ww_compile_save(obj, ap)
+                        undone.append({**entry, "result": "animation-key-prev-value-restored"})
+                    else:
+                        undone.append({**entry, "result": "add-key-handler-absent"})
+                else:
+                    if hasattr(mrl, "remove_animation_key_json"):
+                        mrl.remove_animation_key_json(ap, entry.get("anim_name"), entry.get("widget_name"), entry.get("track_type"), _ci, _tsec)
+                        _ww_compile_save(obj, ap)
+                        undone.append({**entry, "result": "animation-key-removed"})
+                    else:
+                        undone.append({**entry, "result": "remove-key-handler-absent"})
+            except Exception as e:
+                undone.append({**entry, "result": "reverse-key-failed", "err": str(e)[:120]})
+    elif op == "mvvm_add_viewmodel":
+        # cross-module (widget_mvvm_cpp.py "W-D"): remove the added viewmodel. FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_mvvm_viewmodel_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_mvvm_viewmodel_json(ap, entry.get("name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-viewmodel-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-viewmodel-failed", "err": str(e)[:120]})
+    elif op == "mvvm_remove_viewmodel":
+        # cross-module (widget_mvvm_cpp.py "W-D"): best-effort re-add the viewmodel. LOSSY -- NEW guid, so bindings that referenced the old guid are NOT restored.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_mvvm_viewmodel_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.add_mvvm_viewmodel_json(ap, entry.get("class_path"), entry.get("name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-viewmodel-re-added; new-guid"})
+            except Exception as e:
+                undone.append({**entry, "result": "re-add-viewmodel-failed", "err": str(e)[:120]})
+    elif op == "mvvm_rename_viewmodel":
+        # cross-module (widget_mvvm_cpp.py "W-D"): rename the viewmodel back new->old. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "rename_mvvm_viewmodel_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.rename_mvvm_viewmodel_json(ap, entry.get("new_name"), entry.get("old_name"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-viewmodel-renamed-back"})
+            except Exception as e:
+                undone.append({**entry, "result": "rename-viewmodel-failed", "err": str(e)[:120]})
+    elif op == "mvvm_set_viewmodel_settings":
+        # cross-module (widget_mvvm_cpp.py "W-D"): re-apply the captured prior viewmodel settings. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_mvvm_viewmodel_settings_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.set_mvvm_viewmodel_settings_json(ap, entry.get("name"), json.dumps(entry.get("prev") or {}))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-viewmodel-settings-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-viewmodel-settings-failed", "err": str(e)[:120]})
+    elif op == "mvvm_add_binding":
+        # cross-module (widget_mvvm_cpp.py "W-D"): remove the added binding. FAITHFUL (structure).
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "remove_mvvm_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.remove_mvvm_binding_json(ap, entry.get("binding_id"))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-binding-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "remove-binding-failed", "err": str(e)[:120]})
+    elif op == "mvvm_set_binding":
+        # cross-module (widget_mvvm_cpp.py "W-D"): re-apply the captured prior binding fields. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_mvvm_binding_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.set_mvvm_binding_json(ap, entry.get("binding_id"), json.dumps(entry.get("prev") or {}))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-binding-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-binding-failed", "err": str(e)[:120]})
+    elif op == "mvvm_remove_binding":
+        # cross-module (widget_mvvm_cpp.py "W-D"): best-effort re-create the binding from its descriptor. LOSSY -- NEW guid, conversion functions NOT restored.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "add_mvvm_binding_json") or not entry.get("descriptor"):
+            undone.append({**entry, "result": "widgetbp-or-handler-or-descriptor-absent"})
+        else:
+            try:
+                mrl.add_mvvm_binding_json(ap, json.dumps(entry.get("descriptor")))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-binding-re-created; new-guid"})
+            except Exception as e:
+                undone.append({**entry, "result": "re-create-binding-failed", "err": str(e)[:120]})
+    elif op == "mvvm_set_field_notify":
+        # cross-module (widget_mvvm_cpp.py "W-D"): set the variable's FieldNotify back to prev_enabled. FAITHFUL.
+        ap = entry.get("asset_path")
+        obj = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if obj is None or mrl is None or not hasattr(mrl, "set_variable_field_notify_json"):
+            undone.append({**entry, "result": "widgetbp-or-handler-absent"})
+        else:
+            try:
+                mrl.set_variable_field_notify_json(ap, entry.get("variable"), bool(entry.get("prev_enabled")))
+                _ww_compile_save(obj, ap)
+                undone.append({**entry, "result": "mvvm-field-notify-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-field-notify-failed", "err": str(e)[:120]})
+    elif op == "set_project_setting":
+        # cross-module (projectsettings_cpp.py, C++ #41): re-set the developer-setting's prior value + re-persist.
+        # had_prior True -> faithful restore of prev; had_prior False -> best-effort re-set of prev (the added
+        # ini key is not cleanly removable without a clear handler). ledger key is settings_class, not an asset.
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        sc = entry.get("settings_class"); prop = entry.get("property")
+        if mrl is None or not hasattr(mrl, "set_developer_setting_json") or not sc or not prop:
+            undone.append({**entry, "result": "handler-or-op-absent"})
+        else:
+            try:
+                mrl.set_developer_setting_json(sc, prop, json.dumps([entry.get("prev")]))
+                undone.append({**entry, "result": ("project-setting-restored" if entry.get("had_prior") else "project-setting-reset-best-effort")})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-project-setting-failed", "err": str(e)[:120]})
+    elif op == "clear_foliage_instances":
+        # cross-module (foliage_write.py): re-add the exact instances we cleared, at their captured
+        # world-space transforms, into the level's InstancedFoliageActor. FAITHFUL (transforms captured pre-clear).
+        ap = entry.get("foliage_type_path")
+        ftype = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        _ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+        _world = _ues.get_editor_world() if _ues else None
+        if ftype is None or _world is None:
+            undone.append({**entry, "result": "type-or-world-absent"})
+        else:
+            tfs = []
+            for it in (entry.get("transforms") or []):
+                loc = it.get("location") or [0.0, 0.0, 0.0]
+                rot = it.get("rotation") or [0.0, 0.0, 0.0]
+                scl = it.get("scale") or [1.0, 1.0, 1.0]
+                _t = unreal.Transform()
+                _t.translation = unreal.Vector(float(loc[0]), float(loc[1]), float(loc[2]))
+                _t.rotation = unreal.Rotator(pitch=float(rot[0]), yaw=float(rot[1]), roll=float(rot[2])).quaternion()
+                _t.scale3d = unreal.Vector(float(scl[0]), float(scl[1]), float(scl[2]))
+                tfs.append(_t)
+            if tfs:
+                with unreal.ScopedEditorTransaction("MCP undo clear_foliage_instances"):
+                    unreal.InstancedFoliageActor.get_default_object().add_instances(_world, ftype, tfs)
+            undone.append({**entry, "result": "foliage-instances-re-added", "instances_readded": len(tfs)})
+            ftype = None
+    elif op == "remove_foliage_type":
+        # cross-module (foliage_write.py): un-soft-delete the FoliageType (rename trash -> original), then
+        # re-add the exact captured instances. FAITHFUL (asset moved intact; world-space xforms captured).
+        orig = entry.get("original_path"); trash = entry.get("trash_path")
+        _ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+        _world = _ues.get_editor_world() if _ues else None
+        moved_back = False
+        if orig and unreal.EditorAssetLibrary.does_asset_exist(orig):
+            moved_back = True  # already at original path
+        elif orig and trash and unreal.EditorAssetLibrary.does_asset_exist(trash):
+            moved_back = unreal.EditorAssetLibrary.rename_asset(trash, orig)
+        ftype = unreal.EditorAssetLibrary.load_asset(orig) if orig else None
+        readded = 0
+        if ftype is not None and _world is not None:
+            tfs = []
+            for it in (entry.get("transforms") or []):
+                loc = it.get("location") or [0.0, 0.0, 0.0]
+                rot = it.get("rotation") or [0.0, 0.0, 0.0]
+                scl = it.get("scale") or [1.0, 1.0, 1.0]
+                _t = unreal.Transform()
+                _t.translation = unreal.Vector(float(loc[0]), float(loc[1]), float(loc[2]))
+                _t.rotation = unreal.Rotator(pitch=float(rot[0]), yaw=float(rot[1]), roll=float(rot[2])).quaternion()
+                _t.scale3d = unreal.Vector(float(scl[0]), float(scl[1]), float(scl[2]))
+                tfs.append(_t)
+            if tfs:
+                with unreal.ScopedEditorTransaction("MCP undo remove_foliage_type"):
+                    unreal.InstancedFoliageActor.get_default_object().add_instances(_world, ftype, tfs)
+                readded = len(tfs)
+        if entry.get("created_trash_dir"):
+            try:
+                _td = "/Game/_MCP_Trash"
+                if unreal.EditorAssetLibrary.does_directory_exist(_td) and not (unreal.EditorAssetLibrary.list_assets(_td, recursive=True) or []):
+                    unreal.EditorAssetLibrary.delete_directory(_td)
+            except Exception:
+                pass
+        ftype = None
+        undone.append({**entry, "result": ("foliage-type-restored" if moved_back else "foliage-type-rename-failed"), "instances_readded": readded})
+    elif op == "set_spline_points":
+        # cross-module (spline_write.py): rebuild the WHOLE prior point array (locations, types, custom
+        # tangents, closed-loop) on the actor's USplineComponent. FAITHFUL (prior whole-array captured).
+        actor = _find_by_name(entry.get("actor_name"))
+        comp = None
+        if actor is not None:
+            _comps = actor.get_components_by_class(unreal.SplineComponent) or []
+            _cn = entry.get("component_name")
+            for _c in _comps:
+                if _c.get_name() == _cn:
+                    comp = _c; break
+            if comp is None and _comps:
+                comp = _comps[0]
+        if comp is None:
+            undone.append({**entry, "result": "actor-or-spline-absent"})
+        else:
+            _cs = unreal.SplineCoordinateSpace.LOCAL if str(entry.get("coordinate_space")).lower() == "local" else unreal.SplineCoordinateSpace.WORLD
+            prior = entry.get("prior") or {}
+            pts = prior.get("points") or []
+            with unreal.ScopedEditorTransaction("MCP undo set_spline_points"):
+                comp.modify()
+                comp.clear_spline_points(False)
+                for _p in pts:
+                    _loc = _p.get("location") or [0.0, 0.0, 0.0]
+                    comp.add_spline_point(unreal.Vector(float(_loc[0]), float(_loc[1]), float(_loc[2])), _cs, False)
+                for _i, _p in enumerate(pts):
+                    _tn = str(_p.get("type") or "CURVE").upper()
+                    comp.set_spline_point_type(_i, getattr(unreal.SplinePointType, _tn, unreal.SplinePointType.CURVE), False)
+                    if _tn == "CURVE_CUSTOM_TANGENT":
+                        _arr = _p.get("arrive") or [0.0, 0.0, 0.0]; _lev = _p.get("leave") or [0.0, 0.0, 0.0]
+                        comp.set_tangents_at_spline_point(_i, unreal.Vector(float(_arr[0]), float(_arr[1]), float(_arr[2])), unreal.Vector(float(_lev[0]), float(_lev[1]), float(_lev[2])), _cs, False)
+                comp.set_closed_loop(bool(prior.get("closed_loop")), False)
+                comp.update_spline()
+            undone.append({**entry, "result": "spline-points-restored", "points": len(pts)})
+    elif op == "set_spline_point":
+        # cross-module (spline_write.py): restore the ONE prior point (location, type, custom tangents)
+        # on the actor's USplineComponent. FAITHFUL (single-point prior captured).
+        actor = _find_by_name(entry.get("actor_name"))
+        comp = None
+        if actor is not None:
+            _comps = actor.get_components_by_class(unreal.SplineComponent) or []
+            _cn = entry.get("component_name")
+            for _c in _comps:
+                if _c.get_name() == _cn:
+                    comp = _c; break
+            if comp is None and _comps:
+                comp = _comps[0]
+        idx = int(entry.get("index", -1))
+        if comp is None or idx < 0 or idx >= comp.get_number_of_spline_points():
+            undone.append({**entry, "result": "spline-or-index-absent"})
+        else:
+            _cs = unreal.SplineCoordinateSpace.LOCAL if str(entry.get("coordinate_space")).lower() == "local" else unreal.SplineCoordinateSpace.WORLD
+            prior = entry.get("prior") or {}
+            _loc = prior.get("location") or [0.0, 0.0, 0.0]
+            _tn = str(prior.get("type") or "CURVE").upper()
+            with unreal.ScopedEditorTransaction("MCP undo set_spline_point"):
+                comp.modify()
+                comp.set_location_at_spline_point(idx, unreal.Vector(float(_loc[0]), float(_loc[1]), float(_loc[2])), _cs, False)
+                comp.set_spline_point_type(idx, getattr(unreal.SplinePointType, _tn, unreal.SplinePointType.CURVE), False)
+                if _tn == "CURVE_CUSTOM_TANGENT":
+                    _arr = prior.get("arrive") or [0.0, 0.0, 0.0]; _lev = prior.get("leave") or [0.0, 0.0, 0.0]
+                    comp.set_tangents_at_spline_point(idx, unreal.Vector(float(_arr[0]), float(_arr[1]), float(_arr[2])), unreal.Vector(float(_lev[0]), float(_lev[1]), float(_lev[2])), _cs, False)
+                comp.update_spline()
+            undone.append({**entry, "result": "spline-point-restored", "index": idx})
+    elif op == "set_editor_mode":
+        # cross-module (world_ext_cpp.py, C++ WorldExt): re-activate the prior editor mode via the C++
+        # handler (empty prev_mode restores the default mode set). FAITHFUL.
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_editor_mode_json"):
+            undone.append({**entry, "result": "handler-absent"})
+        else:
+            try:
+                mrl.set_editor_mode_json(entry.get("prev_mode") or "")
+                undone.append({**entry, "result": "editor-mode-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-editor-mode-failed", "err": str(e)[:120]})
+    elif op == "set_world_partition_settings":
+        # cross-module (world_ext_cpp.py, C++ WorldExt): re-apply the captured prior WP settings
+        # {prop:value} via the C++ handler. FAITHFUL (prior scalar/ExportText values captured).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_world_partition_settings_json"):
+            undone.append({**entry, "result": "handler-absent"})
+        else:
+            try:
+                mrl.set_world_partition_settings_json(json.dumps(entry.get("prev") or {}))
+                undone.append({**entry, "result": "world-partition-settings-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-wp-settings-failed", "err": str(e)[:120]})
+    elif op == "set_runtime_grid":
+        # cross-module (world_ext_cpp.py, C++ WorldExt): re-apply the captured prior grid fields via the
+        # C++ handler (grid_name + prev {field:value}). FAITHFUL. Requires a spatial-hash WP map.
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_runtime_grid_json"):
+            undone.append({**entry, "result": "handler-absent"})
+        else:
+            try:
+                _payload = {"grid_name": entry.get("grid_name")}
+                _payload.update(entry.get("prev") or {})
+                mrl.set_runtime_grid_json(json.dumps(_payload))
+                undone.append({**entry, "result": "runtime-grid-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-runtime-grid-failed", "err": str(e)[:120]})
+    elif op == "wp_load_actors":
+        # cross-module (wp_write.py): the forward loaded these guids; inverse UNLOADS exactly them.
+        wpbl = getattr(unreal, "WorldPartitionBlueprintLibrary", None)
+        if wpbl is None:
+            undone.append({**entry, "result": "wp-library-absent"})
+        else:
+            def _wf_guid(t):
+                g = unreal.Guid()
+                g.import_text(str(t))
+                return g
+            guids = []
+            for t in (entry.get("guids") or []):
+                try:
+                    guids.append(_wf_guid(t))
+                except Exception:
+                    pass
+            with unreal.ScopedEditorTransaction("MCP undo wp_load_actors"):
+                try:
+                    wpbl.unload_actors(guids)
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "wp-actors-unloaded", "guid_count": len(guids)})
+    elif op == "wp_unload_actors":
+        # cross-module (wp_write.py): the forward unloaded these guids; inverse RELOADS exactly them.
+        wpbl = getattr(unreal, "WorldPartitionBlueprintLibrary", None)
+        if wpbl is None:
+            undone.append({**entry, "result": "wp-library-absent"})
+        else:
+            def _wf_guid(t):
+                g = unreal.Guid()
+                g.import_text(str(t))
+                return g
+            guids = []
+            for t in (entry.get("guids") or []):
+                try:
+                    guids.append(_wf_guid(t))
+                except Exception:
+                    pass
+            with unreal.ScopedEditorTransaction("MCP undo wp_unload_actors"):
+                try:
+                    wpbl.load_actors(guids)
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "wp-actors-reloaded", "guid_count": len(guids)})
+    elif op == "wp_pin_actors":
+        # cross-module (wp_write.py): the forward pinned these guids; inverse UNPINS exactly them.
+        wpbl = getattr(unreal, "WorldPartitionBlueprintLibrary", None)
+        if wpbl is None:
+            undone.append({**entry, "result": "wp-library-absent"})
+        else:
+            def _wf_guid(t):
+                g = unreal.Guid()
+                g.import_text(str(t))
+                return g
+            guids = []
+            for t in (entry.get("guids") or []):
+                try:
+                    guids.append(_wf_guid(t))
+                except Exception:
+                    pass
+            with unreal.ScopedEditorTransaction("MCP undo wp_pin_actors"):
+                try:
+                    wpbl.unpin_actors(guids)
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "wp-actors-unpinned", "guid_count": len(guids)})
+    elif op == "wp_unpin_actors":
+        # cross-module (wp_write.py): the forward unpinned these guids; inverse PINS exactly them.
+        wpbl = getattr(unreal, "WorldPartitionBlueprintLibrary", None)
+        if wpbl is None:
+            undone.append({**entry, "result": "wp-library-absent"})
+        else:
+            def _wf_guid(t):
+                g = unreal.Guid()
+                g.import_text(str(t))
+                return g
+            guids = []
+            for t in (entry.get("guids") or []):
+                try:
+                    guids.append(_wf_guid(t))
+                except Exception:
+                    pass
+            with unreal.ScopedEditorTransaction("MCP undo wp_unpin_actors"):
+                try:
+                    wpbl.pin_actors(guids)
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "wp-actors-repinned", "guid_count": len(guids)})
+    elif op == "set_actor_spatially_loaded":
+        # cross-module (wp_write.py): restore the captured prior is_spatially_loaded bool. FAITHFUL.
+        target = _find_by_name(entry.get("actor_name"))
+        if target is None:
+            undone.append({**entry, "result": "actor-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo set_actor_spatially_loaded"):
+                try:
+                    target.set_editor_property("is_spatially_loaded", bool(entry.get("prior")))
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "spatially-loaded-restored"})
+    elif op == "set_actor_runtime_grid":
+        # cross-module (wp_write.py): restore the captured prior runtime_grid FName. FAITHFUL.
+        target = _find_by_name(entry.get("actor_name"))
+        if target is None:
+            undone.append({**entry, "result": "actor-absent"})
+        else:
+            with unreal.ScopedEditorTransaction("MCP undo set_actor_runtime_grid"):
+                try:
+                    target.set_editor_property("runtime_grid", unreal.Name(str(entry.get("prior"))))
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "runtime-grid-restored"})
+    elif op == "create_data_layer":
+        # cross-module (datalayer_write.py): delete the instance we created, then the backing
+        # DataLayerAsset, then the scratch dir if this call made it. CUSTOM op (not generic create_asset).
+        ap = entry.get("asset_path")
+        dls = unreal.get_editor_subsystem(unreal.DataLayerEditorSubsystem)
+        def _wf_dl_asset_path(di):
+            a = None
+            for m in ("get_asset", "get_data_layer_asset"):
+                try:
+                    a = getattr(di, m)()
+                    if a:
+                        break
+                except Exception:
+                    a = None
+            if a is None:
+                try:
+                    a = di.get_editor_property("data_layer_asset")
+                except Exception:
+                    a = None
+            try:
+                return a.get_path_name() if a else None
+            except Exception:
+                return None
+        di = None
+        for _di in list(dls.get_all_data_layers() or []):
+            if _wf_dl_asset_path(_di) == ap:
+                di = _di
+                break
+        with unreal.ScopedEditorTransaction("MCP undo create_data_layer"):
+            if di is not None:
+                try:
+                    dls.delete_data_layer(di)
+                except Exception:
+                    pass
+        di = None
+        unreal.SystemLibrary.collect_garbage()
+        deleted = False
+        if ap and unreal.EditorAssetLibrary.does_asset_exist(ap):
+            deleted = unreal.EditorAssetLibrary.delete_asset(ap)
+            if not deleted:
+                unreal.SystemLibrary.collect_garbage()
+                deleted = unreal.EditorAssetLibrary.delete_asset(ap)
+        elif ap:
+            deleted = True
+        pkg = entry.get("package_path")
+        cd = entry.get("created_dir")
+        if deleted and cd and pkg and unreal.EditorAssetLibrary.does_directory_exist(pkg):
+            try:
+                if not (unreal.EditorAssetLibrary.list_assets(pkg, recursive=True) or []):
+                    unreal.EditorAssetLibrary.delete_directory(pkg)
+            except Exception:
+                pass
+        undone.append({**entry, "result": ("data-layer-deleted" if deleted else "instance-removed; asset-delete-failed")})
+    elif op == "remove_data_layer":
+        # cross-module (datalayer_write.py): recreate the instance from the persisted asset and restore
+        # the 3 captured state flags. FAITHFUL (asset preserved; flags captured).
+        ap = entry.get("asset_path")
+        asset = unreal.EditorAssetLibrary.load_asset(ap) if ap else None
+        dls = unreal.get_editor_subsystem(unreal.DataLayerEditorSubsystem)
+        if asset is None:
+            undone.append({**entry, "result": "data-layer-asset-absent"})
+        else:
+            di = None
+            with unreal.ScopedEditorTransaction("MCP undo remove_data_layer"):
+                try:
+                    p = unreal.DataLayerCreationParameters()
+                    p.set_editor_property("data_layer_asset", asset)
+                    di = dls.create_data_layer_instance(p)
+                except Exception:
+                    di = None
+                if di is not None:
+                    rs = entry.get("initial_runtime_state")
+                    if rs is not None:
+                        try:
+                            _rk = str(rs).split(".")[-1].split(":")[0].strip().upper()
+                            dls.set_data_layer_initial_runtime_state(di, getattr(unreal.DataLayerRuntimeState, _rk))
+                        except Exception:
+                            pass
+                    if entry.get("is_initially_visible") is not None:
+                        try:
+                            dls.set_data_layer_is_initially_visible(di, bool(entry.get("is_initially_visible")))
+                        except Exception:
+                            pass
+                    if entry.get("is_loaded_in_editor") is not None:
+                        try:
+                            dls.set_data_layer_is_loaded_in_editor(di, bool(entry.get("is_loaded_in_editor")), False)
+                        except Exception:
+                            pass
+            undone.append({**entry, "result": ("data-layer-recreated" if di is not None else "recreate-failed")})
+    elif op == "set_data_layer_state":
+        # cross-module (datalayer_write.py): restore each captured prior state flag on the resolved
+        # instance (only changed flags were ledgered). FAITHFUL.
+        dls = unreal.get_editor_subsystem(unreal.DataLayerEditorSubsystem)
+        def _wf_dl_asset_path(di):
+            a = None
+            for m in ("get_asset", "get_data_layer_asset"):
+                try:
+                    a = getattr(di, m)()
+                    if a:
+                        break
+                except Exception:
+                    a = None
+            if a is None:
+                try:
+                    a = di.get_editor_property("data_layer_asset")
+                except Exception:
+                    a = None
+            try:
+                return a.get_path_name() if a else None
+            except Exception:
+                return None
+        def _wf_dl_short(di):
+            for m in ("get_data_layer_short_name", "get_data_layer_instance_name"):
+                f = getattr(di, m, None)
+                if f is not None:
+                    try:
+                        v = str(f())
+                        if v:
+                            return v
+                    except Exception:
+                        pass
+            try:
+                return di.get_name()
+            except Exception:
+                return None
+        def _wf_dl_full(di):
+            try:
+                return str(di.get_data_layer_full_name())
+            except Exception:
+                return None
+        instances = list(dls.get_all_data_layers() or [])
+        target = None
+        if entry.get("dl_asset"):
+            for di in instances:
+                if _wf_dl_asset_path(di) == entry.get("dl_asset"):
+                    target = di
+                    break
+        if target is None:
+            for di in instances:
+                _mf = entry.get("dl_full") and _wf_dl_full(di) == entry.get("dl_full")
+                _ms = entry.get("dl_short") and _wf_dl_short(di) == entry.get("dl_short")
+                if _mf or _ms:
+                    target = di
+                    break
+        if target is None:
+            undone.append({**entry, "result": "data-layer-absent"})
+        else:
+            prior = entry.get("prior") or {}
+            with unreal.ScopedEditorTransaction("MCP undo set_data_layer_state"):
+                if prior.get("initial_runtime_state") is not None:
+                    try:
+                        _rk = str(prior.get("initial_runtime_state")).split(".")[-1].split(":")[0].strip().upper()
+                        dls.set_data_layer_initial_runtime_state(target, getattr(unreal.DataLayerRuntimeState, _rk))
+                    except Exception:
+                        pass
+                if prior.get("is_initially_visible") is not None:
+                    try:
+                        dls.set_data_layer_is_initially_visible(target, bool(prior.get("is_initially_visible")))
+                    except Exception:
+                        pass
+                if prior.get("is_loaded_in_editor") is not None:
+                    try:
+                        dls.set_data_layer_is_loaded_in_editor(target, bool(prior.get("is_loaded_in_editor")), False)
+                    except Exception:
+                        pass
+            undone.append({**entry, "result": "data-layer-state-restored"})
+    elif op == "create_hlod_layer":
+        # cross-module (hlod_write.py): delete the HLODLayer asset we created (and the scratch dir if
+        # this call made it). CUSTOM op; same delete mechanics as generic create_asset.
+        ap = entry.get("asset_path")
+        try:
+            if ap and unreal.EditorAssetLibrary.does_asset_exist(ap):
+                _o = unreal.EditorAssetLibrary.load_asset(ap)
+                if _o is not None:
+                    aes = unreal.get_editor_subsystem(unreal.AssetEditorSubsystem)
+                    if aes:
+                        aes.close_all_editors_for_asset(_o)
+                _o = None
+        except Exception:
+            pass
+        unreal.SystemLibrary.collect_garbage()
+        deleted = False
+        if ap and unreal.EditorAssetLibrary.does_asset_exist(ap):
+            deleted = unreal.EditorAssetLibrary.delete_asset(ap)
+            if not deleted:
+                unreal.SystemLibrary.collect_garbage()
+                deleted = unreal.EditorAssetLibrary.delete_asset(ap)
+        elif ap:
+            deleted = True
+        pkg = entry.get("package_path")
+        cd = entry.get("created_dir")
+        if deleted and cd and pkg and unreal.EditorAssetLibrary.does_directory_exist(pkg):
+            try:
+                if not (unreal.EditorAssetLibrary.list_assets(pkg, recursive=True) or []):
+                    unreal.EditorAssetLibrary.delete_directory(pkg)
+            except Exception:
+                pass
+        undone.append({**entry, "result": ("hlod-layer-deleted" if deleted else "delete-failed")})
+    elif op == "set_actor_hlod_layer":
+        # cross-module (hlod_write.py): restore the actor's prior hlod_layer assignment. FAITHFUL.
+        target = _find_by_name(entry.get("actor_name"))
+        if target is None:
+            undone.append({**entry, "result": "actor-absent"})
+        else:
+            pp = entry.get("prior_path")
+            prior_asset = unreal.EditorAssetLibrary.load_asset(pp) if pp else None
+            with unreal.ScopedEditorTransaction("MCP undo set_actor_hlod_layer"):
+                try:
+                    target.set_editor_property("hlod_layer", prior_asset)
+                except Exception:
+                    pass
+            undone.append({**entry, "result": "hlod-layer-restored"})
+    elif op == "landscape_set_height_region":
+        # cross-module (landscape_write.py): re-write the captured prior height region via the C++
+        # edit-data bridge. FAITHFUL (whole prior region captured pre-write).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "landscape_set_height_region_json"):
+            undone.append({**entry, "result": "landscape-handler-absent"})
+        else:
+            try:
+                _r = mrl.landscape_set_height_region_json(entry.get("actor_name"),
+                    int(entry.get("x")), int(entry.get("y")), int(entry.get("w")), int(entry.get("h")),
+                    entry.get("prev_b64") or "", False)
+                _rj = json.loads(_r) if isinstance(_r, str) else {}
+                if isinstance(_rj, dict) and _rj.get("error"):
+                    undone.append({**entry, "result": "restore-failed", "err": str(_rj.get("error"))[:120]})
+                else:
+                    undone.append({**entry, "result": "landscape-height-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "landscape_paint_weight_region":
+        # cross-module (landscape_write.py): re-paint the captured prior weight region via the C++
+        # edit-data bridge. FAITHFUL (bridge-returned prior weights captured).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "landscape_paint_weight_region_json"):
+            undone.append({**entry, "result": "landscape-handler-absent"})
+        else:
+            try:
+                _r = mrl.landscape_paint_weight_region_json(entry.get("actor_name"), entry.get("layer_name"),
+                    int(entry.get("x")), int(entry.get("y")), int(entry.get("w")), int(entry.get("h")),
+                    entry.get("prev_b64") or "", entry.get("layer_info_path") or "")
+                _rj = json.loads(_r) if isinstance(_r, str) else {}
+                if isinstance(_rj, dict) and _rj.get("error"):
+                    undone.append({**entry, "result": "restore-failed", "err": str(_rj.get("error"))[:120]})
+                else:
+                    undone.append({**entry, "result": "landscape-weight-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "set_breakpoint":
+        # cross-module (debug_write.py): a breakpoint was created/enabled. Inverse: if one existed before,
+        # restore its prior enabled state; otherwise remove it. Transient editor state (cosmetic undo).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_blueprint_breakpoint_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                if entry.get("prior_exists"):
+                    mrl.set_blueprint_breakpoint_json(entry.get("blueprint_path"), entry.get("graph") or "",
+                        entry.get("node_guid"), bool(entry.get("prior_enabled")))
+                    undone.append({**entry, "result": "breakpoint-restored"})
+                else:
+                    mrl.remove_blueprint_breakpoint_json(entry.get("blueprint_path"), entry.get("graph") or "",
+                        entry.get("node_guid"), False)
+                    undone.append({**entry, "result": "breakpoint-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "remove_breakpoint":
+        # cross-module (debug_write.py): a single-node breakpoint was removed. Inverse: re-create it with its
+        # captured prior enabled state (only ledgered when one actually existed).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_blueprint_breakpoint_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                if entry.get("prior_exists"):
+                    mrl.set_blueprint_breakpoint_json(entry.get("blueprint_path"), entry.get("graph") or "",
+                        entry.get("node_guid"), bool(entry.get("prior_enabled")))
+                    undone.append({**entry, "result": "breakpoint-recreated"})
+                else:
+                    undone.append({**entry, "result": "nothing-to-restore"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "set_pin_watch":
+        # cross-module (debug_write.py): a pin watch was added/removed. Inverse: restore the prior watched
+        # state (add if it was watched before, remove otherwise).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_blueprint_pin_watch_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                _restore_remove = not bool(entry.get("prior_watched"))
+                mrl.set_blueprint_pin_watch_json(entry.get("blueprint_path"), entry.get("graph") or "",
+                    entry.get("node_guid"), entry.get("pin_name"), _restore_remove)
+                undone.append({**entry, "result": "pin-watch-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "set_debug_object":
+        # cross-module (debug_write.py): the debug object changed. Inverse: restore the prior object (or clear
+        # if there was none).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_blueprint_debug_object_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                _prior = entry.get("prior_instance_path")
+                if _prior:
+                    mrl.set_blueprint_debug_object_json(entry.get("blueprint_path"), _prior, False)
+                    undone.append({**entry, "result": "debug-object-restored"})
+                else:
+                    mrl.set_blueprint_debug_object_json(entry.get("blueprint_path"), "", True)
+                    undone.append({**entry, "result": "debug-object-cleared"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "set_bt_breakpoint":
+        # cross-module (bt_debug_write.py): a BT breakpoint was set. Inverse: if one existed before, restore its
+        # prior enabled state; otherwise remove it. Transient editor state (cosmetic undo).
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_bt_breakpoint_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                if entry.get("prior_present"):
+                    mrl.set_bt_breakpoint_json(entry.get("bt_path"), entry.get("node_id"),
+                        bool(entry.get("prior_enabled")))
+                    undone.append({**entry, "result": "bt-breakpoint-restored"})
+                else:
+                    mrl.remove_bt_breakpoint_json(entry.get("bt_path"), entry.get("node_id"), False)
+                    undone.append({**entry, "result": "bt-breakpoint-removed"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "remove_bt_breakpoint":
+        # cross-module (bt_debug_write.py): one or more BT breakpoints were cleared. Inverse: re-set each cleared
+        # node with its captured prior enabled state.
+        mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if mrl is None or not hasattr(mrl, "set_bt_breakpoint_json"):
+            undone.append({**entry, "result": "debug-handler-absent"})
+        else:
+            try:
+                _n = 0
+                for _c in (entry.get("cleared") or []):
+                    _nid = _c.get("node_id") or _c.get("node_guid")
+                    if _nid:
+                        mrl.set_bt_breakpoint_json(entry.get("bt_path"), _nid, bool(_c.get("prior_enabled")))
+                        _n += 1
+                undone.append({**entry, "result": "bt-breakpoints-restored", "restored": _n})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "mutable_set_param":
+        # cross-module (mutable_write.py): re-apply the captured prior value of ONE instance parameter,
+        # then non-validating save. Only BOOL/FLOAT/INT/COLOR reach here (setters refuse other types).
+        try:
+            _mi = unreal.EditorAssetLibrary.load_asset(entry.get("instance_path"))
+            if _mi is None:
+                undone.append({**entry, "result": "instance-not-found"})
+            else:
+                _ty = entry.get("param_type"); _nm = entry.get("param_name"); _pv = entry.get("prior_value")
+                if _ty == "BOOL":
+                    _mi.set_bool_parameter_selected_option(_nm, bool(_pv))
+                elif _ty == "FLOAT":
+                    _mi.set_float_parameter_selected_option(_nm, float(_pv))
+                elif _ty == "INT":
+                    _mi.set_int_parameter_selected_option(_nm, str(_pv))
+                elif _ty == "COLOR":
+                    _cc = unreal.LinearColor(float(_pv[0]), float(_pv[1]), float(_pv[2]),
+                        float(_pv[3]) if isinstance(_pv, (list, tuple)) and len(_pv) > 3 else 1.0)
+                    _mi.set_color_parameter_selected_option(_nm, _cc)
+                unreal.EditorLoadingAndSavingUtils.save_packages([_mi.get_outermost()], False)
+                undone.append({**entry, "result": "mutable-param-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "mutable_set_params":
+        # cross-module (mutable_write.py): reset/paste captured MANY priors. Re-apply each, then save once.
+        try:
+            _mi = unreal.EditorAssetLibrary.load_asset(entry.get("instance_path"))
+            if _mi is None:
+                undone.append({**entry, "result": "instance-not-found"})
+            else:
+                for _p in (entry.get("priors") or []):
+                    _ty = _p.get("type"); _nm = _p.get("name"); _pv = _p.get("value")
+                    try:
+                        if _ty == "BOOL":
+                            _mi.set_bool_parameter_selected_option(_nm, bool(_pv))
+                        elif _ty == "FLOAT":
+                            _mi.set_float_parameter_selected_option(_nm, float(_pv))
+                        elif _ty == "INT":
+                            _mi.set_int_parameter_selected_option(_nm, str(_pv))
+                        elif _ty == "COLOR":
+                            _cc = unreal.LinearColor(float(_pv[0]), float(_pv[1]), float(_pv[2]),
+                                float(_pv[3]) if isinstance(_pv, (list, tuple)) and len(_pv) > 3 else 1.0)
+                            _mi.set_color_parameter_selected_option(_nm, _cc)
+                    except Exception:
+                        pass
+                unreal.EditorLoadingAndSavingUtils.save_packages([_mi.get_outermost()], False)
+                undone.append({**entry, "result": "mutable-params-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "mutable_set_state":
+        # cross-module (mutable_write.py): restore the instance's prior active runtime state, then save.
+        try:
+            _mi = unreal.EditorAssetLibrary.load_asset(entry.get("instance_path"))
+            if _mi is None:
+                undone.append({**entry, "result": "instance-not-found"})
+            else:
+                _mi.set_current_state(entry.get("prior_state"))
+                unreal.EditorLoadingAndSavingUtils.save_packages([_mi.get_outermost()], False)
+                undone.append({**entry, "result": "mutable-state-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "sound_cue_add_node":
+        # cross-module (soundcue_graph.py): a node was added + wired. Inverse: restore the prior wiring at
+        # its placement (root -> prior first_node; parent -> prior child_nodes; floating -> orphan, no-op).
+        try:
+            _cue = _scg_load_cue(entry.get("asset_path"))
+            if _cue is None:
+                undone.append({**entry, "result": "cue-not-found"})
+            else:
+                _pl = entry.get("placement")
+                if _pl == "root":
+                    _pf = entry.get("prior_first_node_name")
+                    _cue.set_editor_property("first_node", _scg_resolve(_cue, _pf) if _pf else None)
+                elif _pl == "parent":
+                    _pn = _scg_resolve(_cue, entry.get("parent_name"))
+                    if _pn is not None:
+                        _scg_write_children(_pn, entry.get("prior_children_names"), _cue)
+                _scg_save(_cue)
+                undone.append({**entry, "result": "sound-cue-add-node-reverted"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "sound_cue_connect":
+        # cross-module (soundcue_graph.py): a child was wired into a parent's child_nodes. Inverse: restore
+        # the parent's prior child array.
+        try:
+            _cue = _scg_load_cue(entry.get("asset_path"))
+            if _cue is None:
+                undone.append({**entry, "result": "cue-not-found"})
+            else:
+                _pn = _scg_resolve(_cue, entry.get("parent_name"))
+                if _pn is not None:
+                    _scg_write_children(_pn, entry.get("prior_children_names"), _cue)
+                _scg_save(_cue)
+                undone.append({**entry, "result": "sound-cue-connect-reverted"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "sound_cue_remove_node":
+        # cross-module (soundcue_graph.py): a node was detached from first_node + parents. Inverse: re-wire it
+        # (the node subobject persists, so re-resolving by name restores the exact prior wiring).
+        try:
+            _cue = _scg_load_cue(entry.get("asset_path"))
+            if _cue is None:
+                undone.append({**entry, "result": "cue-not-found"})
+            else:
+                if entry.get("was_root"):
+                    _cue.set_editor_property("first_node", _scg_resolve(_cue, entry.get("node_name")))
+                for _pr in (entry.get("parents") or []):
+                    _pn = _scg_resolve(_cue, _pr.get("parent_name"))
+                    if _pn is not None:
+                        _scg_write_children(_pn, _pr.get("prior_children_names"), _cue)
+                _scg_save(_cue)
+                undone.append({**entry, "result": "sound-cue-remove-node-reverted"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "sound_cue_set_node_props":
+        # cross-module (soundcue_graph.py): reflected props were set with faithful prior capture. Inverse:
+        # restore each captured prior value by its kind.
+        try:
+            _cue = _scg_load_cue(entry.get("asset_path"))
+            if _cue is None:
+                undone.append({**entry, "result": "cue-not-found"})
+            else:
+                _nd = _scg_resolve(_cue, entry.get("node_name"))
+                if _nd is None:
+                    undone.append({**entry, "result": "node-not-found"})
+                else:
+                    for _k, _cap in (entry.get("prior") or {}).items():
+                        try:
+                            _scg_restore_prop(_nd, _k, _cap)
+                        except Exception:
+                            pass
+                    _scg_save(_cue)
+                    undone.append({**entry, "result": "sound-cue-props-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "delete_mutable_node":
+        # cross-module (mutable_graph_cpp.py): a node was ADDED -> inverse deletes it.
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if _mrl is None or not hasattr(_mrl, "delete_mutable_node_json"):
+            undone.append({**entry, "result": "mutable-handler-absent"})
+        else:
+            try:
+                _mrl.delete_mutable_node_json(entry.get("asset_path"), entry.get("node_guid"))
+                _mg_save(entry.get("asset_path"))
+                undone.append({**entry, "result": "mutable-node-deleted"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "disconnect_mutable_pin":
+        # cross-module (mutable_graph_cpp.py): a link was MADE -> inverse breaks that specific link.
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if _mrl is None or not hasattr(_mrl, "disconnect_mutable_pin_json"):
+            undone.append({**entry, "result": "mutable-handler-absent"})
+        else:
+            try:
+                _mrl.disconnect_mutable_pin_json(entry.get("asset_path"), entry.get("node_guid"),
+                    entry.get("pin"), entry.get("other_guid") or "", entry.get("other_pin") or "")
+                _mg_save(entry.get("asset_path"))
+                undone.append({**entry, "result": "mutable-pin-disconnected"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "reconnect_mutable_links":
+        # cross-module (mutable_graph_cpp.py): a pin's links were BROKEN -> inverse reconnects each captured endpoint.
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if _mrl is None or not hasattr(_mrl, "connect_mutable_nodes_json"):
+            undone.append({**entry, "result": "mutable-handler-absent"})
+        else:
+            try:
+                _n = 0
+                for _b in (entry.get("broken") or []):
+                    try:
+                        _mrl.connect_mutable_nodes_json(entry.get("asset_path"), entry.get("node_guid"),
+                            entry.get("pin"), _b.get("other_guid"), _b.get("other_pin"))
+                        _n += 1
+                    except Exception:
+                        pass
+                _mg_save(entry.get("asset_path"))
+                undone.append({**entry, "result": "mutable-links-reconnected", "reconnected": _n})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "readd_mutable_node":
+        # cross-module (mutable_graph_cpp.py): a node was DELETED -> inverse re-adds it (LOSSY: class+pos+links
+        # best-effort; internal per-node state does not round-trip).
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if _mrl is None or not hasattr(_mrl, "add_mutable_node_json"):
+            undone.append({**entry, "result": "mutable-handler-absent"})
+        else:
+            try:
+                _cap = entry.get("captured") or {}
+                _r = _mrl.add_mutable_node_json(entry.get("asset_path"), _cap.get("node_class"),
+                    float(_cap.get("x", 0.0)), float(_cap.get("y", 0.0)))
+                _rj = json.loads(_r) if isinstance(_r, str) else {}
+                _newg = _rj.get("node_guid")
+                if _newg and hasattr(_mrl, "connect_mutable_nodes_json"):
+                    for _pin in (_cap.get("pins") or []):
+                        for _lk in (_pin.get("linked_to") or []):
+                            try:
+                                _mrl.connect_mutable_nodes_json(entry.get("asset_path"), _newg,
+                                    _pin.get("name"), _lk.get("node_guid"), _lk.get("pin_name"))
+                            except Exception:
+                                pass
+                _mg_save(entry.get("asset_path"))
+                undone.append({**entry, "result": "mutable-node-readded", "lossy": True, "new_guid": _newg})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "set_mutable_node_property":
+        # cross-module (mutable_graph_cpp.py): a node property was SET -> inverse restores the captured prior text.
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        if _mrl is None or not hasattr(_mrl, "set_mutable_node_property_json"):
+            undone.append({**entry, "result": "mutable-handler-absent"})
+        else:
+            try:
+                _pv = entry.get("prev_value")
+                _mrl.set_mutable_node_property_json(entry.get("asset_path"), entry.get("node_guid"),
+                    entry.get("property"), _pv if _pv is not None else "")
+                _mg_save(entry.get("asset_path"))
+                undone.append({**entry, "result": "mutable-prop-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_add_node":
+        # cross-module (metasound_write.py): a node was added -> inverse removes it (by reconstructed handle).
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _b.remove_node(_ms_node(entry.get("node_id")), True)
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-node-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_connect":
+        # cross-module: a link was made -> inverse disconnects the target input.
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _th = _ms_node(entry.get("to_node_id"))
+                _ih, _ri = _b.find_node_input_by_name(_th, entry.get("to_input_name"))
+                _b.disconnect_node_input(_ih)
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-disconnected"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_disconnect":
+        # cross-module: an edge was broken -> inverse reconnects output->input.
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _oh, _ro = _b.find_node_output_by_name(_ms_node(entry.get("from_node_id")), entry.get("from_output_name"))
+                _ih, _ri = _b.find_node_input_by_name(_ms_node(entry.get("to_node_id")), entry.get("to_input_name"))
+                _b.connect_nodes(_oh, _ih)
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-reconnected"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_set_node_input_default":
+        # cross-module: a node input literal was set -> restore prior (or clear if none).
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _ih, _ri = _b.find_node_input_by_name(_ms_node(entry.get("node_id")), entry.get("input_name"))
+                if entry.get("had_prior"):
+                    _b.set_node_input_default(_ih, _ms_lit(entry.get("prior_literal")))
+                else:
+                    _b.remove_node_input_default(_ih)
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-input-default-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_add_graph_input":
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _b.remove_graph_input(entry.get("input_name")); _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-graph-input-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_add_graph_output":
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _b.remove_graph_output(entry.get("output_name")); _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-graph-output-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_add_variable":
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _b.remove_graph_variable(entry.get("variable_name")); _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-variable-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_set_graph_input_default":
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                if entry.get("had_prior"):
+                    _b.set_graph_input_default(entry.get("input_name"), _ms_lit(entry.get("prior_literal")))
+                else:
+                    _b.reset_graph_input_defaults(entry.get("input_name"))
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-graph-input-default-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_remove_graph_member":
+        # cross-module: a graph member was removed -> re-add best-effort (LOSSY: connections not restored).
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                _k = entry.get("kind"); _nm = entry.get("name"); _dt = entry.get("data_type")
+                _lit = _ms_lit(entry.get("default_literal"))
+                if _k == "input" and _dt:
+                    _b.add_graph_input_node(_nm, _dt, _lit, False)
+                elif _k == "output" and _dt:
+                    _b.add_graph_output_node(_nm, _dt, _lit, False)
+                elif _k == "variable" and _dt:
+                    _b.add_graph_variable(_nm, _dt, _lit)
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-member-readded", "lossy": True})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "metasound_set_interface":
+        try:
+            _ap = entry.get("asset_path"); _b = _ms_fobb(_ap)
+            if _b is None:
+                undone.append({**entry, "result": "metasound-builder-absent"})
+            else:
+                if entry.get("added"):
+                    _b.remove_interface(entry.get("interface_name"))
+                else:
+                    _b.add_interface(entry.get("interface_name"))
+                _ms_save(_ap)
+                undone.append({**entry, "result": "metasound-interface-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "audio_set_sound_class_parent":
+        # cross-module (audio_reparent.py): a SoundClass was reparented -> restore its prior parent (child_classes
+        # on the parents + the child's parent_class pointer).
+        try:
+            _child = unreal.EditorAssetLibrary.load_asset(entry.get("child_path"))
+            if _child is None:
+                undone.append({**entry, "result": "sound-class-not-found"})
+            else:
+                _pp = entry.get("prior_parent_path")
+                _prior = unreal.EditorAssetLibrary.load_asset(_pp) if _pp else None
+                _cur = None
+                try:
+                    _cur = _child.get_editor_property("parent_class")
+                except Exception:
+                    _cur = None
+                _cpath = _child.get_path_name()
+                _touched = [_child]
+                if _cur is not None and (_prior is None or _cur.get_path_name() != _prior.get_path_name()):
+                    try:
+                        _ok = [c for c in (_cur.get_editor_property("child_classes") or [])
+                               if c is not None and c.get_path_name() != _cpath]
+                        _cur.set_editor_property("child_classes", _ok); _touched.append(_cur)
+                    except Exception:
+                        pass
+                if _prior is not None:
+                    try:
+                        _nk = [c for c in (_prior.get_editor_property("child_classes") or [])
+                               if c is not None and c.get_path_name() != _cpath]
+                        _nk.append(_child)
+                        _prior.set_editor_property("child_classes", _nk); _touched.append(_prior)
+                    except Exception:
+                        pass
+                try:
+                    _child.set_editor_property("parent_class", _prior)
+                except Exception:
+                    pass
+                for _o in _touched:
+                    try:
+                        unreal.EditorAssetLibrary.save_asset(_o.get_path_name(), only_if_is_dirty=False)
+                    except Exception:
+                        pass
+                undone.append({**entry, "result": "sound-class-parent-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "audio_set_effect_chain":
+        # cross-module (audio_reparent.py): a submix effect chain was set -> restore the prior chain.
+        try:
+            _sm = unreal.EditorAssetLibrary.load_asset(entry.get("submix_path"))
+            if _sm is None:
+                undone.append({**entry, "result": "submix-not-found"})
+            else:
+                _arr = unreal.Array(unreal.SoundEffectSubmixPreset)
+                for _p in (entry.get("prior_chain_paths") or []):
+                    try:
+                        _o = unreal.EditorAssetLibrary.load_asset(_p)
+                        if _o is not None:
+                            _arr.append(_o)
+                    except Exception:
+                        pass
+                _sm.set_editor_property("submix_effect_chain", _arr)
+                try:
+                    unreal.EditorAssetLibrary.save_asset(_sm.get_path_name(), only_if_is_dirty=False)
+                except Exception:
+                    pass
+                undone.append({**entry, "result": "effect-chain-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "audio_set_submix_parent":
+        # cross-module (audio_cpp.py, C++ #47): re-run the SAME C++ submix-parent setter with the captured
+        # prior parent path (empty -> detach to root). The C++ handler writes the EditConst parent_submix/
+        # child_submixes that Python cannot. FAITHFUL.
+        _mrl = getattr(unreal, "MCPReflectionLibrary", None)
+        _sp = entry.get("submix_path")
+        if not _sp or _mrl is None or not hasattr(_mrl, "set_submix_parent_json"):
+            undone.append({**entry, "result": "submix-or-handler-absent"})
+        else:
+            try:
+                _res = _mrl.set_submix_parent_json(_sp, entry.get("prior_parent_path") or "")
+                try:
+                    _rj = json.loads(_res) if isinstance(_res, str) else {}
+                    for _tp in (_rj.get("touched_paths") or []):
+                        unreal.EditorAssetLibrary.save_asset(_tp, only_if_is_dirty=False)
+                except Exception:
+                    pass
+                undone.append({**entry, "result": "submix-parent-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_add_node":
+        # cross-module (pcg_write.py): a node was added -> inverse removes it.
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                _n = _pcg_resolve_node(_g, entry.get("node_name"))
+                if _n is not None:
+                    _g.remove_node(_n)
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-node-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_delete_node":
+        # cross-module (pcg_write.py): a node was deleted -> re-add it best-effort (LOSSY: new internal name).
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                _cls = _pcg_resolve_settings_class(entry.get("settings_class"))
+                _nn = None; _ss = None
+                if _cls is not None:
+                    _r = _g.add_node_of_type(_cls)
+                    if isinstance(_r, (list, tuple)):
+                        for _x in _r:
+                            if isinstance(_x, unreal.PCGNode):
+                                _nn = _x
+                            elif isinstance(_x, unreal.PCGSettings):
+                                _ss = _x
+                    elif isinstance(_r, unreal.PCGNode):
+                        _nn = _r
+                if _nn is not None:
+                    _pos = entry.get("position")
+                    if _pos and len(_pos) >= 2:
+                        try:
+                            _nn.set_node_position(float(_pos[0]), float(_pos[1]))
+                        except Exception:
+                            pass
+                    if _ss is None:
+                        _ss = _nn.get_settings()
+                    for _pk, _pv in (entry.get("props") or {}).items():
+                        try:
+                            _ss.set_editor_property(_pk, _pcg_coerce(_ss.get_editor_property(_pk), _pv))
+                        except Exception:
+                            pass
+                    _oldname = entry.get("node_name")
+                    for _e in (entry.get("edges") or []):
+                        try:
+                            _fn = _e.get("from_node"); _tn = _e.get("to_node")
+                            _fnode = _nn if _fn == _oldname else _pcg_resolve_node(_g, _fn)
+                            _tnode = _nn if _tn == _oldname else _pcg_resolve_node(_g, _tn)
+                            if _fnode is not None and _tnode is not None:
+                                _g.add_edge(_fnode, _e.get("from_pin"), _tnode, _e.get("to_pin"))
+                        except Exception:
+                            pass
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-node-readded", "lossy": True})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_node_property":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+            _s = _n.get_settings() if _n is not None else None
+            if _s is None:
+                undone.append({**entry, "result": "pcg-node-absent"})
+            else:
+                if entry.get("had_prior"):
+                    _prop = entry.get("prop")
+                    _s.set_editor_property(_prop, _pcg_coerce(_s.get_editor_property(_prop), entry.get("prior")))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-node-property-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_node_position":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+            if _n is None:
+                undone.append({**entry, "result": "pcg-node-absent"})
+            else:
+                _n.set_node_position(float(entry.get("prior_x", 0.0)), float(entry.get("prior_y", 0.0)))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-node-position-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_connect":
+        # a connection was made -> inverse removes the edge.
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                _fn = _pcg_resolve_node(_g, entry.get("from_node"))
+                _tn = _pcg_resolve_node(_g, entry.get("to_node"))
+                if _fn is not None and _tn is not None:
+                    _g.remove_edge(_fn, entry.get("from_pin"), _tn, entry.get("to_pin"))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-edge-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_disconnect":
+        # an edge was removed -> inverse re-adds it.
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                _fn = _pcg_resolve_node(_g, entry.get("from_node"))
+                _tn = _pcg_resolve_node(_g, entry.get("to_node"))
+                if _fn is not None and _tn is not None:
+                    _g.add_edge(_fn, entry.get("from_pin"), _tn, entry.get("to_pin"))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-edge-readded"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_graph_property":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                if entry.get("had_prior"):
+                    _prop = entry.get("prop")
+                    _g.set_editor_property(_prop, _pcg_coerce(_g.get_editor_property(_prop), entry.get("prior")))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-graph-property-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_layout":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                for _nm, _pos in (entry.get("prior_positions") or {}).items():
+                    try:
+                        _n = _pcg_resolve_node(_g, _nm)
+                        if _n is not None and _pos and len(_pos) >= 2:
+                            _n.set_node_position(float(_pos[0]), float(_pos[1]))
+                    except Exception:
+                        pass
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-layout-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_build":
+        # a whole graph was built -> inverse removes the created nodes (drops incident edges).
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            if _g is None:
+                undone.append({**entry, "result": "pcg-graph-absent"})
+            else:
+                for _nm in (entry.get("node_names") or []):
+                    try:
+                        _n = _pcg_resolve_node(_g, _nm)
+                        if _n is not None:
+                            _g.remove_node(_n)
+                    except Exception:
+                        pass
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-build-reverted"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_subgraph":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+            _s = _n.get_settings() if _n is not None else None
+            if _s is None or not hasattr(_s, "set_subgraph"):
+                undone.append({**entry, "result": "pcg-subgraph-node-absent"})
+            else:
+                _pp = entry.get("prior_subgraph")
+                _tgt = unreal.EditorAssetLibrary.load_asset(_pp) if _pp else None
+                _s.set_subgraph(_tgt)
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-subgraph-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_graph_param":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            _H = getattr(unreal, "PCGGraphParametersHelpers", None)
+            if _g is None or _H is None:
+                undone.append({**entry, "result": "pcg-graph-or-helper-absent"})
+            else:
+                if entry.get("had_prior"):
+                    _setter = getattr(_H, entry.get("set_method"), None)
+                    if _setter is not None:
+                        _setter(_g, entry.get("param_name"), entry.get("prior"))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-graph-param-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_compute_source":
+        try:
+            _a = unreal.EditorAssetLibrary.load_asset(entry.get("asset_path"))
+            if _a is None:
+                undone.append({**entry, "result": "pcg-compute-source-absent"})
+            else:
+                if entry.get("had_prior"):
+                    _a.set_editor_property("source", entry.get("prior_source") or "")
+                _pcg_save(_a)
+                undone.append({**entry, "result": "pcg-compute-source-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_add_compute_source_additional":
+        try:
+            _a = unreal.EditorAssetLibrary.load_asset(entry.get("asset_path"))
+            if _a is None:
+                undone.append({**entry, "result": "pcg-compute-source-absent"})
+            else:
+                _rp = entry.get("ref_path")
+                _keep = []
+                for _e in list(_a.get_editor_property("additional_sources") or []):
+                    _drop = False
+                    try:
+                        if isinstance(_e, unreal.Object) and _e is not None and _e.get_path_name().split(".")[0] == _rp:
+                            _drop = True
+                    except Exception:
+                        _drop = False
+                    if not _drop:
+                        _keep.append(_e)
+                _a.set_editor_property("additional_sources", _keep)
+                _pcg_save(_a)
+                undone.append({**entry, "result": "pcg-compute-additional-removed"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_remove_compute_source_additional":
+        try:
+            _a = unreal.EditorAssetLibrary.load_asset(entry.get("asset_path"))
+            _ref = unreal.EditorAssetLibrary.load_asset(entry.get("ref_path")) if entry.get("ref_path") else None
+            if _a is None or _ref is None:
+                undone.append({**entry, "result": "pcg-compute-source-or-ref-absent"})
+            else:
+                _arr = list(_a.get_editor_property("additional_sources") or [])
+                _idx = entry.get("index")
+                if _idx is None or _idx < 0 or _idx > len(_arr):
+                    _arr.append(_ref)
+                else:
+                    _arr.insert(_idx, _ref)
+                _a.set_editor_property("additional_sources", _arr)
+                _pcg_save(_a)
+                undone.append({**entry, "result": "pcg-compute-additional-reinserted"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_hlsl_kernel_type":
+        try:
+            _g = _pcg_load_graph(entry.get("graph_path"))
+            _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+            if _g is None or _n is None:
+                undone.append({**entry, "result": "pcg-graph-or-node-absent"})
+            else:
+                _s = _n.get_settings()
+                if _s is not None and entry.get("had_prior"):
+                    _cur = _s.get_editor_property("kernel_type")
+                    _s.set_editor_property("kernel_type", _pcg_coerce(_cur, entry.get("prior")))
+                _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-hlsl-kernel-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_subgraph_override":
+        if (entry.get("via") or "").startswith("param:"):
+            # DISABLED (2026-08-19): programmatically restoring a bag-backed subgraph USER-PARAMETER
+            # override crashes the editor -- a Python-interpreter stack overflow through the PCG param
+            # marshalling path (EXCEPTION_ACCESS_VIOLATION in python311.dll, reproduced twice, both
+            # via reset_editor_property AND the typed PCGGraphParametersHelpers setter). The param-leg
+            # override undo is a documented NO-OP: the forward best-effort override stays applied.
+            # (set/reset_pcg_subgraph_override remain PARTIAL.) The prop-leg inverse below is verified safe.
+            undone.append({**entry, "result": "pcg-subgraph-override-param-noop"})
+        else:
+            try:
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+                _inst = None
+                if _n is not None:
+                    _sset = _n.get_settings()
+                    if _sset is not None:
+                        try:
+                            _inst = _sset.get_editor_property("subgraph_instance")
+                        except Exception:
+                            _inst = None
+                if _inst is None:
+                    undone.append({**entry, "result": "pcg-subgraph-instance-absent"})
+                else:
+                    _prop = entry.get("property")
+                    _po = entry.get("prior_overridden") or ""
+                    _was = ("OVERRIDDEN" in _po) or (_po == "True")
+                    if not _was:
+                        try:
+                            _inst.reset_editor_property(_prop)
+                        except Exception:
+                            pass
+                    elif entry.get("had_prior"):
+                        try:
+                            _cur = _inst.get_editor_property(_prop)
+                            _inst.set_editor_property(_prop, _pcg_coerce(_cur, entry.get("prior_value")))
+                        except Exception:
+                            pass
+                    _pcg_save(_g)
+                    undone.append({**entry, "result": "pcg-subgraph-override-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_reset_subgraph_override":
+        if (entry.get("via") or "").startswith("param:"):
+            # DISABLED (2026-08-19): see pcg_set_subgraph_override above -- programmatically re-applying a
+            # bag-backed subgraph user-parameter value crashes the editor (python311 stack overflow).
+            # Param-leg reset undo is a documented NO-OP. The prop-leg inverse below is verified safe.
+            undone.append({**entry, "result": "pcg-subgraph-reset-param-noop"})
+        else:
+            try:
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                _n = _pcg_resolve_node(_g, entry.get("node_name")) if _g is not None else None
+                _inst = None
+                if _n is not None:
+                    _sset = _n.get_settings()
+                    if _sset is not None:
+                        try:
+                            _inst = _sset.get_editor_property("subgraph_instance")
+                        except Exception:
+                            _inst = None
+                if _inst is None:
+                    undone.append({**entry, "result": "pcg-subgraph-instance-absent"})
+                else:
+                    _prop = entry.get("property")
+                    _po = entry.get("prior_overridden") or ""
+                    _was = ("OVERRIDDEN" in _po) or (_po == "True")
+                    if _was and entry.get("had_prior"):
+                        try:
+                            _cur = _inst.get_editor_property(_prop)
+                            _inst.set_editor_property(_prop, _pcg_coerce(_cur, entry.get("prior_value")))
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            _inst.reset_editor_property(_prop)
+                        except Exception:
+                            pass
+                    _pcg_save(_g)
+                    undone.append({**entry, "result": "pcg-subgraph-reset-restored"})
+            except Exception as e:
+                undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_set_component_graph":
+        try:
+            _eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            _all = list(_eas.get_all_level_actors()) if _eas is not None else []
+            _ap = entry.get("actor_path"); _an = entry.get("actor_name"); _al = entry.get("actor_label")
+            _act = None
+            for _a in _all:
+                try:
+                    if _ap and _a.get_path_name() == _ap:
+                        _act = _a; break
+                except Exception:
+                    pass
+            if _act is None:
+                for _a in _all:
+                    try:
+                        if _an and _a.get_name() == _an:
+                            _act = _a; break
+                        if _al and _a.get_actor_label() == _al:
+                            _act = _a; break
+                    except Exception:
+                        pass
+            _comp = None
+            if _act is not None:
+                try:
+                    _cs = _act.get_components_by_class(unreal.PCGComponent)
+                    if _cs and len(list(_cs)) > 0:
+                        _comp = list(_cs)[0]
+                except Exception:
+                    _comp = None
+                if _comp is None:
+                    try:
+                        _cc = _act.get_editor_property("pcg_component")
+                        if isinstance(_cc, unreal.PCGComponent):
+                            _comp = _cc
+                    except Exception:
+                        _comp = None
+            if _comp is None:
+                undone.append({**entry, "result": "pcg-component-absent; no-op"})
+            else:
+                _pg = entry.get("prior_graph")
+                _obj = unreal.EditorAssetLibrary.load_asset(_pg) if _pg else None
+                _comp.set_graph(_obj)
+                undone.append({**entry, "result": "pcg-component-graph-restored"})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_remove_graph_parameter":
+        try:
+            _fn = getattr(unreal.MCPReflectionLibrary, "remove_pcg_graph_parameter_json", None)
+            if _fn is None:
+                undone.append({**entry, "result": "pcg-schema-handler-absent"})
+            else:
+                _r = _fn(entry.get("graph_path"), entry.get("name"))
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                if _g is not None:
+                    _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-graph-param-add-undone", "handler": str(_r)[:100]})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_add_graph_parameter":
+        try:
+            _fn = getattr(unreal.MCPReflectionLibrary, "add_pcg_graph_parameter_json", None)
+            if _fn is None:
+                undone.append({**entry, "result": "pcg-schema-handler-absent"})
+            else:
+                _ty = entry.get("type")
+                _vto = entry.get("value_type_object") or ""
+                if _ty == "struct":
+                    _sm = {"Vector2D": "vector2d", "Vector": "vector", "Rotator": "rotator", "Transform": "transform", "Quat": "quat", "LinearColor": "linearcolor"}
+                    _ty = _sm.get(_vto.split(".")[-1], "vector")
+                _r = _fn(entry.get("graph_path"), entry.get("name"), _ty)
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                if _g is not None:
+                    _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-graph-param-remove-undone", "handler": str(_r)[:100]})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_rename_graph_parameter":
+        try:
+            _fn = getattr(unreal.MCPReflectionLibrary, "rename_pcg_graph_parameter_json", None)
+            if _fn is None:
+                undone.append({**entry, "result": "pcg-schema-handler-absent"})
+            else:
+                _r = _fn(entry.get("graph_path"), entry.get("old_name"), entry.get("new_name"))
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                if _g is not None:
+                    _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-graph-param-rename-undone", "handler": str(_r)[:100]})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_remove_dynamic_input_pin":
+        try:
+            _fn = getattr(unreal.MCPReflectionLibrary, "remove_pcg_dynamic_input_pin_json", None)
+            if _fn is None:
+                undone.append({**entry, "result": "pcg-schema-handler-absent"})
+            else:
+                _pi = entry.get("pin_index")
+                _pi = int(_pi) if _pi is not None else -1
+                _r = _fn(entry.get("graph_path"), entry.get("node_name"), _pi)
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                if _g is not None:
+                    _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-dynamic-pin-add-undone", "handler": str(_r)[:100]})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
+    elif op == "pcg_add_dynamic_input_pin":
+        try:
+            _fn = getattr(unreal.MCPReflectionLibrary, "add_pcg_dynamic_input_pin_json", None)
+            if _fn is None:
+                undone.append({**entry, "result": "pcg-schema-handler-absent"})
+            else:
+                _r = _fn(entry.get("graph_path"), entry.get("node_name"))
+                _g = _pcg_load_graph(entry.get("graph_path"))
+                if _g is not None:
+                    _pcg_save(_g)
+                undone.append({**entry, "result": "pcg-dynamic-pin-remove-undone", "handler": str(_r)[:100]})
+        except Exception as e:
+            undone.append({**entry, "result": "restore-failed", "err": str(e)[:120]})
     else:
         led.append(entry)
         undone.append({"op": op, "result": "no-inverse-known; stopped"})
         break
+    try:
+        _rroot = getattr(builtins, "_UMCP_REDO", None)
+        if _rroot is None:
+            _rroot = {}
+            builtins._UMCP_REDO = _rroot
+        _rsid = PARAMS.get("_session", "default")
+        _rroot.setdefault(_rsid, []).append(entry)
+    except Exception:
+        pass
 print("@@UMCP@@" + json.dumps({"status": "success", "undone": undone, "ledger_depth": len(led)}))
 '''
 
@@ -4144,21 +9371,52 @@ print("@@UMCP@@" + json.dumps({"status": "success", "swept": out}))
         recorded edits are touched; your manual editor changes are never affected.
         Stops early if it hits an op with no known inverse."""
         try:
-            res = _exec(_UNDO_BODY, {"count": count})
-            # Follow-up sweep (separate execute_python call): a just-created asset can resist delete
-            # in the same undo pass (engine settle timing) — a later call always succeeds. Re-delete
-            # any create_asset that reported delete-failed, and update its result in place.
-            failed = [{"asset_path": u.get("asset_path"), "package_path": u.get("package_path"),
-                       "created_dir": u.get("created_dir")}
-                      for u in (res.get("undone") or [])
-                      if u.get("op") == "create_asset" and u.get("result") == "delete-failed"]
-            if failed:
-                sweep = _exec(_CREATE_ASSET_SWEEP_BODY, {"targets": failed})
-                ok_paths = {s.get("asset_path") for s in (sweep.get("swept") or []) if s.get("swept")}
-                for u in res.get("undone") or []:
-                    if (u.get("op") == "create_asset" and u.get("result") == "delete-failed"
-                            and u.get("asset_path") in ok_paths):
-                        u["result"] = "asset-deleted (post-sweep)"
-            return json.dumps(res, indent=2)
+            undone = []
+            while len(undone) < count:
+                peek = _lean_exec(_ST_PEEK, {})
+                entry = peek.get("entry") if isinstance(peek, dict) else None
+                if entry is None:
+                    break
+                op = entry.get("op", "")
+                # --- StateTree ops: apply the inverse via a LEAN snippet (avoids crash #2 in _UNDO_BODY) ---
+                if op == "st_set_component_tree":
+                    r = _lean_exec(_ST_UNDO_COMPTREE, {"entry": entry})
+                    undone.append({**entry, "result": (r.get("result") if isinstance(r, dict) else None)})
+                    continue
+                if isinstance(op, str) and op.startswith("st_"):
+                    calls, token = _st_inverse(entry)
+                    if calls is not None:
+                        r = _lean_exec(_ST_UNDO_APPLY, {"asset_path": entry.get("asset_path"),
+                            "_op": op, "_calls": calls, "_token": token})
+                        undone.append({**entry, "result": (r.get("result") if isinstance(r, dict) else token)})
+                        continue
+                    # unknown st_* op -> fall through to the legacy body below
+                # --- PCG schema/pin ops: apply the inverse via a LEAN snippet (avoids the python311 C-stack
+                #     overflow that _UNDO_BODY + the graph-changed broadcast triggers) ---
+                if isinstance(op, str) and op in ("pcg_remove_graph_parameter", "pcg_add_graph_parameter",
+                        "pcg_rename_graph_parameter", "pcg_remove_dynamic_input_pin", "pcg_add_dynamic_input_pin"):
+                    _pgp, _pcalls, _ptok = _pcg_schema_inverse(entry)
+                    if _pcalls is not None:
+                        r = _lean_exec(_PCG_SCHEMA_UNDO, {"graph_path": _pgp, "_calls": _pcalls,
+                            "_token": _ptok, "_entry": entry})
+                        undone.append({**entry, "result": (r.get("result") if isinstance(r, dict) else _ptok)})
+                        continue
+                # --- non-StateTree op: undo exactly ONE via the legacy _UNDO_BODY, then create_asset sweep ---
+                rb = _exec(_UNDO_BODY, {"count": 1})
+                ub = rb.get("undone") if isinstance(rb, dict) else None
+                if not ub:
+                    break
+                failed = [{"asset_path": u.get("asset_path"), "package_path": u.get("package_path"),
+                           "created_dir": u.get("created_dir")}
+                          for u in ub if u.get("op") == "create_asset" and u.get("result") == "delete-failed"]
+                if failed:
+                    sweep = _exec(_CREATE_ASSET_SWEEP_BODY, {"targets": failed})
+                    ok_paths = {s.get("asset_path") for s in (sweep.get("swept") or []) if s.get("swept")}
+                    for u in ub:
+                        if (u.get("op") == "create_asset" and u.get("result") == "delete-failed"
+                                and u.get("asset_path") in ok_paths):
+                            u["result"] = "asset-deleted (post-sweep)"
+                undone.extend(ub)
+            return json.dumps({"undone": undone, "count": len(undone)}, indent=2)
         except Exception as e:
             return f"Error: {e}"

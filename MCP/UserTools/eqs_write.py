@@ -31,10 +31,11 @@ LIVE PROBE FINDINGS (UE 5.8.1, TestMCPSetup — what IS / ISN'T Python-reachable
     handler unwraps the single-element array and returns the prior value bare in "prev" (re-wrap in an
     array for the inverse). Locator grammar: "option:<i>", "option:<i>/generator", "option:<i>/test:<j>".
     Each handler is hasattr-guarded: on an un-rebuilt DLL the tool returns a clear "handler unavailable".
-  * run_env_query is DEFERRED. unreal.EnvQueryManager + EnvQueryInstanceBlueprintWrapper exist, but a run
-    needs a RUNNING (PIE/game) world + a valid querier pawn + navigation data + async tick to process the
-    query; the editor (non-PIE) world does not process EQS, and PROTOCOL forbids PIE against the shared
-    editor. Not faked; a future PIE-enabled harness with a querier could implement it via EnvQueryManager.
+  * run_env_query IS NOW LIVE (C++ #25 RunEnvQueryJson) but PIE-GATED. unreal.EnvQueryManager processes a
+    query only in a RUNNING (PIE/game) world; the editor (non-PIE) world does not tick EQS. So the tool
+    resolves the PIE game world (UnrealEditorSubsystem.get_game_world under is_in_play_in_editor), resolves a
+    querier actor there, and calls RunEnvQueryJson -> UEnvQueryManager::RunInstantQuery (synchronous). Outside
+    PIE it returns a clear "not in PIE" error (never faked). The coordinator verifies it by running PIE.
 
 Implemented (working):
   - create_env_query   (WRITE; ledgered op "create_asset"; creates an EMPTY query)
@@ -44,8 +45,7 @@ Implemented (working):
   - set_eqs_node_property (WRITE; C++ SetEnvQueryNodeProperty; NEW op "eqs_set_node_property"; inverse re-set prev)
   - remove_eqs_option  (WRITE; C++ RemoveEnvQueryOption; NEW op "eqs_readd_option"; BEST-EFFORT replay inverse)
   - remove_eqs_test    (WRITE; C++ RemoveEnvQueryTest; NEW op "eqs_readd_test"; BEST-EFFORT replay inverse)
-Implemented as HONEST REFUSALS (no mutation; explain the blocker + point to the editor):
-  - run_env_query (DEFERRED)
+  - run_env_query      (READ/RUNTIME; C++ RunEnvQueryJson; PIE-gated; NO ledger; scored result items)
 
 NEW undo ops (schemas reported to .mcp_coord/coordinator-inbox/cpp1516_wire_undo_ops.md for folding into
 editor_level.undo): eqs_add_option, eqs_add_test, eqs_set_node_property, eqs_readd_option, eqs_readd_test.
@@ -731,24 +731,89 @@ else:
             return f"Error: {e}"
 
     # ------------------------------------------------------------------ #
-    # run_env_query — DEFERRED (needs a running world + querier; PIE off)  #
+    # run_env_query — PIE-gated runtime execution (C++ #25 RunEnvQueryJson) #
+    # Needs a LIVE (PIE/game) world; the editor world does not tick EQS.   #
+    # Read-only (no ledger). hasattr-guarded on an un-rebuilt DLL.         #
     # ------------------------------------------------------------------ #
+    _RUN_BODY = _EQS_W_HELPERS + r'''
+env_query = PARAMS["env_query"]; querier_name = PARAMS.get("querier"); run_mode = PARAMS.get("run_mode") or "all"
+max_results = PARAMS.get("max_results")
+try:
+    max_items = int(max_results) if max_results is not None else 0
+except Exception:
+    max_items = 0
+ues = _try(lambda: unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem))
+les = _try(lambda: unreal.get_editor_subsystem(unreal.LevelEditorSubsystem))
+gw = ues.get_game_world() if (ues is not None and les is not None and les.is_in_play_in_editor()) else None
+obj, err = _load_eq(env_query)
+m = _refl()
+runner = getattr(m, "run_env_query_json", None) if m is not None else None
+if gw is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "feature": "run_env_query", "executed": False,
+        "message": "not in PIE -- EQS is only processed by a running world. play_in_editor, poll get_pie_status until in_pie, then retry."}))
+elif err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
+elif runner is None:
+    print("@@UMCP@@" + json.dumps({"status": "error", "feature": "run_env_query", "executed": False,
+        "message": "C++ handler run_env_query_json unavailable (plugin DLL predates C++ #25; recompile needed)"}))
+else:
+    acts = _try(lambda: list(unreal.GameplayStatics.get_all_actors_of_class(gw, unreal.Actor)), []) or []
+    querier = None
+    if querier_name:
+        for a in acts:
+            try:
+                nm = a.get_name(); lbl = _try(lambda a=a: a.get_actor_label(), "")
+                if nm == querier_name or (querier_name.lower() in nm.lower()) or lbl == querier_name:
+                    querier = a; break
+            except Exception:
+                pass
+    if querier is None and not querier_name:
+        querier = _try(lambda: unreal.GameplayStatics.get_player_pawn(gw, 0), None)
+        if querier is None:
+            for a in acts:
+                if isinstance(a, unreal.Pawn):
+                    querier = a; break
+        if querier is None and acts:
+            querier = acts[0]
+    if querier is None:
+        print("@@UMCP@@" + json.dumps({"status": "error", "feature": "run_env_query", "executed": False,
+            "message": "could not resolve a querier actor (querier=%s) in the PIE world" % (querier_name or "(auto)")}))
+    else:
+        res = _try(lambda: json.loads(runner(obj, querier, run_mode, max_items)), {"error": "call failed"})
+        if not isinstance(res, dict) or res.get("error"):
+            print("@@UMCP@@" + json.dumps({"status": "error", "feature": "run_env_query", "executed": False,
+                "querier": _try(lambda: querier.get_name(), None),
+                "message": (res.get("error") if isinstance(res, dict) else "run_env_query_json failed")}))
+        else:
+            res["executed"] = True
+            res["note"] = ("Ran via C++ RunEnvQueryJson (UEnvQueryManager.RunInstantQuery) in the live PIE "
+                           "world. items are scored best-first (score normalized 0..1); each item carries a "
+                           "location and, for actor queries, an actor + actor_path. Read-only (no ledger).")
+            print("@@UMCP@@" + json.dumps(res))
+'''
+
     @mcp.tool()
     def run_env_query(ctx, env_query: str, querier: str = None, run_mode: str = None,
                      max_results: int = None, params: str = None) -> str:
-        """Execute an EnvQuery in-editor and return scored results. DEFERRED (no execution) in this build.
+        """Execute an EnvQuery in the LIVE PIE world and return scored results (C++ #25 handler).
 
-        unreal.EnvQueryManager and EnvQueryInstanceBlueprintWrapper exist, but running a query requires a
-        RUNNING (PIE/game) world plus a valid querier pawn, navigation data, and an async tick to process
-        the query -- the editor (non-PIE) world does not process EQS, and this shared-editor protocol
-        forbids PIE. So a run cannot be performed (or faked) here. Returns a structured 'deferred' status.
-        A future PIE-enabled harness with a spawned querier could implement it via
-        EnvQueryManager.run_query. Use validate_env_query for static structural checking meanwhile."""
-        payload = {"status": "deferred", "feature": "run_env_query", "env_query": env_query,
-                   "executed": False,
-                   "message": ("Running EQS needs a running (PIE/game) world + a valid querier pawn + nav "
-                               "data + async tick; the editor world does not process EQS and PROTOCOL "
-                               "forbids PIE against the shared editor. Not faked. EnvQueryManager IS "
-                               "present for a future PIE-enabled harness. Use validate_env_query for "
-                               "static structural checks.")}
-        return json.dumps(payload, indent=2)
+        REQUIRES PIE -- EQS is only processed by a running world. play_in_editor, poll get_pie_status until
+        in_pie, then call this (the editor / non-PIE world does not tick queries).
+
+        env_query:   EnvQuery asset path.
+        querier:     querier actor name / label / substring in the PIE world (the query OWNER; contexts like
+                     EnvQueryContext_Querier resolve against it). Empty = the player pawn, else the first
+                     Pawn, else the first actor.
+        run_mode:    'single' | 'randombest5' | 'randombest25' | 'all' (default 'all' = every scored item).
+        max_results: cap on returned items (the full item_count is always reported); None/0 = all.
+        params:      accepted for spec parity; named EQS query params are not wired in this build (ignored).
+
+        Calls MCPReflectionLibrary.run_env_query_json(query, querier, run_mode, max_items) via RunInstantQuery.
+        Read-only: NO mutation, NO ledger. Returns {result_status, success, finished, option_index, item_type,
+        item_count, returned_count, items:[{index, score, location, actor?, actor_path?}]}."""
+        exec_params = {"env_query": env_query, "querier": querier, "run_mode": run_mode,
+                       "max_results": max_results}
+        try:
+            return json.dumps(_exec(_RUN_BODY, exec_params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"

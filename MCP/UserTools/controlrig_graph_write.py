@@ -955,6 +955,179 @@ else:
         except Exception as e:
             return f"Error: {e}"
 
+    # ------------------------------------------------------------------ #
+    # collapse_rig_vm_nodes — group nodes into a collapse (library) node  #
+    # ------------------------------------------------------------------ #
+    _COLLAPSE_BODY = _CR_HELPERS + r'''
+path = PARAMS.get("asset_path")
+node_names = PARAMS.get("node_names") or []
+collapse_name = str(PARAMS.get("collapse_name") or "Collapse")
+bp, err = _load_cr(path)
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
+elif not node_names:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "provide node_names (a list of node names/paths to collapse)"}))
+else:
+    ctrl, model, cerr = _get_controller(bp, PARAMS.get("graph_name"))
+    if cerr:
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": cerr}))
+    else:
+        model = _model_of(ctrl, bp, model)
+        gname = str(_try(lambda: model.get_graph_name()))
+        keys = [unreal.Name(str(n)) for n in node_names]
+        snap = _try(lambda: ctrl.export_nodes_to_text(keys, True)) or ""
+        coll = None
+        with unreal.ScopedEditorTransaction("MCP collapse_rig_vm_nodes"):
+            coll = _try(lambda: ctrl.collapse_nodes(keys, collapse_name, True, False, False))
+        if coll is None:
+            print("@@UMCP@@" + json.dumps({"status": "error", "message": "collapse_nodes returned None (unknown node names, or nodes not collapsible together)"}))
+        else:
+            cn = str(_try(lambda: coll.get_node_path()))
+            _ledger().append({"op": "collapse_rig_vm_nodes", "asset_path": path, "graph_name": gname,
+                              "collapse_node_name": cn, "snapshot": snap})
+            _save_cr(path)
+            print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": bp.get_path_name(),
+                "graph_name": gname, "collapse_node_name": cn, "collapsed": [str(n) for n in node_names],
+                "node_count": len(_try(lambda: model.get_nodes(), []) or []),
+                "snapshot_chars": len(snap), "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def collapse_rig_vm_nodes(ctx, asset_path: str, node_names: list, collapse_name: str = "Collapse",
+                              graph_name: str = None) -> str:
+        """Collapse several RigVM nodes into a single COLLAPSE (library) node (ledgered, FAITHFUL undo).
+
+        asset_path:    ControlRigBlueprint path.
+        node_names:    list of node names/paths (on the same graph) to group.
+        collapse_name: desired name for the new collapse node (graph may adjust; real name returned).
+        graph_name:    which graph to author in (default = the default model).
+
+        Snapshots the exact source subgraph (export_nodes_to_text incl. exterior links) BEFORE collapsing,
+        so the inverse losslessly restores every node+pin+link. Ledgers op 'collapse_rig_vm_nodes'
+        {asset_path, graph_name, collapse_node_name, snapshot}; inverse = remove the collapse node +
+        import_nodes_from_text(snapshot)."""
+        params = {"asset_path": asset_path, "node_names": node_names,
+                  "collapse_name": collapse_name, "graph_name": graph_name}
+        try:
+            return json.dumps(_exec(_COLLAPSE_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # expand_rig_vm_node — expand a collapse/function node back to nodes  #
+    # ------------------------------------------------------------------ #
+    _EXPAND_BODY = _CR_HELPERS + r'''
+path = PARAMS.get("asset_path")
+node_name = str(PARAMS.get("node_name") or "")
+bp, err = _load_cr(path)
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
+elif not node_name:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "provide node_name (the collapse/function-ref node to expand)"}))
+else:
+    ctrl, model, cerr = _get_controller(bp, PARAMS.get("graph_name"))
+    if cerr:
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": cerr}))
+    else:
+        model = _model_of(ctrl, bp, model)
+        gname = str(_try(lambda: model.get_graph_name()))
+        snap = _try(lambda: ctrl.export_nodes_to_text([unreal.Name(node_name)], True)) or ""
+        exp = None
+        with unreal.ScopedEditorTransaction("MCP expand_rig_vm_node"):
+            exp = _try(lambda: ctrl.expand_library_node(unreal.Name(node_name), True, False))
+        if exp is None:
+            print("@@UMCP@@" + json.dumps({"status": "error", "message": "expand_library_node returned None (node %r is not a collapse/function-reference node?)" % node_name}))
+        else:
+            expanded = [str(_try(lambda n=n: n.get_node_path())) for n in (exp or [])]
+            _ledger().append({"op": "expand_rig_vm_node", "asset_path": path, "graph_name": gname,
+                              "snapshot": snap, "expanded_names": expanded})
+            _save_cr(path)
+            print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": bp.get_path_name(),
+                "graph_name": gname, "expanded_node": node_name, "expanded_names": expanded,
+                "node_count": len(_try(lambda: model.get_nodes(), []) or []),
+                "snapshot_chars": len(snap), "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def expand_rig_vm_node(ctx, asset_path: str, node_name: str, graph_name: str = None) -> str:
+        """Expand a COLLAPSE or FUNCTION-REFERENCE node back into its constituent nodes (ledgered, FAITHFUL undo).
+
+        asset_path: ControlRigBlueprint path.
+        node_name:  the collapse/function-reference node to expand.
+        graph_name: which graph the node lives on (default = the default model).
+
+        Snapshots the library node (export_nodes_to_text incl. exterior links) BEFORE expanding. Ledgers op
+        'expand_rig_vm_node' {asset_path, graph_name, snapshot, expanded_names}; inverse = remove the
+        expanded child nodes + import_nodes_from_text(snapshot) to restore the single library node."""
+        params = {"asset_path": asset_path, "node_name": node_name, "graph_name": graph_name}
+        try:
+            return json.dumps(_exec(_EXPAND_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # promote_rig_vm_node — collapse<->function-reference promotion       #
+    # ------------------------------------------------------------------ #
+    _PROMOTE_BODY = _CR_HELPERS + r'''
+path = PARAMS.get("asset_path")
+node_name = str(PARAMS.get("node_name") or "")
+bp, err = _load_cr(path)
+if err:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
+elif not node_name:
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "provide node_name (a collapse OR function-reference node)"}))
+else:
+    ctrl, model, cerr = _get_controller(bp, PARAMS.get("graph_name"))
+    if cerr:
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": cerr}))
+    else:
+        model = _model_of(ctrl, bp, model)
+        gname = str(_try(lambda: model.get_graph_name()))
+        node = _find_node(model, node_name)
+        if node is None:
+            print("@@UMCP@@" + json.dumps({"status": "error", "message": "node %r not found on graph %r" % (node_name, gname)}))
+        else:
+            cls = type(node).__name__
+            snap = _try(lambda: ctrl.export_nodes_to_text([unreal.Name(node_name)], True)) or ""
+            new = None; kind = "unsupported"
+            with unreal.ScopedEditorTransaction("MCP promote_rig_vm_node"):
+                if "Collapse" in cls:
+                    new = _try(lambda: ctrl.promote_collapse_node_to_function_reference_node(unreal.Name(node_name), True, False))
+                    kind = "collapse->function_reference"
+                elif "FunctionReference" in cls:
+                    new = _try(lambda: ctrl.promote_function_reference_node_to_collapse_node(unreal.Name(node_name), True, False))
+                    kind = "function_reference->collapse"
+            if kind == "unsupported" or not new:
+                print("@@UMCP@@" + json.dumps({"status": "error", "message": "node %r is a %s -- promote needs a collapse or function-reference node" % (node_name, cls)}))
+            else:
+                nn = str(new)
+                _ledger().append({"op": "promote_rig_vm_node", "asset_path": path, "graph_name": gname,
+                                  "snapshot": snap, "new_node_name": nn})
+                _save_cr(path)
+                print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": bp.get_path_name(),
+                    "graph_name": gname, "promotion": kind, "from_node": node_name, "new_node_name": nn,
+                    "snapshot_chars": len(snap), "ledger_depth": len(_ledger())}))
+'''
+
+    @mcp.tool()
+    def promote_rig_vm_node(ctx, asset_path: str, node_name: str, graph_name: str = None) -> str:
+        """Promote a COLLAPSE node to a FUNCTION-REFERENCE node (reusable function), or vice-versa
+        (ledgered, FAITHFUL undo).
+
+        asset_path: ControlRigBlueprint path.
+        node_name:  a collapse node (-> promoted to a function reference) OR a function-reference node
+                    (-> demoted back to an inline collapse node). The node's class decides the direction.
+        graph_name: which graph the node lives on (default = the default model).
+
+        Snapshots the node (export_nodes_to_text incl. exterior links) BEFORE promoting. Ledgers op
+        'promote_rig_vm_node' {asset_path, graph_name, snapshot, new_node_name}; inverse = remove the
+        promoted node + import_nodes_from_text(snapshot)."""
+        params = {"asset_path": asset_path, "node_name": node_name, "graph_name": graph_name}
+        try:
+            return json.dumps(_exec(_PROMOTE_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. The op schemas
     # (add_rig_vm_node / set_rig_vm_pin_default / set_rig_vm_node_position / remove_rig_vm_node /
     # add_rig_vm_link / break_rig_vm_link) are reported to the coordinator to fold their inverses into
