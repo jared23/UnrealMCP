@@ -11,6 +11,10 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshSocket.h"
 
+// ---- C++ #52 includes (pose-render skin flush) ----
+#include "Components/SkinnedMeshComponent.h"  // USkinnedMeshComponent::RefreshBoneTransforms (public PURE_VIRTUAL)
+#include "RenderingThread.h"                   // FlushRenderingCommands (RenderCore, linked via Engine)
+
 // ---- STAGED C++ #3 includes (all Engine-module public headers) ----
 #include "Curves/CurveBase.h"
 #include "Curves/CurveFloat.h"
@@ -3935,4 +3939,25 @@ FString UMCPReflectionLibrary::SetEnvQueryNodeProperty(UEnvQuery* Query, const F
 #else
     return SerializeJson(ErrorObj(TEXT("editor-only")));
 #endif
+}
+
+// ==== C++ #52 (pose-render SKIN FLUSH — BUG_01) ====
+// A backgrounded, MCP-driven editor never ticks/redraws, so a PoseableMeshComponent baked via
+// set_bone_transform_by_name stores correct bone transforms but its GPU skin proxy stays at the
+// reference pose -> a SceneCapture renders the ref pose regardless of the requested frame. Force a
+// synchronous flush so the very next capture_scene() sees the authored pose.
+FString UMCPReflectionLibrary::ForceSkinFlush(USkinnedMeshComponent* Component)
+{
+    if (!Component)
+    {
+        return TEXT("{\"error\":\"null component\"}");
+    }
+    // 1) Recompute component-space transforms from the (Python-set) bone-space transforms. On a
+    //    UPoseableMeshComponent this runs FillComponentSpaceTransforms and marks the render data dirty.
+    Component->RefreshBoneTransforms(nullptr);
+    // 2) Rebuild the render proxy from the CURRENT pose (a backgrounded editor won't do this on its own).
+    Component->RecreateRenderState_Concurrent();
+    // 3) Block until the render thread has applied it, so the pose is on-GPU before the next capture.
+    FlushRenderingCommands();
+    return TEXT("{\"flushed\":true}");
 }

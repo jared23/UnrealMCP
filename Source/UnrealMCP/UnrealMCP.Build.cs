@@ -25,6 +25,8 @@ public class UnrealMCP : ModuleRules
 		PublicDependencyModuleNames.AddRange(
 			new string[] {
 				"Core", "CoreUObject", "Engine", "UnrealEd",
+				// C++ #52 (pose-render skin flush): FlushRenderingCommands() lives in RenderCore.
+				"RenderCore",
 				"Networking", "Sockets", "Slate", "SlateCore", "EditorStyle",
 				"DeveloperSettings", "Projects", "ToolMenus",
 				"BlueprintGraph", "GraphEditor", "KismetCompiler",

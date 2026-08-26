@@ -1262,4 +1262,16 @@ public:
     static FString InspectPCGNodeOutputJson(const FString& ActorPath, const FString& NodeName);
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString ClearPCGInspectionJson(const FString& ActorPath);
+
+    // ==== C++ #52 2026-08-25 (pose-render SKIN FLUSH — BUG_01): a backgrounded, MCP-driven editor never
+    // ticks/redraws, so a PoseableMeshComponent baked via set_bone_transform_by_name stores correct bones
+    // but its GPU skin proxy stays at the REFERENCE pose -> SceneCapture renders ref pose regardless of the
+    // requested frame. This forces a SYNCHRONOUS flush: RefreshBoneTransforms (recompute component-space from
+    // the set bones; public PURE_VIRTUAL on USkinnedMeshComponent, dispatches to UPoseableMeshComponent's
+    // override) -> RecreateRenderState_Concurrent (rebuild the render proxy from the CURRENT pose) ->
+    // FlushRenderingCommands (block until the render thread applies it, so the very next capture_scene sees
+    // the pose). Engine-module only (Engine links RenderCore for FlushRenderingCommands) -> NO Build.cs change.
+    // Wired into pose_render.py: called after baking each subject, before capture. NON-LEDGERED (transient). ====
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ForceSkinFlush(USkinnedMeshComponent* Component);
 };
