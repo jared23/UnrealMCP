@@ -12,8 +12,9 @@ public:
     UPROPERTY(config, EditAnywhere, Category = "MCP", meta = (ClampMin = "1024", ClampMax = "65535"))
     int32 Port = MCPConstants::DEFAULT_PORT;
 
-    /** Address the server binds to. Set to this machine's Tailscale IP to only accept
-     *  connections over Tailscale. Leave blank to listen on all interfaces (0.0.0.0). */
+    /** Address the server binds to. Defaults to 127.0.0.1 (localhost only) so the MCP server is
+     *  never exposed off this machine. Set to a Tailscale IP to accept connections over Tailscale,
+     *  or leave blank to listen on all interfaces (0.0.0.0 — not recommended). */
     UPROPERTY(config, EditAnywhere, Category = "MCP", meta = (DisplayName = "Bind Address (blank = all interfaces)"))
     FString BindAddress = TEXT("127.0.0.1");
 
