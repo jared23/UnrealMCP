@@ -1274,4 +1274,41 @@ public:
     // Wired into pose_render.py: called after baking each subject, before capture. NON-LEDGERED (transient). ====
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString ForceSkinFlush(USkinnedMeshComponent* Component);
+
+    // ==== C++ #53 2026-08-29 (MCP_TOOLING_GAPS batch 1 — game-dev gaps). MCPReflection_GameDevGaps.cpp.
+    // Self-contained, Engine/UnrealEd/CoreUObject only -> NO Build.cs change. See that .cpp for detail. ====
+
+    /** #7: set the current editor level's WorldSettings.DefaultGameMode override (TSubclassOf coercion the
+     *  generic write path lacked). Pass a native (/Script/Mod.GM) or BP (/Game/BP_GM.BP_GM_C) class path; empty
+     *  clears the override. Marks the level dirty (caller saves). Returns {new_game_mode, prior_game_mode}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetGameModeOverride(const FString& GameModeClassPath);
+
+    /** #2: mutate the in-memory ULevelEditorPlaySettings so the NEXT play_in_editor uses them with no editor
+     *  restart. num_clients (>0 to set), net_mode ('standalone'|'listen'|'client'), run_under_one_process,
+     *  use_splitscreen. Returns the applied values. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetPieSettings(int32 NumClients, const FString& NetMode, bool bRunUnderOneProcess, bool bUseSplitscreen);
+
+    /** #10: enumerate every GEngine world context (Editor/PIE/Game) — for multi-client PIE, lists the server +
+     *  each client world with {world, world_type, net_role, pie_instance, actor_count}. Read-only. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString ListPieWorldsJson();
+
+    /** #5: set a material's usage flags (bUsedWith*) and PERSIST via a C++ SavePackage (Python save_loaded_asset
+     *  returned a bare False). UsageFlagsCsv e.g. "skeletal_mesh,morph_targets". Returns applied flags + real
+     *  save result. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetMaterialUsage(UMaterialInterface* MaterialIface, const FString& UsageFlagsCsv, bool bSave);
+
+    /** #9: read ANY reflected UPROPERTY (including protected / non-Blueprint-visible) via raw FProperty —
+     *  bypasses the Python edit-property protection. Returns {cpp_type, value}. Truly-private C++ is out of scope. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Reflection")
+    static FString GetReflectedPropertyJson(UObject* Target, const FString& PropertyName);
+
+    /** #9: call a UFUNCTION by name on an object via ProcessEvent. ArgsJson is a {paramName: scalar} object
+     *  (bool/number/string, marshalled via ImportText). Returns {outputs:{return?, outParams...}}. Only reflected
+     *  UFUNCTIONs are callable. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CallFunctionJson(UObject* Target, const FString& FunctionName, const FString& ArgsJson);
 };

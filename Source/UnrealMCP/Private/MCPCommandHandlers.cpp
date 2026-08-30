@@ -8,6 +8,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/Guid.h"
+#include "Misc/Base64.h"          // MCP_TOOLING_GAPS #6: base64 the user code so backslashes can't wedge the wrapper
 #include "MCPConstants.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetSystemLibrary.h"
@@ -467,19 +468,48 @@ TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJson
             PlatformFile.CreateDirectory(*TempDir);
         }
 
-        // Create a unique filename for the temporary Python script
-        FString TempFilePath = TempDir / FString::Printf(TEXT("%s%s.py"), MCPConstants::PYTHON_TEMP_FILE_PREFIX, *FGuid::NewGuid().ToString());
+        // MCP_TOOLING_GAPS #6: per-call UNIQUE capture files. The old code reused fixed output.txt/error.txt/
+        // status.txt names, so a wrapper that failed to run (e.g. a user backslash path caused a SyntaxError in
+        // the wrapper itself) left the C++ side reading a stale/empty file -> every payload tool returned
+        // "no @@UMCP@@ payload" until an editor restart. Unique names per call make cross-call contamination
+        // impossible.
+        FString RunId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+        FString TempFilePath = TempDir / (FString(MCPConstants::PYTHON_TEMP_FILE_PREFIX) + RunId + TEXT(".py"));
+        FString OutPath = TempDir / (TEXT("mcp_out_") + RunId + TEXT(".txt"));
+        FString ErrPath = TempDir / (TEXT("mcp_err_") + RunId + TEXT(".txt"));
+        FString StatusPath = TempDir / (TEXT("mcp_status_") + RunId + TEXT(".txt"));
 
-        // Add error handling wrapper to the Python code
-        FString WrappedPythonCode = TEXT("import sys\n")
-                                        TEXT("import traceback\n")
-                                            TEXT("import unreal\n\n")
-                                                TEXT("# Create output capture file\n")
-                                                    TEXT("output_file = open('") +
-                                    TempDir + TEXT("/output.txt', 'w')\n") TEXT("error_file = open('") + TempDir + TEXT("/error.txt', 'w')\n\n") TEXT("# Store original stdout and stderr\n") TEXT("original_stdout = sys.stdout\n") TEXT("original_stderr = sys.stderr\n\n") TEXT("# Redirect stdout and stderr\n") TEXT("sys.stdout = output_file\n") TEXT("sys.stderr = error_file\n\n") TEXT("success = True\n") TEXT("try:\n")
-                                    // Instead of directly embedding the code, we'll compile it first to catch syntax errors
-                                    TEXT("    # Compile the code to catch syntax errors\n") TEXT("    user_code = '''") +
-                                    PythonCode + TEXT("'''\n") TEXT("    try:\n") TEXT("        code_obj = compile(user_code, '<string>', 'exec')\n") TEXT("        # Execute the compiled code\n") TEXT("        exec(code_obj)\n") TEXT("    except SyntaxError as e:\n") TEXT("        traceback.print_exc()\n") TEXT("        success = False\n") TEXT("    except Exception as e:\n") TEXT("        traceback.print_exc()\n") TEXT("        success = False\n") TEXT("except Exception as e:\n") TEXT("    traceback.print_exc()\n") TEXT("    success = False\n") TEXT("finally:\n") TEXT("    # Restore original stdout and stderr\n") TEXT("    sys.stdout = original_stdout\n") TEXT("    sys.stderr = original_stderr\n") TEXT("    output_file.close()\n") TEXT("    error_file.close()\n") TEXT("    # Write success status\n") TEXT("    with open('") + TempDir + TEXT("/status.txt', 'w') as f:\n") TEXT("        f.write('1' if success else '0')\n");
+        // MCP_TOOLING_GAPS #6: base64 the user code so backslashes / quotes / triple-quotes in it can NEVER break
+        // the wrapper's own parse. Previously the code was embedded as user_code = '''<code>''' — a Windows path
+        // literal like "C:\Users\..." made the wrapper raise SyntaxError: (unicode error) truncated \UXXXX escape,
+        // and nothing ran. Base64 sidesteps all escaping. (Callers should still prefer forward slashes in paths.)
+        FTCHARToUTF8 CodeUtf8(*PythonCode);
+        FString CodeB64 = FBase64::Encode(reinterpret_cast<const uint8*>(CodeUtf8.Get()), CodeUtf8.Length());
+
+        FString WrappedPythonCode =
+              FString(TEXT("import sys, traceback, base64\n"))
+            + TEXT("import unreal\n")
+            + TEXT("output_file = open('") + OutPath + TEXT("', 'w')\n")
+            + TEXT("error_file = open('") + ErrPath + TEXT("', 'w')\n")
+            + TEXT("original_stdout = sys.stdout\n")
+            + TEXT("original_stderr = sys.stderr\n")
+            + TEXT("sys.stdout = output_file\n")
+            + TEXT("sys.stderr = error_file\n")
+            + TEXT("success = True\n")
+            + TEXT("try:\n")
+            + TEXT("    user_code = base64.b64decode('") + CodeB64 + TEXT("').decode('utf-8')\n")
+            + TEXT("    exec(compile(user_code, '<mcp>', 'exec'))\n")
+            + TEXT("except Exception:\n")
+            + TEXT("    traceback.print_exc()\n")
+            + TEXT("    success = False\n")
+            + TEXT("finally:\n")
+            + TEXT("    sys.stdout = original_stdout\n")
+            + TEXT("    sys.stderr = original_stderr\n")
+            + TEXT("    output_file.close()\n")
+            + TEXT("    error_file.close()\n")
+            + TEXT("    _sf = open('") + StatusPath + TEXT("', 'w')\n")
+            + TEXT("    _sf.write('1' if success else '0')\n")
+            + TEXT("    _sf.close()\n");
 
         // Write the Python code to the temporary file
         if (FFileHelper::SaveStringToFile(WrappedPythonCode, *TempFilePath))
@@ -493,9 +523,9 @@ TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJson
             FString ErrorContent;
             FString StatusContent;
 
-            FFileHelper::LoadFileToString(OutputContent, *(TempDir / TEXT("output.txt")));
-            FFileHelper::LoadFileToString(ErrorContent, *(TempDir / TEXT("error.txt")));
-            FFileHelper::LoadFileToString(StatusContent, *(TempDir / TEXT("status.txt")));
+            FFileHelper::LoadFileToString(OutputContent, *OutPath);
+            FFileHelper::LoadFileToString(ErrorContent, *ErrPath);
+            FFileHelper::LoadFileToString(StatusContent, *StatusPath);
 
             bSuccess = StatusContent.TrimStartAndEnd().Equals(TEXT("1"));
 
@@ -505,9 +535,9 @@ TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJson
 
             // Clean up the temporary files
             PlatformFile.DeleteFile(*TempFilePath);
-            PlatformFile.DeleteFile(*(TempDir / TEXT("output.txt")));
-            PlatformFile.DeleteFile(*(TempDir / TEXT("error.txt")));
-            PlatformFile.DeleteFile(*(TempDir / TEXT("status.txt")));
+            PlatformFile.DeleteFile(*OutPath);
+            PlatformFile.DeleteFile(*ErrPath);
+            PlatformFile.DeleteFile(*StatusPath);
         }
         else
         {
@@ -530,15 +560,41 @@ TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJson
             PlatformFile.CreateDirectory(*TempDir);
         }
 
-        // Create a wrapper script that executes the file and captures output
-        FString WrapperFilePath = TempDir / FString::Printf(TEXT("%s_wrapper_%s.py"), MCPConstants::PYTHON_TEMP_FILE_PREFIX, *FGuid::NewGuid().ToString());
+        // Create a wrapper script that executes the file and captures output. MCP_TOOLING_GAPS #6: unique per-call
+        // capture files (base64 the FILE PATH so backslashes can't break the wrapper, same as the code path).
+        FString RunId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+        FString WrapperFilePath = TempDir / (FString(MCPConstants::PYTHON_TEMP_FILE_PREFIX) + TEXT("wrapper_") + RunId + TEXT(".py"));
+        FString OutPath = TempDir / (TEXT("mcp_out_") + RunId + TEXT(".txt"));
+        FString ErrPath = TempDir / (TEXT("mcp_err_") + RunId + TEXT(".txt"));
+        FString StatusPath = TempDir / (TEXT("mcp_status_") + RunId + TEXT(".txt"));
+        FTCHARToUTF8 PathUtf8(*PythonFile);
+        FString PathB64 = FBase64::Encode(reinterpret_cast<const uint8*>(PathUtf8.Get()), PathUtf8.Length());
 
-        FString WrapperCode = TEXT("import sys\n")
-                                  TEXT("import traceback\n")
-                                      TEXT("import unreal\n\n")
-                                          TEXT("# Create output capture file\n")
-                                              TEXT("output_file = open('") +
-                              TempDir + TEXT("/output.txt', 'w')\n") TEXT("error_file = open('") + TempDir + TEXT("/error.txt', 'w')\n\n") TEXT("# Store original stdout and stderr\n") TEXT("original_stdout = sys.stdout\n") TEXT("original_stderr = sys.stderr\n\n") TEXT("# Redirect stdout and stderr\n") TEXT("sys.stdout = output_file\n") TEXT("sys.stderr = error_file\n\n") TEXT("success = True\n") TEXT("try:\n") TEXT("    # Read the file content\n") TEXT("    with open('") + PythonFile.Replace(TEXT("\\"), TEXT("\\\\")) + TEXT("', 'r') as f:\n") TEXT("        file_content = f.read()\n") TEXT("    # Compile the code to catch syntax errors\n") TEXT("    try:\n") TEXT("        code_obj = compile(file_content, '") + PythonFile.Replace(TEXT("\\"), TEXT("\\\\")) + TEXT("', 'exec')\n") TEXT("        # Execute the compiled code\n") TEXT("        exec(code_obj)\n") TEXT("    except SyntaxError as e:\n") TEXT("        traceback.print_exc()\n") TEXT("        success = False\n") TEXT("    except Exception as e:\n") TEXT("        traceback.print_exc()\n") TEXT("        success = False\n") TEXT("except Exception as e:\n") TEXT("    traceback.print_exc()\n") TEXT("    success = False\n") TEXT("finally:\n") TEXT("    # Restore original stdout and stderr\n") TEXT("    sys.stdout = original_stdout\n") TEXT("    sys.stderr = original_stderr\n") TEXT("    output_file.close()\n") TEXT("    error_file.close()\n") TEXT("    # Write success status\n") TEXT("    with open('") + TempDir + TEXT("/status.txt', 'w') as f:\n") TEXT("        f.write('1' if success else '0')\n");
+        FString WrapperCode =
+              FString(TEXT("import sys, traceback, base64\n"))
+            + TEXT("import unreal\n")
+            + TEXT("output_file = open('") + OutPath + TEXT("', 'w')\n")
+            + TEXT("error_file = open('") + ErrPath + TEXT("', 'w')\n")
+            + TEXT("original_stdout = sys.stdout\n")
+            + TEXT("original_stderr = sys.stderr\n")
+            + TEXT("sys.stdout = output_file\n")
+            + TEXT("sys.stderr = error_file\n")
+            + TEXT("success = True\n")
+            + TEXT("try:\n")
+            + TEXT("    _p = base64.b64decode('") + PathB64 + TEXT("').decode('utf-8')\n")
+            + TEXT("    with open(_p, 'r') as _f: file_content = _f.read()\n")
+            + TEXT("    exec(compile(file_content, _p, 'exec'))\n")
+            + TEXT("except Exception:\n")
+            + TEXT("    traceback.print_exc()\n")
+            + TEXT("    success = False\n")
+            + TEXT("finally:\n")
+            + TEXT("    sys.stdout = original_stdout\n")
+            + TEXT("    sys.stderr = original_stderr\n")
+            + TEXT("    output_file.close()\n")
+            + TEXT("    error_file.close()\n")
+            + TEXT("    _sf = open('") + StatusPath + TEXT("', 'w')\n")
+            + TEXT("    _sf.write('1' if success else '0')\n")
+            + TEXT("    _sf.close()\n");
 
         if (FFileHelper::SaveStringToFile(WrapperCode, *WrapperFilePath))
         {
@@ -551,9 +607,9 @@ TSharedPtr<FJsonObject> FMCPExecutePythonHandler::Execute(const TSharedPtr<FJson
             FString ErrorContent;
             FString StatusContent;
 
-            FFileHelper::LoadFileToString(OutputContent, *(TempDir / TEXT("output.txt")));
-            FFileHelper::LoadFileToString(ErrorContent, *(TempDir / TEXT("error.txt")));
-            FFileHelper::LoadFileToString(StatusContent, *(TempDir / TEXT("status.txt")));
+            FFileHelper::LoadFileToString(OutputContent, *OutPath);
+            FFileHelper::LoadFileToString(ErrorContent, *ErrPath);
+            FFileHelper::LoadFileToString(StatusContent, *StatusPath);
 
             bSuccess = StatusContent.TrimStartAndEnd().Equals(TEXT("1"));
 
