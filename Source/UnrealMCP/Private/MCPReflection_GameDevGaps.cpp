@@ -36,6 +36,17 @@
 #include "Materials/MaterialInterface.h"
 #include "UObject/SavePackage.h"
 #include "Misc/PackageName.h"
+#include "GameFramework/PlayerController.h"   // #3 PIE input: APlayerController::InputKey
+#include "GameFramework/PlayerInput.h"        // #3 FInputKeyParams
+#include "Kismet/GameplayStatics.h"           // #3 GetPlayerController
+#include "InputCoreTypes.h"                   // #3 FKey / EKeys
+#include "Animation/AnimBlueprint.h"          // #1 UAnimBlueprint / FAnimParentNodeAssetOverride / ParentAssetOverrides
+#include "Animation/AnimBlueprintGeneratedClass.h"
+#include "Animation/AnimationAsset.h"
+#include "Kismet2/KismetEditorUtilities.h"    // #1 FKismetEditorUtilities::CreateBlueprint
+#include "EdGraph/EdGraph.h"                  // #1 walk parent anim-graph nodes
+#include "EdGraph/EdGraphNode.h"
+#include "UObject/Package.h"                  // #1 CreatePackage
 
 #if WITH_EDITOR
 #include "Settings/LevelEditorPlaySettings.h"   // ULevelEditorPlaySettings (UnrealEd)
@@ -445,4 +456,190 @@ FString UMCPReflectionLibrary::CallFunctionJson(UObject* Target, const FString& 
         O->SetArrayField(TEXT("unset_params_defaulted"), UnsetArr);
     }
     return GDG_Serialize(O);
+}
+
+namespace
+{
+    UWorld* GDG_PieWorld()
+    {
+        if (GEngine)
+        {
+            for (const FWorldContext& C : GEngine->GetWorldContexts())
+            {
+                if (C.WorldType == EWorldType::PIE && C.World())
+                {
+                    return C.World();
+                }
+            }
+        }
+        return nullptr;
+    }
+}
+
+// ---- #3  inject_pie_key (feed a key/axis event into a PIE player's input) --------
+FString UMCPReflectionLibrary::InjectPieKey(int32 PlayerIndex, const FString& KeyName, const FString& EventName,
+                                            float Delta, bool bIsGamepad)
+{
+#if WITH_EDITOR
+    UWorld* GameWorld = GDG_PieWorld();
+    if (!GameWorld) return GDG_Error(TEXT("no PIE world — start Play-In-Editor first"));
+    APlayerController* PC = UGameplayStatics::GetPlayerController(GameWorld, PlayerIndex);
+    if (!PC) return GDG_Error(FString::Printf(TEXT("no player controller at index %d"), PlayerIndex));
+
+    const FName KeyFName(*KeyName);
+    FKey Key(KeyFName);   // two statements: FKey Key(FName(*KeyName)) would be a most-vexing-parse fn decl
+    if (!Key.IsValid())
+    {
+        return GDG_Error(FString::Printf(TEXT("invalid key '%s' (use FKey names, e.g. W, SpaceBar, LeftMouseButton, Gamepad_FaceButton_Bottom)"), *KeyName));
+    }
+
+    EInputEvent Evt = IE_Pressed;
+    const FString E = EventName.ToLower();
+    if (E == TEXT("released"))          Evt = IE_Released;
+    else if (E == TEXT("repeat"))       Evt = IE_Repeat;
+    else if (E == TEXT("doubleclick"))  Evt = IE_DoubleClick;
+    // "pressed" (default) otherwise.
+
+    bool bHandled = false;
+    PRAGMA_DISABLE_DEPRECATION_WARNINGS
+    // FInputKeyParams is deprecated 5.6 (superseded by FInputKeyEventArgs) but present + functional in 5.8;
+    // guarded so the deprecation warning doesn't add noise. Feeds the player's UPlayerInput, which both the
+    // legacy input stack AND Enhanced Input read from — so this drives IA_* actions without needing the assets.
+    FInputKeyParams Params(Key, Evt, (double)Delta, bIsGamepad);
+    bHandled = PC->InputKey(Params);
+    PRAGMA_ENABLE_DEPRECATION_WARNINGS
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("status"), TEXT("ok"));
+    O->SetNumberField(TEXT("player_index"), PlayerIndex);
+    O->SetStringField(TEXT("key"), Key.ToString());
+    O->SetStringField(TEXT("event"), E.IsEmpty() ? TEXT("pressed") : E);
+    O->SetNumberField(TEXT("delta"), Delta);
+    O->SetBoolField(TEXT("handled"), bHandled);
+    return GDG_Serialize(O);
+#else
+    return GDG_Error(TEXT("editor-only"));
+#endif
+}
+
+// ---- #1  create_child_anim_blueprint_override -----------------------------------
+// Create a CHILD AnimBlueprint parented to Parent's generated class, remapping animation assets by adding
+// FAnimParentNodeAssetOverride entries (the standard "reuse ABP_Unarmed's graph with Rifle anims" flow).
+// The overrides are DATA-set + saved; they apply on COMPILE — we do NOT compile here (compiling AnimBPs
+// from the MCP is crash-prone), so the child compiles when opened/loaded in-editor.
+FString UMCPReflectionLibrary::CreateChildAnimBlueprintOverride(const FString& ParentAnimBpPath,
+    const FString& PackagePath, const FString& AssetName, const FString& OverridesJson)
+{
+#if WITH_EDITOR
+    UAnimBlueprint* Parent = LoadObject<UAnimBlueprint>(nullptr, *ParentAnimBpPath);
+    if (!Parent) return GDG_Error(FString::Printf(TEXT("could not load parent AnimBlueprint: %s"), *ParentAnimBpPath));
+    UClass* ParentClass = Parent->GeneratedClass;
+    if (!ParentClass) return GDG_Error(TEXT("parent AnimBlueprint has no GeneratedClass — open+compile it in-editor first"));
+
+    TSharedPtr<FJsonObject> Ov;
+    {
+        TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(OverridesJson);
+        FJsonSerializer::Deserialize(R, Ov);
+    }
+    if (!Ov.IsValid() || Ov->Values.Num() == 0)
+        return GDG_Error(TEXT("overrides must be a non-empty JSON object {oldAnimPathOrName: newAnimPath}"));
+
+    FString CleanPkg = PackagePath; CleanPkg.RemoveFromEnd(TEXT("/"));
+    const FString FullName = CleanPkg + TEXT("/") + AssetName;
+    UPackage* Pkg = CreatePackage(*FullName);
+    if (!Pkg) return GDG_Error(FString::Printf(TEXT("could not create package %s"), *FullName));
+
+    UBlueprint* NewBP = FKismetEditorUtilities::CreateBlueprint(ParentClass, Pkg, FName(*AssetName), BPTYPE_Normal,
+        UAnimBlueprint::StaticClass(), UAnimBlueprintGeneratedClass::StaticClass());
+    UAnimBlueprint* Child = Cast<UAnimBlueprint>(NewBP);
+    if (!Child) return GDG_Error(TEXT("CreateBlueprint did not return a UAnimBlueprint"));
+
+    // carry the parent's target skeleton (reflection avoids TargetSkeleton deprecation churn).
+    if (FObjectProperty* TS = FindFProperty<FObjectProperty>(UAnimBlueprint::StaticClass(), TEXT("TargetSkeleton")))
+    {
+        UObject* ParentSkel = TS->GetObjectPropertyValue_InContainer(Parent);
+        TS->SetObjectPropertyValue_InContainer(Child, ParentSkel);
+    }
+
+    // Walk parent anim-graph nodes; for any node whose reflected anim asset matches an override key, add an
+    // override remapping it to the new asset. Pure reflection -> no ANIMGRAPH_API symbol references.
+    int32 nAdded = 0;
+    TArray<TSharedPtr<FJsonValue>> Applied;
+    TArray<UEdGraph*> Graphs;
+    Parent->GetAllGraphs(Graphs);
+    for (UEdGraph* G : Graphs)
+    {
+        if (!G) continue;
+        for (UEdGraphNode* Node : G->Nodes)
+        {
+            if (!Node) continue;
+            UAnimationAsset* FoundAsset = nullptr;
+            for (TFieldIterator<FProperty> It(Node->GetClass()); It && !FoundAsset; ++It)
+            {
+                if (FObjectProperty* OP = CastField<FObjectProperty>(*It))
+                {
+                    if (UAnimationAsset* AA = Cast<UAnimationAsset>(OP->GetObjectPropertyValue_InContainer(Node)))
+                        FoundAsset = AA;
+                }
+                else if (FStructProperty* SP = CastField<FStructProperty>(*It))
+                {
+                    const void* StructPtr = SP->ContainerPtrToValuePtr<void>(Node);
+                    for (TFieldIterator<FProperty> SIt(SP->Struct); SIt && !FoundAsset; ++SIt)
+                    {
+                        if (FObjectProperty* SOP = CastField<FObjectProperty>(*SIt))
+                        {
+                            if (UAnimationAsset* AA = Cast<UAnimationAsset>(SOP->GetObjectPropertyValue_InContainer(StructPtr)))
+                                FoundAsset = AA;
+                        }
+                    }
+                }
+            }
+            if (!FoundAsset) continue;
+
+            const FString OldPath = FoundAsset->GetPathName();
+            const FString OldName = FoundAsset->GetName();
+            // Match this node's anim by full path OR asset name against the override keys (public API,
+            // sidesteps FJsonObject::Values being keyed on a template FStringType, not FString).
+            FString NewPath;
+            if (Ov->TryGetStringField(OldPath, NewPath) || Ov->TryGetStringField(OldName, NewPath))
+            {
+                UAnimationAsset* NewAsset = LoadObject<UAnimationAsset>(nullptr, *NewPath);
+                if (NewAsset)
+                {
+                    Child->ParentAssetOverrides.Add(FAnimParentNodeAssetOverride(Node->NodeGuid, NewAsset));
+                    TSharedRef<FJsonObject> A = MakeShared<FJsonObject>();
+                    A->SetStringField(TEXT("node"), Node->GetName());
+                    A->SetStringField(TEXT("old"), OldPath);
+                    A->SetStringField(TEXT("new"), NewAsset->GetPathName());
+                    Applied.Add(MakeShared<FJsonValueObject>(A));
+                    ++nAdded;
+                }
+            }
+        }
+    }
+
+    Child->MarkPackageDirty();
+    bool bSaved = false;
+    {
+        UPackage* CP = Child->GetPackage();
+        if (CP)
+        {
+            const FString FileName = FPackageName::LongPackageNameToFilename(CP->GetName(), FPackageName::GetAssetPackageExtension());
+            FSavePackageArgs Args; Args.TopLevelFlags = RF_Public | RF_Standalone; Args.SaveFlags = SAVE_NoError; Args.Error = GError;
+            bSaved = UPackage::Save(CP, Child, *FileName, Args).Result == ESavePackageResult::Success;
+        }
+    }
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("status"), TEXT("ok"));
+    O->SetStringField(TEXT("child"), Child->GetPathName());
+    O->SetStringField(TEXT("parent"), Parent->GetPathName());
+    O->SetNumberField(TEXT("overrides_added"), nAdded);
+    O->SetArrayField(TEXT("applied"), Applied);
+    O->SetBoolField(TEXT("saved"), bSaved);
+    O->SetStringField(TEXT("note"), TEXT("overrides are DATA-set; open + compile the child AnimBP in-editor to apply them (MCP does not compile AnimBPs)"));
+    return GDG_Serialize(O);
+#else
+    return GDG_Error(TEXT("editor-only"));
+#endif
 }

@@ -101,6 +101,7 @@ FILE_DOMAIN = {
     'UserTools/eqs.py': 'blueprint',
     'UserTools/eqs_write.py': 'blueprint',
     'UserTools/example_tool.py': 'misc',
+    'UserTools/build_control.py': 'core',
     'UserTools/foliage_write.py': 'vfx',
     'UserTools/game_dev_gaps.py': 'world',
     'UserTools/gameplay_tags_read.py': 'blueprint',

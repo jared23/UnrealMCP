@@ -1311,4 +1311,19 @@ public:
      *  UFUNCTIONs are callable. */
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString CallFunctionJson(UObject* Target, const FString& FunctionName, const FString& ArgsJson);
+
+    /** #3: inject a key/axis event into a PIE player's input (drives both legacy input and Enhanced Input
+     *  IA_* actions, no action assets needed). KeyName is an FKey name (W, SpaceBar, LeftMouseButton,
+     *  Gamepad_LeftX...); EventName = 'pressed'|'released'|'repeat'|'doubleclick'; Delta = 1.0 for a button
+     *  press / the axis value for an analog key. Hold = pressed, wait, released (see pie_input). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectPieKey(int32 PlayerIndex, const FString& KeyName, const FString& EventName, float Delta, bool bIsGamepad);
+
+    /** #1: create a CHILD AnimBlueprint of ParentAnimBpPath that remaps animation assets via
+     *  FAnimParentNodeAssetOverride (the "reuse a working locomotion graph with different anims" flow).
+     *  OverridesJson = {oldAnimPathOrName: newAnimPath}. Sets the override DATA + saves; the overrides apply
+     *  on COMPILE (open the child in-editor to compile — the MCP does not compile AnimBPs). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreateChildAnimBlueprintOverride(const FString& ParentAnimBpPath, const FString& PackagePath,
+                                                    const FString& AssetName, const FString& OverridesJson);
 };

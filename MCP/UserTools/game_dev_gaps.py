@@ -181,6 +181,80 @@ def register_tools(mcp, utils):
         except Exception as e:
             return f"Error: {e}"
 
+    # ---- #3 pie_input (inject input into the running PIE session) -----------------
+    _PIE_PRESS_BODY = (
+        "import unreal, json\n"
+        "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+        "if mrl is None or not hasattr(mrl, 'inject_pie_key'):\n"
+        "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #53 inject_pie_key unavailable — recompile the plugin'}))\n"
+        "else:\n"
+        "    r = []\n"
+        "    for k in (PARAMS.get('keys') or []):\n"
+        "        r.append(json.loads(mrl.inject_pie_key(int(PARAMS['pi']), k, 'pressed', 1.0, False)))\n"
+        "    for k, v in (PARAMS.get('axes') or {}).items():\n"
+        "        r.append(json.loads(mrl.inject_pie_key(int(PARAMS['pi']), k, 'pressed', float(v), False)))\n"
+        "    errs = [x for x in r if x.get('status') != 'ok']\n"
+        "    print('@@UMCP@@' + json.dumps({'status': 'error' if errs else 'ok', 'pressed': r}))\n"
+    )
+    _PIE_RELEASE_BODY = (
+        "import unreal, json\n"
+        "mrl = unreal.MCPReflectionLibrary\n"
+        "r = [json.loads(mrl.inject_pie_key(int(PARAMS['pi']), k, 'released', 0.0, False)) for k in (PARAMS.get('keys') or [])]\n"
+        "print('@@UMCP@@' + json.dumps({'status':'ok','released': r}))\n"
+    )
+
+    @mcp.tool()
+    def pie_input(ctx, keys: list = None, hold_seconds: float = 0.2, player_index: int = 0,
+                  release: bool = True, axes: dict = None) -> str:
+        """Inject keyboard/gamepad input into the RUNNING PIE session so input-driven features can be
+        self-tested (WASD move, jump, fire/ADS, sprint/crouch). keys: FKey names to press together, e.g.
+        ['W'], ['SpaceBar'], ['W','LeftShift'] (sprint). They are HELD for hold_seconds (press -> wait ->
+        release) so movement/holds register across game ticks, then released (release=False to keep them
+        down). player_index selects the PIE player (0 first; 1 the second client in multi-client PIE).
+        axes: {fkey: value} for analog, injected once (e.g. {'Gamepad_LeftX': 1.0}). Requires PIE running
+        (start play_in_editor first) + the C++ #53 handler. Verify effects with get_pie_status /
+        get_reflected_property on the pawn, or game_screenshot (keep the PIE window foreground)."""
+        keys = keys or []
+        try:
+            press = _exec(_PIE_PRESS_BODY, {"keys": keys, "axes": axes or {}, "pi": player_index})
+            if press.get("status") != "ok":
+                return json.dumps(press, indent=2)
+            if hold_seconds and hold_seconds > 0:
+                time.sleep(min(float(hold_seconds), 30.0))
+            released = None
+            if release and keys:
+                released = _exec(_PIE_RELEASE_BODY, {"keys": keys, "pi": player_index})
+            return json.dumps({"status": "ok", "held_seconds": hold_seconds,
+                               "pressed": press.get("pressed"), "released": released.get("released") if released else None}, indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ---- #1 create_child_anim_blueprint_override ---------------------------------
+    @mcp.tool()
+    def create_child_anim_blueprint_override(ctx, parent_path: str, package_path: str,
+                                             asset_name: str, overrides: dict) -> str:
+        """Create a CHILD AnimBlueprint of parent_path that REMAPS animations — the standard "reuse a
+        working locomotion/state-machine graph with a different anim set" flow (e.g. reuse ABP_Unarmed's
+        graph with Rifle anims). overrides = {oldAnimPathOrName: newAnimPath}, e.g.
+        {"MM_Unarmed_Idle": "/Game/Characters/.../MM_Rifle_Idle"}. It matches parent anim-graph nodes that
+        play each old anim (by full path, asset name, or path suffix) and adds a ParentAssetOverride to the
+        new asset. Sets the override DATA + saves the child; then OPEN + COMPILE the child AnimBP in-editor
+        to apply it (the MCP intentionally does not compile AnimBlueprints — that path is crash-prone).
+        Requires the C++ #53 handler."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "if mrl is None or not hasattr(mrl, 'create_child_anim_blueprint_override'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #53 create_child_anim_blueprint_override unavailable — recompile the plugin'}))\n"
+            "else:\n"
+            "    print('@@UMCP@@' + mrl.create_child_anim_blueprint_override(PARAMS['parent'], PARAMS['pkg'], PARAMS['name'], json.dumps(PARAMS.get('overrides') or {})))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"parent": parent_path, "pkg": package_path,
+                                           "name": asset_name, "overrides": overrides}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
     # ---- #4 game_screenshot (pure Python — captures the GAME viewport, works in PIE) ---
     @mcp.tool()
     def game_screenshot(ctx, width: int = 1920, height: int = 1080, wait_seconds: float = 8.0) -> str:
