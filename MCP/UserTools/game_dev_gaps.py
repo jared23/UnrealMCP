@@ -10,7 +10,17 @@ loads on an older plugin DLL. game_screenshot is pure Python (no rebuild needed)
   set_material_usage      (#5)  -> set bUsedWith* flags + persist via SavePackage (C++ #53)
   get_reflected_property  (#9)  -> read ANY reflected UPROPERTY incl. protected (C++ #53)
   call_function           (#9)  -> ProcessEvent a UFUNCTION by name (C++ #53)
+  pie_input               (#3)  -> inject GAMEPLAY input into PIE (PlayerController -> Enhanced Input) (C++ #53)
+  create_child_anim_blueprint_override (#1) -> child AnimBP that remaps anims (C++ #53)
   game_screenshot         (#4)  -> capture the GAME viewport during PIE (AutomationLibrary; pure Python)
+
+  # SLATE-LEVEL PIE input (C++ #54) — drives the UI/UMG layer (menus, hover, click, text, gamepad nav),
+  # which pie_input (gameplay-only) cannot reach:
+  pie_ui_key       -> keyboard nav into UMG (Enter/Escape/arrows/Tab) (C++ #54)
+  pie_ui_text      -> type into the focused editable text box (room codes) (C++ #54)
+  pie_ui_mouse_move-> hover hit-testing at a viewport point (C++ #54)
+  pie_ui_click     -> click UMG/HUD hitboxes at a viewport point (C++ #54)
+  pie_ui_gamepad   -> controller button/analog menu nav (C++ #54)
 """
 import json
 import base64
@@ -254,6 +264,123 @@ def register_tools(mcp, utils):
                                            "name": asset_name, "overrides": overrides}), indent=2)
         except Exception as e:
             return f"Error: {e}"
+
+    # ==== #3S SLATE-LEVEL PIE input (C++ #54) — drives the UI/UMG layer =====================
+    # Unlike pie_input (gameplay: PlayerController->Enhanced Input->pawn), these inject at the
+    # FSlateApplication layer so UMG menus, button hover/click hitboxes, editable-text (room codes),
+    # and gamepad menu nav actually respond. All require PIE running (start play_in_editor) + C++ #54.
+
+    def _slate_call(fn, call_expr, params):
+        return _exec(_cpp_delegate(fn, call_expr), params)
+
+    @mcp.tool()
+    def pie_ui_key(ctx, key: str, hold_seconds: float = 0.0, release: bool = True,
+                   shift: bool = False, ctrl: bool = False, alt: bool = False, cmd: bool = False,
+                   user_index: int = 0) -> str:
+        """Inject a KEYBOARD event into the MENU/UMG layer during PIE (main-menu nav, pause menu, list
+        selection) — the Slate path a real keypress takes, so UMG navigation actually moves. Unlike pie_input
+        (which drives the PAWN via Enhanced Input), this drives WIDGET focus/navigation: Enter=activate,
+        Escape=back, Up/Down/Left/Right/Tab=navigate, plus letter/number keys. By default it's a full tap
+        (key down then up); set release=False + hold_seconds>0 to hold. Modifier flags (shift/ctrl/alt/cmd)
+        apply to the event. key is an FKey name (Enter, Escape, Down, Up, Left, Right, Tab, A, One...).
+        Requires PIE running + the C++ #54 handler. Verify with a game_screenshot (keep the PIE window
+        foreground) or by reading the widget/HUD state."""
+        try:
+            down = _slate_call("inject_slate_key", "mrl.inject_slate_key(PARAMS['key'],'down',"
+                               "bool(PARAMS['shift']),bool(PARAMS['ctrl']),bool(PARAMS['alt']),bool(PARAMS['cmd']),int(PARAMS['ui']))",
+                               {"key": key, "shift": shift, "ctrl": ctrl, "alt": alt, "cmd": cmd, "ui": user_index})
+            if down.get("status") != "ok":
+                return json.dumps(down, indent=2)
+            if hold_seconds and hold_seconds > 0:
+                time.sleep(min(float(hold_seconds), 30.0))
+            up = None
+            if release:
+                up = _slate_call("inject_slate_key", "mrl.inject_slate_key(PARAMS['key'],'up',"
+                                 "bool(PARAMS['shift']),bool(PARAMS['ctrl']),bool(PARAMS['alt']),bool(PARAMS['cmd']),int(PARAMS['ui']))",
+                                 {"key": key, "shift": shift, "ctrl": ctrl, "alt": alt, "cmd": cmd, "ui": user_index})
+            return json.dumps({"status": "ok", "down": down, "up": up}, indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def pie_ui_text(ctx, text: str, user_index: int = 0) -> str:
+        """Type TEXT into the currently-FOCUSED editable text box during PIE (e.g. the room-code entry field) via
+        per-character Slate character events. Focus the text box FIRST with pie_ui_click on its location — a
+        character event only lands in whichever widget currently has keyboard focus. Returns {chars_sent}.
+        Requires PIE running + the C++ #54 handler."""
+        try:
+            return json.dumps(_slate_call("inject_slate_char", "mrl.inject_slate_char(PARAMS['text'], int(PARAMS['ui']))",
+                                          {"text": text, "ui": user_index}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def pie_ui_mouse_move(ctx, x: float, y: float, normalized: bool = True, user_index: int = 0) -> str:
+        """Move the mouse cursor to a viewport point during PIE and fire a Slate mouse-move so HUD/UMG HOVER
+        hit-testing runs (reveal hover states, tooltips, highlight the button under the cursor). normalized=True
+        => x,y in 0..1 across the viewport (0.5,0.5 = center; resolution-independent, best for HUD); False => raw
+        viewport-local pixels. Returns the absolute {screen_x, screen_y}. Requires PIE running + the C++ #54
+        handler. Pair with game_screenshot to see the hover state."""
+        try:
+            return json.dumps(_slate_call("inject_slate_mouse_move",
+                                          "mrl.inject_slate_mouse_move(float(PARAMS['x']), float(PARAMS['y']), bool(PARAMS['n']), int(PARAMS['ui']))",
+                                          {"x": x, "y": y, "n": normalized, "ui": user_index}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def pie_ui_click(ctx, x: float, y: float, button: str = "left", event: str = "click",
+                     normalized: bool = True) -> str:
+        """Click a UMG/HUD element at a viewport point during PIE — tests click HITBOXES (menu buttons, the
+        host-lobby Start gate, list rows). One call moves the cursor there, then presses+releases. button =
+        left|right|middle. event = 'click' (down+up, default) | 'down' | 'up' | 'doubleclick'. normalized=True
+        => x,y in 0..1 across the viewport (best for HUD); False => raw viewport pixels. To fill a text box:
+        pie_ui_click its location to focus it, then pie_ui_text. Returns {button, screen_x, screen_y,
+        down_handled, up_handled}. Requires PIE running + the C++ #54 handler."""
+        try:
+            return json.dumps(_slate_call("inject_slate_mouse_button",
+                                          "mrl.inject_slate_mouse_button(PARAMS['b'], PARAMS['e'], float(PARAMS['x']), float(PARAMS['y']), bool(PARAMS['n']))",
+                                          {"b": button, "e": event, "x": x, "y": y, "n": normalized}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def pie_ui_gamepad(ctx, key: str, event: str = "press", value: float = 1.0,
+                       hold_seconds: float = 0.0, release: bool = True, controller_id: int = 0) -> str:
+        """Inject a GAMEPAD button or analog axis into the MENU/UMG layer during PIE (controller menu nav +
+        analog-stick edge-detect) — routed to Slate's UI navigation (Accept/Back/Up/Down), so controller menu
+        support can actually be exercised. key is a gamepad FKey name: Gamepad_FaceButton_Bottom (A / Accept),
+        Gamepad_FaceButton_Right (B / Back), Gamepad_DPad_Up/Down/Left/Right, Gamepad_LeftX / Gamepad_LeftY
+        (analog). event = 'press' (pressed then released — a tap) | 'analog' (set the axis to `value`) | 'pressed'
+        | 'released'. For a held button use event='pressed', release=False. For analog menu edge-detect, send
+        event='analog' value=1.0 then value=0.0. Routes to the primary controller. Requires PIE running + the
+        C++ #54 handler."""
+        try:
+            e = (event or "press").lower()
+            if e == "analog":
+                return json.dumps(_slate_call("inject_slate_gamepad",
+                                              "mrl.inject_slate_gamepad(PARAMS['k'],'analog',float(PARAMS['v']),int(PARAMS['c']))",
+                                              {"k": key, "v": value, "c": controller_id}), indent=2)
+            if e in ("pressed", "released"):
+                return json.dumps(_slate_call("inject_slate_gamepad",
+                                              "mrl.inject_slate_gamepad(PARAMS['k'],PARAMS['e'],1.0,int(PARAMS['c']))",
+                                              {"k": key, "e": e, "c": controller_id}), indent=2)
+            # 'press' == a tap: pressed, optional hold, released.
+            down = _slate_call("inject_slate_gamepad",
+                               "mrl.inject_slate_gamepad(PARAMS['k'],'pressed',1.0,int(PARAMS['c']))",
+                               {"k": key, "c": controller_id})
+            if down.get("status") != "ok":
+                return json.dumps(down, indent=2)
+            if hold_seconds and hold_seconds > 0:
+                time.sleep(min(float(hold_seconds), 30.0))
+            up = None
+            if release:
+                up = _slate_call("inject_slate_gamepad",
+                                 "mrl.inject_slate_gamepad(PARAMS['k'],'released',0.0,int(PARAMS['c']))",
+                                 {"k": key, "c": controller_id})
+            return json.dumps({"status": "ok", "pressed": down, "released": up}, indent=2)
+        except Exception as e2:
+            return f"Error: {e2}"
 
     # ---- #4 game_screenshot (pure Python — captures the GAME viewport, works in PIE) ---
     @mcp.tool()

@@ -28,6 +28,10 @@ public class UnrealMCP : ModuleRules
 				// C++ #52 (pose-render skin flush): FlushRenderingCommands() lives in RenderCore.
 				"RenderCore",
 				"Networking", "Sockets", "Slate", "SlateCore", "EditorStyle",
+				// C++ #54 (Slate-level PIE input): IPlatformInputDeviceMapper::Get() (gamepad user/device) is
+				// APPLICATIONCORE_API — normally a transitive header-only dep of Slate, but the symbol must be
+				// linked explicitly. Fundamental runtime module (Slate depends on it) -> zero risk.
+				"ApplicationCore",
 				"DeveloperSettings", "Projects", "ToolMenus",
 				"BlueprintGraph", "GraphEditor", "KismetCompiler",
 				// C++ #5 (Niagara authoring): UNiagaraSystem/UNiagaraEmitter (Niagara runtime) +

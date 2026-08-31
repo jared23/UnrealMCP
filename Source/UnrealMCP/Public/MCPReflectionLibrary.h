@@ -1326,4 +1326,45 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString CreateChildAnimBlueprintOverride(const FString& ParentAnimBpPath, const FString& PackagePath,
                                                     const FString& AssetName, const FString& OverridesJson);
+
+    // ==== C++ #54 2026-08-30 (MCP_TOOLING_GAPS batch 3 — SLATE-LEVEL PIE input). MCPReflection_SlateInput.cpp.
+    // Self-contained, Slate/SlateCore/InputCore/ApplicationCore (all already linked) + Engine/UnrealEd ->
+    // NO Build.cs change. Unlike #53 InjectPieKey (which feeds APlayerController::InputKey -> GAMEPLAY input
+    // only), these inject at the FSlateApplication layer — the path real keyboard/mouse/gamepad input takes —
+    // so UMG MENUS, button hover/click hit-testing, editable-text entry (room codes), and gamepad menu nav
+    // actually respond. Editor-only (PIE testing). ====
+
+    /** #3S: inject a keyboard event at the Slate layer (drives UMG navigation Enter/arrows/Tab + accelerators).
+     *  KeyName is an FKey name (Enter, Escape, Down, Tab, A...); EventName = 'down'|'up'. Modifier flags set
+     *  shift/ctrl/alt/cmd. UserIndex is the Slate user (0). Returns {key, event, handled}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectSlateKey(const FString& KeyName, const FString& EventName,
+                                  bool bShift, bool bCtrl, bool bAlt, bool bCmd, int32 UserIndex);
+
+    /** #3S: type characters into the FOCUSED editable text widget via per-char ProcessKeyCharEvent (the room-code
+     *  box). Focus the box first (inject_slate_mouse_button). Returns {text, chars_sent}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectSlateChar(const FString& Text, int32 UserIndex);
+
+    /** #3S: move the cursor to a viewport point and fire a Slate mouse-move (hover hit-testing). bNormalized:
+     *  X,Y in 0..1 across the viewport (resolution-independent) vs raw viewport-local pixels. Returns
+     *  {screen_x, screen_y, handled}. Requires PIE running (maps against the game viewport widget geometry). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectSlateMouseMove(float X, float Y, bool bNormalized, int32 UserIndex);
+
+    /** #3S: press/release/click a mouse button at a viewport point (click hitboxes). ButtonName =
+     *  left|right|middle|thumb1|thumb2; EventName = 'down'|'up'|'click'(down+up, default)|'doubleclick'.
+     *  bNormalized as inject_slate_mouse_move. Returns {button, event, screen_x, screen_y, down_handled,
+     *  up_handled}. Requires PIE running. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectSlateMouseButton(const FString& ButtonName, const FString& EventName,
+                                          float X, float Y, bool bNormalized);
+
+    /** #3S: inject a gamepad button/analog at the Slate layer (controller menu nav — Accept/Back/Up/Down).
+     *  KeyName is a gamepad FKey name (Gamepad_FaceButton_Bottom, Gamepad_DPad_Up, Gamepad_LeftX...);
+     *  EventName = 'pressed'|'released'|'analog'. AnalogValue is the axis value for 'analog'. Routes to the
+     *  primary platform user/device. Returns {key, event, handled}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InjectSlateGamepad(const FString& KeyName, const FString& EventName,
+                                      float AnalogValue, int32 ControllerId);
 };
