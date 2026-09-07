@@ -1367,4 +1367,24 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString InjectSlateGamepad(const FString& KeyName, const FString& EventName,
                                       float AnalogValue, int32 ControllerId);
+
+    // ==== C++ #55 2026-09-06 (MCP_TOOLING_GAPS Project_Aimon G-01 — gameplay-tag property writer).
+    // MCPReflection_GameplayTagWrite.cpp. Self-contained; GameplayTags already a Build.cs dep -> NO Build.cs
+    // change. The 5.8 Python API can't build a REGISTERED FGameplayTag from a string and set_object_property
+    // nativizes a struct from a sequence (not ExportText), so tag/tag-container UPROPERTYs (species
+    // DefaultTypes, StatsComponent.Types, a move's MoveTag) can't be authored from Python. These build the
+    // tags in C++ (FGameplayTag::RequestGameplayTag) and assign by reflection. Generic (any UObject). ====
+
+    /** #55: set a single FGameplayTag UPROPERTY (by name, inherited ok) from a string tag name (empty clears).
+     *  The tag must already be registered. Marks the package dirty + PostEditChange. Returns {object, property,
+     *  tag} (or {error} incl. an unregistered-tag message). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetGameplayTagProperty(UObject* Target, const FString& PropertyName, const FString& TagName);
+
+    /** #55: set an FGameplayTagContainer UPROPERTY (full replace) from a JSON array of names (["Type.Fire",
+     *  "Type.Flying"]) or a CSV list; empty list clears it. Only REGISTERED tags are added; unregistered names
+     *  are reported in `missing`. Marks the package dirty + PostEditChange. Returns {object, property, applied[],
+     *  missing[], count} with status "ok" or "partial" (or {error}). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetGameplayTagContainerProperty(UObject* Target, const FString& PropertyName, const FString& TagsJson);
 };

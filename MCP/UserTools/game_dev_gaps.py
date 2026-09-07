@@ -21,6 +21,8 @@ loads on an older plugin DLL. game_screenshot is pure Python (no rebuild needed)
   pie_ui_mouse_move-> hover hit-testing at a viewport point (C++ #54)
   pie_ui_click     -> click UMG/HUD hitboxes at a viewport point (C++ #54)
   pie_ui_gamepad   -> controller button/analog menu nav (C++ #54)
+
+  set_gameplay_tags (G-01) -> set an FGameplayTag / FGameplayTagContainer property from string names (C++ #55)
 """
 import json
 import base64
@@ -381,6 +383,67 @@ def register_tools(mcp, utils):
             return json.dumps({"status": "ok", "pressed": down, "released": up}, indent=2)
         except Exception as e2:
             return f"Error: {e2}"
+
+    # ==== G-01 gameplay-tag property writer (C++ #55) ======================================
+    # The 5.8 Python API can't build a registered FGameplayTag from a string, and set_object_property
+    # nativizes structs from a sequence (not ExportText), so tag / tag-container UPROPERTYs can't be
+    # authored from Python. This sets them via C++ (FGameplayTag::RequestGameplayTag + reflection).
+
+    @mcp.tool()
+    def set_gameplay_tags(ctx, property_name: str, tags, object_path: str = "", actor_label: str = "",
+                          component_name: str = "", single: bool = False, save: bool = True) -> str:
+        """Set an FGameplayTag or FGameplayTagContainer UPROPERTY from string tag name(s) — the authoring path
+        the stock Python API lacks (no registered-tag construction; set_object_property can't nativize a tag
+        struct). Use for species DefaultTypes, a StatsComponent's Types, a move's MoveTag, etc.
+
+        Target ONE of: object_path (an asset/object, e.g. '/Game/.../DA_Species.DA_Species'); OR actor_label
+        (a level/PIE actor) optionally + component_name (set the property on that component instead of the actor).
+        property_name: the UPROPERTY (inherited ok). tags: a list of tag names (['Type.Fire','Type.Flying'])
+        for a container, or a single 'Type.Fire' string when single=True (empty string/list clears). Only
+        REGISTERED tags apply — unregistered names come back in `missing` (define them in the project first).
+        save: save the asset after (asset targets only). Requires the C++ #55 handler.
+
+        Returns the C++ result {applied[], missing[], count} (container) or {tag} (single)."""
+        norm_tags = tags if isinstance(tags, list) else [tags]
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "single = bool(PARAMS['single'])\n"
+            "fn = 'set_gameplay_tag_property' if single else 'set_gameplay_tag_container_property'\n"
+            "obj = None\n"
+            "if PARAMS.get('actor_label'):\n"
+            "    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)\n"
+            "    actors = eas.get_all_level_actors()\n"
+            "    obj = next((a for a in actors if a.get_actor_label()==PARAMS['actor_label'] or a.get_name()==PARAMS['actor_label']), None)\n"
+            "    if obj is not None and PARAMS.get('component_name'):\n"
+            "        comp = next((c for c in obj.get_components_by_class(unreal.ActorComponent) if c.get_name()==PARAMS['component_name'] or c.get_class().get_name()==PARAMS['component_name']), None)\n"
+            "        obj = comp\n"
+            "if obj is None and PARAMS.get('object_path'):\n"
+            "    obj = unreal.load_asset(PARAMS['object_path']) or unreal.load_object(None, PARAMS['object_path'])\n"
+            "if mrl is None or not hasattr(mrl, fn):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #55 gameplay-tag writer unavailable — recompile the plugin'}))\n"
+            "elif obj is None:\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'could not resolve target (object_path / actor_label[+component_name])'}))\n"
+            "else:\n"
+            "    if single:\n"
+            "        tag = PARAMS['tags'][0] if PARAMS['tags'] else ''\n"
+            "        r = json.loads(mrl.set_gameplay_tag_property(obj, PARAMS['property'], tag))\n"
+            "    else:\n"
+            "        r = json.loads(mrl.set_gameplay_tag_container_property(obj, PARAMS['property'], json.dumps(PARAMS['tags'])))\n"
+            "    if PARAMS.get('save') and r.get('status') in ('ok','partial'):\n"
+            "        try:\n"
+            "            if unreal.EditorAssetLibrary.does_asset_exist(obj.get_path_name().split('.')[0]):\n"
+            "                r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(obj))\n"
+            "        except Exception as _e:\n"
+            "            r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"property": property_name, "tags": norm_tags, "single": single,
+                                           "object_path": object_path, "actor_label": actor_label,
+                                           "component_name": component_name, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
 
     # ---- #4 game_screenshot (pure Python — captures the GAME viewport, works in PIE) ---
     @mcp.tool()
