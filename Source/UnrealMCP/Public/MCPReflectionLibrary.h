@@ -1405,4 +1405,16 @@ public:
      *  Marks dirty + HandleDataTableChanged. Returns {table, row, field, cpp_type, value} (or {error} on parse fail). */
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString SetDataTableRowFieldFromText(UDataTable* Table, const FString& RowName, const FString& FieldName, const FString& ValueText);
+
+    // ==== C++ #57 2026-09-07 (MCP_TOOLING_GAPS Project_Aimon — Blackboard enum-key UEnum binding).
+    // MCPReflection_BlackboardKeyEnum.cpp. Self-contained; AIModule already a Build.cs dep -> NO Build.cs
+    // change. UBlackboardKeyType_Enum::EnumType/EnumName aren't Python-reflected (the KeyType is an
+    // instanced sub-object), so an Enum key works functionally but shows raw bytes in the editor. ====
+
+    /** #57: bind an existing Enum-typed Blackboard key to a UEnum so the editor shows enum names. KeyName is
+     *  the entry name (this asset's own keys). EnumRef is a path (/Script/Module.EEnum native, or
+     *  /Game/.../MyEnum UserDefinedEnum) or a bare UENUM type name. Sets EnumType (disables the EnumName
+     *  override). Marks the asset dirty (caller saves). Returns {blackboard, key, enum, enum_entries}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetBlackboardKeyEnum(UBlackboardData* Blackboard, const FString& KeyName, const FString& EnumRef);
 };

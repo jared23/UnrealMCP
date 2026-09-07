@@ -24,6 +24,7 @@ loads on an older plugin DLL. game_screenshot is pure Python (no rebuild needed)
 
   set_gameplay_tags (G-01) -> set an FGameplayTag / FGameplayTagContainer property from string names (C++ #55)
   set_data_table_row_field (G-02) -> set one row field (FText backfill, or any type via ImportText) (C++ #56)
+  set_blackboard_key_enum       -> bind an Enum blackboard key to its UEnum (editor shows enum names) (C++ #57)
 """
 import json
 import base64
@@ -488,6 +489,40 @@ def register_tools(mcp, utils):
         try:
             return json.dumps(_exec(body, {"table": table_path, "row": row_name, "field": field_name,
                                            "value": value, "raw": raw, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ==== Blackboard enum-key UEnum binding (C++ #57) ======================================
+    # UBlackboardKeyType_Enum.EnumType/EnumName aren't Python-reflected (instanced sub-object), so an
+    # Enum key works but shows raw bytes in the editor. This binds the UEnum via C++.
+
+    @mcp.tool()
+    def set_blackboard_key_enum(ctx, blackboard_path: str, key_name: str, enum: str, save: bool = True) -> str:
+        """Bind an existing Enum-typed Blackboard key to its UEnum so the editor shows enum NAMES (not raw
+        bytes). The key must already exist and be Enum-typed (this only sets the display/enum binding).
+        blackboard_path: the UBlackboardData asset. key_name: the entry name (e.g. 'MainState'). enum: a path
+        — native UENUM '/Script/Project_Aimon.EMainMentalState' or a UserDefinedEnum '/Game/.../MyEnum.MyEnum'
+        — or a bare UENUM type name ('EMainMentalState'). save: save the asset after. Requires the C++ #57
+        handler. Returns {blackboard, key, enum, enum_entries}."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "bb = unreal.load_asset(PARAMS['bb'])\n"
+            "if mrl is None or not hasattr(mrl, 'set_blackboard_key_enum'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #57 set_blackboard_key_enum unavailable — recompile the plugin'}))\n"
+            "elif bb is None:\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'could not load BlackboardData: ' + str(PARAMS['bb'])}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.set_blackboard_key_enum(bb, PARAMS['key'], PARAMS['enum']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try:\n"
+            "            r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(bb))\n"
+            "        except Exception as _e:\n"
+            "            r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"bb": blackboard_path, "key": key_name, "enum": enum, "save": save}), indent=2)
         except Exception as e:
             return f"Error: {e}"
 
