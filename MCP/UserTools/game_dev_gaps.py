@@ -23,6 +23,7 @@ loads on an older plugin DLL. game_screenshot is pure Python (no rebuild needed)
   pie_ui_gamepad   -> controller button/analog menu nav (C++ #54)
 
   set_gameplay_tags (G-01) -> set an FGameplayTag / FGameplayTagContainer property from string names (C++ #55)
+  set_data_table_row_field (G-02) -> set one row field (FText backfill, or any type via ImportText) (C++ #56)
 """
 import json
 import base64
@@ -442,6 +443,51 @@ def register_tools(mcp, utils):
             return json.dumps(_exec(body, {"property": property_name, "tags": norm_tags, "single": single,
                                            "object_path": object_path, "actor_label": actor_label,
                                            "component_name": component_name, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ==== G-02 DataTable row FIELD writer (C++ #56) ========================================
+    # fill_data_table_from_json_string treats "Name" as the ROW-ID key, colliding with a row's own
+    # FText Name column (imports empty); FText also isn't settable from a plain string via the normal path.
+    # This sets a single field on a row directly (FText::FromString, or ImportText for any type).
+
+    @mcp.tool()
+    def set_data_table_row_field(ctx, table_path: str, row_name: str, field_name: str, value: str,
+                                 raw: bool = False, save: bool = True) -> str:
+        """Set ONE field on a DataTable row — mainly to backfill an FText column (e.g. a move row's display
+        `Name`) that fill_data_table_from_json_string leaves empty (it uses 'Name' as the row-id key, which
+        collides with the FText Name column). table_path: the DataTable asset. row_name: the row's id (its
+        RowName / MoveTag). field_name: the column (C++ or authored name). value: the string to set.
+
+        raw=False (default): treat `value` as plain display text -> FText::FromString (the FText backfill case).
+        raw=True: parse `value` with the engine's ImportText for ANY field type — float '5.0', struct
+        '(X=1,Y=2)', name 'Foo', etc. (use for non-FText fields the importer mangled). save: save the table
+        after. Requires the C++ #56 handler."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "raw = bool(PARAMS['raw'])\n"
+            "fn = 'set_data_table_row_field_from_text' if raw else 'set_data_table_row_text'\n"
+            "dt = unreal.load_asset(PARAMS['table'])\n"
+            "if mrl is None or not hasattr(mrl, fn):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #56 DataTable field writer unavailable — recompile the plugin'}))\n"
+            "elif dt is None:\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'could not load DataTable: ' + str(PARAMS['table'])}))\n"
+            "else:\n"
+            "    if raw:\n"
+            "        r = json.loads(mrl.set_data_table_row_field_from_text(dt, PARAMS['row'], PARAMS['field'], PARAMS['value']))\n"
+            "    else:\n"
+            "        r = json.loads(mrl.set_data_table_row_text(dt, PARAMS['row'], PARAMS['field'], PARAMS['value']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try:\n"
+            "            r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(dt))\n"
+            "        except Exception as _e:\n"
+            "            r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"table": table_path, "row": row_name, "field": field_name,
+                                           "value": value, "raw": raw, "save": save}), indent=2)
         except Exception as e:
             return f"Error: {e}"
 

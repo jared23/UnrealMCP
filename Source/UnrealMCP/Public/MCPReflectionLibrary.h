@@ -1387,4 +1387,22 @@ public:
      *  missing[], count} with status "ok" or "partial" (or {error}). */
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString SetGameplayTagContainerProperty(UObject* Target, const FString& PropertyName, const FString& TagsJson);
+
+    // ==== C++ #56 2026-09-07 (MCP_TOOLING_GAPS Project_Aimon G-02 — DataTable row FIELD writer).
+    // MCPReflection_DataTableFieldWrite.cpp. Self-contained; DataTable is Engine module (already a dep) -> NO
+    // Build.cs change. fill_data_table_from_json_string uses "Name" as the ROW-ID key, colliding with a row
+    // struct's own `FText Name` column (imports empty), and FText isn't settable from a plain string via the
+    // sequence-nativizing set_object_property path. These set a single row field directly by reflection. ====
+
+    /** #56: set an FText field on a DataTable row (by row name + field name, C++ or authored name) from a plain
+     *  string via FText::FromString — backfills display names the JSON importer left empty. Marks the package
+     *  dirty + HandleDataTableChanged. Returns {table, row, field, text} (or {error} incl. a not-an-FText hint). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetDataTableRowText(UDataTable* Table, const FString& RowName, const FString& FieldName, const FString& Text);
+
+    /** #56: set ANY single field on a DataTable row via FProperty::ImportText_Direct (float "5.0", struct
+     *  "(X=1,Y=2)", FText NSLOCTEXT(...), etc.) — the general escape hatch for a field the JSON importer mangles.
+     *  Marks dirty + HandleDataTableChanged. Returns {table, row, field, cpp_type, value} (or {error} on parse fail). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetDataTableRowFieldFromText(UDataTable* Table, const FString& RowName, const FString& FieldName, const FString& ValueText);
 };
