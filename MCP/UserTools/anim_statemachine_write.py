@@ -163,6 +163,11 @@ _fnmap = {
     "bind_node_function": "bind_anim_node_function",
     "add_layer": "add_anim_layer",
     "create_layer_interface": "create_anim_layer_interface",
+    # C++ #59 locomotion authoring
+    "set_state_anim": "set_state_anim",
+    "connect_sm_to_output": "connect_anim_state_machine_to_output",
+    "set_transition_rule": "set_anim_transition_rule",
+    "setup_speed_from_velocity": "setup_anim_speed_from_velocity",
 }
 _rl = getattr(unreal, "MCPReflectionLibrary", None)
 _fn = _fnmap.get(_action)
@@ -216,6 +221,14 @@ else:
                 _res = json.loads(_rl.bind_anim_node_function(_abp, PARAMS["node_guid"], PARAMS["slot"], PARAMS.get("function") or ""))
             elif _action == "add_layer":
                 _res = json.loads(_rl.add_anim_layer(_abp, PARAMS["layer"]))
+            elif _action == "set_state_anim":
+                _res = json.loads(_rl.set_state_anim(_abp, PARAMS["machine"], PARAMS["state"], PARAMS["anim"], bool(PARAMS["loop"]), float(PARAMS["play_rate"])))
+            elif _action == "connect_sm_to_output":
+                _res = json.loads(_rl.connect_anim_state_machine_to_output(_abp, PARAMS["machine"]))
+            elif _action == "set_transition_rule":
+                _res = json.loads(_rl.set_anim_transition_rule(_abp, PARAMS["machine"], PARAMS["from_state"], PARAMS["to_state"], PARAMS["variable"], PARAMS["op"], PARAMS["value"]))
+            elif _action == "setup_speed_from_velocity":
+                _res = json.loads(_rl.setup_anim_speed_from_velocity(_abp, PARAMS["variable"]))
             else:
                 _res = {"status": "error", "error": "unknown action: %s" % _action}
         if _is_err(_res):
@@ -544,6 +557,85 @@ else:
         editor_level.undo): WORLD-SAFE soft-delete = rename the asset to /Game/_MCP_Trash/<name> (never
         delete_asset -- avoids the delete->GC->python311.dll crash path)."""
         return _run("create_layer_interface", {"package_path": package_path, "asset_name": asset_name})
+
+    # ================================================================== #
+    # 14) set_state_anim  (C++ #59 locomotion)                            #
+    # ================================================================== #
+    @mcp.tool()
+    def set_state_anim(ctx, anim_blueprint_path: str, machine: str, state: str, anim_asset_path: str,
+                       loop: bool = True, play_rate: float = 1.0, save: bool = True) -> str:
+        """Fill a state with a looping Sequence Player wired to the state's Result pose — the piece the
+        structure tools omit (states are otherwise EMPTY and output no pose). Idempotent (reuses/retargets an
+        existing player in the state).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        machine/state:       existing state-machine + state names.
+        anim_asset_path:     the AnimSequence to play, e.g. '/Game/.../MM_Orcadet_Walking.MM_Orcadet_Walking'.
+        loop/play_rate:      Sequence Player settings.
+        save:                persist the AnimBP package (default True; NOT a compile).
+
+        Calls MCPReflectionLibrary.set_state_anim (C++ #59). Returns {sequence, sequence_player_guid,
+        connected_to_result}."""
+        return _run("set_state_anim", {"anim_blueprint_path": anim_blueprint_path, "machine": machine,
+                                       "state": state, "anim": anim_asset_path, "loop": loop,
+                                       "play_rate": play_rate, "save": save})
+
+    # ================================================================== #
+    # 15) connect_anim_state_machine_to_output  (C++ #59)                 #
+    # ================================================================== #
+    @mcp.tool()
+    def connect_anim_state_machine_to_output(ctx, anim_blueprint_path: str, machine: str, save: bool = True) -> str:
+        """Wire a state machine's pose output to the AnimGraph's Output Pose (root) so the machine actually
+        drives the final pose — the connection the structure tools leave undone (an unconnected machine
+        outputs a ref pose).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        machine:             the state-machine to connect.
+        save:                persist the AnimBP package (default True).
+
+        Calls MCPReflectionLibrary.connect_anim_state_machine_to_output (C++ #59). Returns
+        {connected_to_output}."""
+        return _run("connect_sm_to_output", {"anim_blueprint_path": anim_blueprint_path, "machine": machine, "save": save})
+
+    # ================================================================== #
+    # 16) set_anim_transition_rule  (C++ #59)                             #
+    # ================================================================== #
+    @mcp.tool()
+    def set_anim_transition_rule(ctx, anim_blueprint_path: str, machine: str, from_state: str, to_state: str,
+                                 variable: str, op: str, value: str, save: bool = True) -> str:
+        """Author a transition RULE '<variable> <op> <value>' (the condition that fires the transition) — the
+        structure tools create transitions with EMPTY rule graphs that never fire. Builds: variable getter ->
+        KismetMath double-compare -> bCanEnterTransition. Idempotent (rebuilds the rule on re-run).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        machine:             existing state-machine.
+        from_state/to_state: an existing transition's endpoints (add_anim_transition first).
+        variable:            an AnimBP member variable to test (add_blueprint_variable first, e.g. a float 'Speed').
+        op:                  one of > >= < <= == != .
+        value:               the constant to compare against, e.g. '10.0'.
+        save:                persist the AnimBP package (default True).
+
+        Calls MCPReflectionLibrary.set_anim_transition_rule (C++ #59). Returns {rule, compare_func, wired}."""
+        return _run("set_transition_rule", {"anim_blueprint_path": anim_blueprint_path, "machine": machine,
+                                            "from_state": from_state, "to_state": to_state, "variable": variable,
+                                            "op": op, "value": value, "save": save})
+
+    # ================================================================== #
+    # 17) setup_anim_speed_from_velocity  (C++ #59)                       #
+    # ================================================================== #
+    @mcp.tool()
+    def setup_anim_speed_from_velocity(ctx, anim_blueprint_path: str, variable: str = "Speed", save: bool = True) -> str:
+        """Author the standard Speed drive in the AnimBP's BlueprintUpdateAnimation event:
+        Set <variable> = VSize(GetOwningActor().GetVelocity()). Creates the update event if absent. This is
+        what feeds a movement-speed transition rule each frame. The float member variable must already exist
+        (add_blueprint_variable first).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        variable:            the float member variable to write each frame (default 'Speed').
+        save:                persist the AnimBP package (default True).
+
+        Calls MCPReflectionLibrary.setup_anim_speed_from_velocity (C++ #59). Returns {exec_wired, data_wired}."""
+        return _run("setup_speed_from_velocity", {"anim_blueprint_path": anim_blueprint_path, "variable": variable, "save": save})
 
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. The 13 op inverses
     # above are reported to the coordinator to fold into editor_level.undo (see module docstring / report).

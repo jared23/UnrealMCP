@@ -1052,6 +1052,36 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString CreateAnimLayerInterface(const FString& PackagePath, const FString& AssetName);
 
+    // ==== C++ #59 2026-09-13 (AnimGraph LOCOMOTION authoring — MCPReflection_AnimGraph.cpp). Fills the
+    // gap the structure-only anim tools left: put a player IN a state, wire the SM to Output Pose, author
+    // transition rules, and drive a Speed variable. AnimGraph + BlueprintGraph already deps -> NO Build.cs change. ====
+
+    /** #59: fill a state's bound graph with a looping Sequence Player (AnimAssetPath) wired to the state's
+     *  Result pose. Idempotent (reuses an existing player). Returns {state, sequence, sequence_player_guid,
+     *  loop, play_rate, connected_to_result}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateAnim(UAnimBlueprint* AnimBlueprint, const FString& MachineName, const FString& StateName,
+                                const FString& AnimAssetPath, bool bLoop, float PlayRate);
+
+    /** #59: connect a state machine's pose output to the AnimGraph's Output Pose (root) — the wiring the
+     *  structure tools omit, so the machine actually drives the final pose. Returns {connected_to_output}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ConnectAnimStateMachineToOutput(UAnimBlueprint* AnimBlueprint, const FString& MachineName);
+
+    /** #59: author a transition rule "<VariableName> <Op> <ValueStr>" (Op: > >= < <= == !=) into a transition's
+     *  rule graph — variable getter -> KismetMath double-compare -> bCanEnterTransition. The variable must exist
+     *  (add_blueprint_variable first). Idempotent (rebuilds the rule). Returns {rule, compare_func, wired}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetAnimTransitionRule(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                         const FString& FromState, const FString& ToState,
+                                         const FString& VariableName, const FString& Op, const FString& ValueStr);
+
+    /** #59: author the standard Speed drive in BlueprintUpdateAnimation: Set <VariableName> =
+     *  VSize(GetOwningActor().GetVelocity()). Creates the update event if absent. The float variable must exist.
+     *  Idempotent-ish (reuses the event). Returns {variable, exec_wired, data_wired}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetupAnimSpeedFromVelocity(UAnimBlueprint* AnimBlueprint, const FString& VariableName);
+
     // ==== C++ #19 2026-08-18 batch — Blueprint interfaces + var-flags (MCPReflection_BlueprintExt.cpp),
     //      AnimGraph removers (MCPReflection_AnimRemove.cpp), Niagara renderer/emitter (MCPReflection_NiagaraExt.cpp).
     //      NO Build.cs change (all modules already deps). EnsureStateTreeEditorData decl is up in the StateTree block. ====

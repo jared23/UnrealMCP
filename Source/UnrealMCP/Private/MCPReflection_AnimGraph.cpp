@@ -72,6 +72,21 @@
 #include "AnimStateTransitionNode.h"                 // UAnimStateTransitionNode (CreateConnections/GetPrevious/GetNextState)
 #include "AnimStateEntryNode.h"                      // UAnimStateEntryNode (GetOutputPin/GetOutputNode)
 
+// --- C++ #59 (locomotion authoring): node types + K2 nodes for state anim / rules / speed drive ---
+#include "AnimGraphNode_SequencePlayer.h"           // UAnimGraphNode_SequencePlayer (fill a state)
+#include "AnimGraphNode_StateResult.h"              // UAnimGraphNode_StateResult (state's output pose)
+#include "AnimGraphNode_Root.h"                     // UAnimGraphNode_Root (AnimGraph Output Pose)
+#include "AnimGraphNode_TransitionResult.h"         // UAnimGraphNode_TransitionResult (rule bCanEnterTransition)
+#include "Animation/AnimSequenceBase.h"             // UAnimSequenceBase
+#include "Animation/AnimInstance.h"                 // UAnimInstance (GetOwningActor / BlueprintUpdateAnimation)
+#include "GameFramework/Actor.h"                    // AActor::GetVelocity
+#include "Kismet/KismetMathLibrary.h"               // compare funcs + VSize
+#include "K2Node_VariableGet.h"                     // rule: variable getter
+#include "K2Node_VariableSet.h"                     // speed drive: variable setter
+#include "K2Node_CallFunction.h"                    // compare / GetOwningActor / GetVelocity / VSize
+#include "K2Node_Event.h"                           // BlueprintUpdateAnimation event
+#include "EdGraphSchema_K2.h"                        // PN_Self / PN_Then / PN_Execute (already via GN_AnimGraph use)
+
 namespace
 {
     // ---- JSON helpers ------------------------------------------------------
@@ -884,5 +899,321 @@ FString UMCPReflectionLibrary::CreateAnimLayerInterface(const FString& PackagePa
     Obj->SetStringField(TEXT("anim_layer_interface"), NewBP->GetName());
     Obj->SetStringField(TEXT("package"), FullPackageName);
     Obj->SetStringField(TEXT("path"), NewBP->GetPathName());
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// ===========================================================================
+//  C++ #59 — LOCOMOTION AUTHORING (fill states, wire poses, transition rules, speed drive)
+// ===========================================================================
+namespace
+{
+    // The single pose pin of a given direction on an AnimGraph node.
+    UEdGraphPin* MCPAnimGraph_FindPosePin(UEdGraphNode* Node, EEdGraphPinDirection Dir)
+    {
+        if (!Node) { return nullptr; }
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin && Pin->Direction == Dir && UAnimationGraphSchema::IsPosePin(Pin->PinType))
+            {
+                return Pin;
+            }
+        }
+        return nullptr;
+    }
+
+    // First node of type T in a graph.
+    template <typename T>
+    T* MCPAnimGraph_FirstNodeOfType(UEdGraph* Graph)
+    {
+        if (!Graph) { return nullptr; }
+        for (UEdGraphNode* N : Graph->Nodes)
+        {
+            if (T* Typed = Cast<T>(N)) { return Typed; }
+        }
+        return nullptr;
+    }
+
+    // Connect two pins via the graph schema, falling back to a direct link.
+    bool MCPAnimGraph_Connect(UEdGraph* Graph, UEdGraphPin* From, UEdGraphPin* To)
+    {
+        if (!From || !To) { return false; }
+        const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
+        if (Schema && Schema->TryCreateConnection(From, To)) { return true; }
+        From->MakeLinkTo(To);
+        return From->LinkedTo.Contains(To);
+    }
+
+    // Map a comparison operator to a KismetMathLibrary double-compare function name.
+    FName MCPAnimGraph_CompareFunc(const FString& Op)
+    {
+        const FString O = Op.TrimStartAndEnd();
+        if (O == TEXT(">"))  { return FName(TEXT("Greater_DoubleDouble")); }
+        if (O == TEXT(">=")) { return FName(TEXT("GreaterEqual_DoubleDouble")); }
+        if (O == TEXT("<"))  { return FName(TEXT("Less_DoubleDouble")); }
+        if (O == TEXT("<=")) { return FName(TEXT("LessEqual_DoubleDouble")); }
+        if (O == TEXT("==")) { return FName(TEXT("EqualEqual_DoubleDouble")); }
+        if (O == TEXT("!=")) { return FName(TEXT("NotEqual_DoubleDouble")); }
+        return NAME_None;
+    }
+}
+
+// 14) SetStateAnim — fill a state's bound graph with a looping Sequence Player wired to the state Result.
+FString UMCPReflectionLibrary::SetStateAnim(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                            const FString& StateName, const FString& AnimAssetPath,
+                                            bool bLoop, float PlayRate)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UAnimGraphNode_StateMachineBase* SM = MCPAnimGraph_FindStateMachine(AnimBlueprint, MachineName);
+    if (!SM || !SM->EditorStateMachineGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State machine '%s' not found"), *MachineName)); }
+    UAnimStateNode* State = MCPAnimGraph_FindState(SM->EditorStateMachineGraph, StateName);
+    if (!State || !State->BoundGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State '%s' not found"), *StateName)); }
+    UEdGraph* BoundGraph = State->BoundGraph;
+
+    UAnimSequenceBase* Seq = LoadObject<UAnimSequenceBase>(nullptr, *AnimAssetPath);
+    if (!Seq) { return MCPAnimGraph_Error(FString::Printf(TEXT("Could not load anim sequence '%s'"), *AnimAssetPath)); }
+
+    UAnimGraphNode_StateResult* ResultNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_StateResult>(BoundGraph);
+    if (!ResultNode) { return MCPAnimGraph_Error(TEXT("State bound graph has no result node")); }
+    UEdGraphPin* ResultIn = MCPAnimGraph_FindPosePin(ResultNode, EGPD_Input);
+    if (!ResultIn) { return MCPAnimGraph_Error(TEXT("State result node has no input pose pin")); }
+
+    BoundGraph->Modify();
+
+    // Reuse an existing sequence player if one is already in this state (idempotent re-run).
+    UAnimGraphNode_SequencePlayer* SeqNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_SequencePlayer>(BoundGraph);
+    if (SeqNode)
+    {
+        SeqNode->Modify();
+        SeqNode->Node.SetSequence(Seq);            // Sequence/bLoopAnimation/PlayRate are protected — use setters
+        SeqNode->Node.SetLoopAnimation(bLoop);
+        SeqNode->Node.SetPlayRate(PlayRate);
+        SeqNode->ReconstructNode();
+    }
+    else
+    {
+        FGraphNodeCreator<UAnimGraphNode_SequencePlayer> Creator(*BoundGraph);
+        SeqNode = Creator.CreateNode(false);
+        SeqNode->Node.SetSequence(Seq);
+        SeqNode->Node.SetLoopAnimation(bLoop);
+        SeqNode->Node.SetPlayRate(PlayRate);
+        Creator.Finalize();
+        SeqNode->NodePosX = ResultNode->NodePosX - 320;
+        SeqNode->NodePosY = ResultNode->NodePosY;
+    }
+
+    UEdGraphPin* SeqOut = MCPAnimGraph_FindPosePin(SeqNode, EGPD_Output);
+    if (!SeqOut) { return MCPAnimGraph_Error(TEXT("Sequence player has no output pose pin")); }
+
+    ResultIn->BreakAllPinLinks();
+    const bool bConnected = MCPAnimGraph_Connect(BoundGraph, SeqOut, ResultIn);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("state"), StateName);
+    Obj->SetStringField(TEXT("sequence"), Seq->GetPathName());
+    Obj->SetStringField(TEXT("sequence_player_guid"), SeqNode->NodeGuid.ToString());
+    Obj->SetBoolField(TEXT("loop"), bLoop);
+    Obj->SetNumberField(TEXT("play_rate"), PlayRate);
+    Obj->SetBoolField(TEXT("connected_to_result"), bConnected);
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// 15) ConnectAnimStateMachineToOutput — wire the state machine's pose output to the AnimGraph Output Pose.
+FString UMCPReflectionLibrary::ConnectAnimStateMachineToOutput(UAnimBlueprint* AnimBlueprint, const FString& MachineName)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UAnimGraphNode_StateMachineBase* SM = MCPAnimGraph_FindStateMachine(AnimBlueprint, MachineName);
+    if (!SM) { return MCPAnimGraph_Error(FString::Printf(TEXT("State machine '%s' not found"), *MachineName)); }
+    UEdGraph* HostGraph = SM->GetGraph();
+    if (!HostGraph) { return MCPAnimGraph_Error(TEXT("State machine node has no host graph")); }
+    UAnimGraphNode_Root* Root = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_Root>(HostGraph);
+    if (!Root) { return MCPAnimGraph_Error(TEXT("AnimGraph has no Output Pose (root) node")); }
+
+    UEdGraphPin* SMOut = MCPAnimGraph_FindPosePin(SM, EGPD_Output);
+    UEdGraphPin* RootIn = MCPAnimGraph_FindPosePin(Root, EGPD_Input);
+    if (!SMOut)  { return MCPAnimGraph_Error(TEXT("State machine node has no output pose pin")); }
+    if (!RootIn) { return MCPAnimGraph_Error(TEXT("Output Pose node has no input pose pin")); }
+
+    HostGraph->Modify();
+    RootIn->BreakAllPinLinks();
+    const bool bConnected = MCPAnimGraph_Connect(HostGraph, SMOut, RootIn);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("state_machine_name"), MachineName);
+    Obj->SetBoolField(TEXT("connected_to_output"), bConnected);
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// 16) SetAnimTransitionRule — author a "<variable> <op> <value>" bool rule on a transition.
+FString UMCPReflectionLibrary::SetAnimTransitionRule(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                                     const FString& FromState, const FString& ToState,
+                                                     const FString& VariableName, const FString& Op, const FString& ValueStr)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UAnimGraphNode_StateMachineBase* SM = MCPAnimGraph_FindStateMachine(AnimBlueprint, MachineName);
+    if (!SM || !SM->EditorStateMachineGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State machine '%s' not found"), *MachineName)); }
+    UAnimStateTransitionNode* Trans = MCPAnimGraph_FindTransition(SM->EditorStateMachineGraph, FromState, ToState);
+    if (!Trans || !Trans->BoundGraph) { return MCPAnimGraph_Error(TEXT("Transition (or its rule graph) not found")); }
+    UEdGraph* RuleGraph = Trans->BoundGraph;
+
+    const FName FuncName = MCPAnimGraph_CompareFunc(Op);
+    if (FuncName == NAME_None) { return MCPAnimGraph_Error(FString::Printf(TEXT("Unsupported op '%s' (use > >= < <= == !=)"), *Op)); }
+
+    UAnimGraphNode_TransitionResult* ResultNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_TransitionResult>(RuleGraph);
+    if (!ResultNode) { return MCPAnimGraph_Error(TEXT("Transition rule graph has no result node")); }
+    UEdGraphPin* CanEnter = ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input);
+    if (!CanEnter) { return MCPAnimGraph_Error(TEXT("Result node has no bCanEnterTransition pin")); }
+
+    RuleGraph->Modify();
+    // Clean slate: remove every node except the result node so a re-run replaces the rule.
+    TArray<UEdGraphNode*> ToRemove;
+    for (UEdGraphNode* N : RuleGraph->Nodes) { if (N != ResultNode) { ToRemove.Add(N); } }
+    for (UEdGraphNode* N : ToRemove) { FBlueprintEditorUtils::RemoveNode(AnimBlueprint, N, /*bDontRecompile*/true); }
+
+    // Variable getter.
+    UK2Node_VariableGet* VarGet = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_VariableGet> C(*RuleGraph);
+        VarGet = C.CreateNode(false);
+        VarGet->VariableReference.SetSelfMember(FName(*VariableName));
+        C.Finalize();
+    }
+    UEdGraphPin* VarOut = VarGet->GetValuePin();
+    if (!VarOut) { return MCPAnimGraph_Error(FString::Printf(TEXT("Variable '%s' getter has no value pin (does the variable exist?)"), *VariableName)); }
+
+    // Comparison call (KismetMathLibrary double compare).
+    UK2Node_CallFunction* Cmp = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_CallFunction> C(*RuleGraph);
+        Cmp = C.CreateNode(false);
+        Cmp->FunctionReference.SetExternalMember(FuncName, UKismetMathLibrary::StaticClass());
+        C.Finalize();
+    }
+    UEdGraphPin* PinA = Cmp->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* PinB = Cmp->FindPin(TEXT("B"), EGPD_Input);
+    UEdGraphPin* PinRet = Cmp->GetReturnValuePin();
+    if (!PinA || !PinB || !PinRet) { return MCPAnimGraph_Error(TEXT("Compare node pins not found")); }
+    PinB->DefaultValue = ValueStr;
+
+    VarGet->NodePosX = ResultNode->NodePosX - 640; VarGet->NodePosY = ResultNode->NodePosY;
+    Cmp->NodePosX = ResultNode->NodePosX - 320;    Cmp->NodePosY = ResultNode->NodePosY;
+
+    const bool bC1 = MCPAnimGraph_Connect(RuleGraph, VarOut, PinA);
+    const bool bC2 = MCPAnimGraph_Connect(RuleGraph, PinRet, CanEnter);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("from_state"), FromState);
+    Obj->SetStringField(TEXT("to_state"), ToState);
+    Obj->SetStringField(TEXT("rule"), FString::Printf(TEXT("%s %s %s"), *VariableName, *Op, *ValueStr));
+    Obj->SetStringField(TEXT("compare_func"), FuncName.ToString());
+    Obj->SetBoolField(TEXT("wired"), bC1 && bC2);
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// 17) SetupAnimSpeedFromVelocity — author BlueprintUpdateAnimation: Set <var> = VSize(GetOwningActor.GetVelocity()).
+FString UMCPReflectionLibrary::SetupAnimSpeedFromVelocity(UAnimBlueprint* AnimBlueprint, const FString& VariableName)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    if (AnimBlueprint->UbergraphPages.Num() == 0 || !AnimBlueprint->UbergraphPages[0])
+    {
+        return MCPAnimGraph_Error(TEXT("AnimBlueprint has no event graph (ubergraph)"));
+    }
+    UEdGraph* Uber = AnimBlueprint->UbergraphPages[0];
+    Uber->Modify();
+
+    // Find or create the BlueprintUpdateAnimation event.
+    UK2Node_Event* Evt = nullptr;
+    for (UEdGraphNode* N : Uber->Nodes)
+    {
+        if (UK2Node_Event* E = Cast<UK2Node_Event>(N))
+        {
+            if (E->EventReference.GetMemberName() == FName(TEXT("BlueprintUpdateAnimation"))) { Evt = E; break; }
+        }
+    }
+    if (!Evt)
+    {
+        FGraphNodeCreator<UK2Node_Event> C(*Uber);
+        Evt = C.CreateNode(false);
+        Evt->EventReference.SetExternalMember(FName(TEXT("BlueprintUpdateAnimation")), UAnimInstance::StaticClass());
+        Evt->bOverrideFunction = true;
+        C.Finalize();
+        Evt->NodePosX = 0; Evt->NodePosY = 0;
+    }
+    UEdGraphPin* EvtThen = Evt->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output);
+    if (!EvtThen) { return MCPAnimGraph_Error(TEXT("Update event has no exec (then) pin")); }
+
+    // GetOwningActor (self-context, pure).
+    UK2Node_CallFunction* GetActor = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_CallFunction> C(*Uber);
+        GetActor = C.CreateNode(false);
+        GetActor->FunctionReference.SetSelfMember(FName(TEXT("GetOwningActor")));
+        C.Finalize();
+        GetActor->NodePosX = 300; GetActor->NodePosY = 200;
+    }
+    UEdGraphPin* ActorRet = GetActor->GetReturnValuePin();
+
+    // GetVelocity on the actor (member call, pure) — target via the 'self' pin.
+    UK2Node_CallFunction* GetVel = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_CallFunction> C(*Uber);
+        GetVel = C.CreateNode(false);
+        GetVel->FunctionReference.SetExternalMember(FName(TEXT("GetVelocity")), AActor::StaticClass());
+        C.Finalize();
+        GetVel->NodePosX = 560; GetVel->NodePosY = 200;
+    }
+    UEdGraphPin* VelSelf = GetVel->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+    UEdGraphPin* VelRet = GetVel->GetReturnValuePin();
+
+    // VSize (static, pure).
+    UK2Node_CallFunction* VSizeNode = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_CallFunction> C(*Uber);
+        VSizeNode = C.CreateNode(false);
+        VSizeNode->FunctionReference.SetExternalMember(FName(TEXT("VSize")), UKismetMathLibrary::StaticClass());
+        C.Finalize();
+        VSizeNode->NodePosX = 820; VSizeNode->NodePosY = 200;
+    }
+    UEdGraphPin* VSizeA = VSizeNode->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* VSizeRet = VSizeNode->GetReturnValuePin();
+
+    // Set <VariableName>.
+    UK2Node_VariableSet* SetVar = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_VariableSet> C(*Uber);
+        SetVar = C.CreateNode(false);
+        SetVar->VariableReference.SetSelfMember(FName(*VariableName));
+        C.Finalize();
+        SetVar->NodePosX = 1080; SetVar->NodePosY = 0;
+    }
+    UEdGraphPin* SetExecIn = SetVar->FindPin(UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+    UEdGraphPin* SetValIn = SetVar->FindPin(FName(*VariableName), EGPD_Input);
+
+    if (!ActorRet || !VelSelf || !VelRet || !VSizeA || !VSizeRet || !SetExecIn || !SetValIn)
+    {
+        return MCPAnimGraph_Error(TEXT("Could not resolve one or more pins for the speed-update graph (variable may not exist yet)"));
+    }
+
+    // Wire: exec Event.then -> Set.exec ; data GetActor -> GetVelocity.self -> VSize.A -> Set.<var>.
+    const bool bE = MCPAnimGraph_Connect(Uber, EvtThen, SetExecIn);
+    const bool bD1 = MCPAnimGraph_Connect(Uber, ActorRet, VelSelf);
+    const bool bD2 = MCPAnimGraph_Connect(Uber, VelRet, VSizeA);
+    const bool bD3 = MCPAnimGraph_Connect(Uber, VSizeRet, SetValIn);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("variable"), VariableName);
+    Obj->SetBoolField(TEXT("exec_wired"), bE);
+    Obj->SetBoolField(TEXT("data_wired"), bD1 && bD2 && bD3);
     return MCPAnimGraph_SerializeObject(Obj);
 }
