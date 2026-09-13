@@ -56,8 +56,12 @@ namespace
 {
     FString GDG_Serialize(const TSharedRef<FJsonObject>& Obj)
     {
+        // Condensed (single-line): _cpp_delegate tools (set_game_mode_override, set_pie_settings,
+        // list_pie_worlds) print this raw, and the bridge extracts JSON from ONE line after the marker —
+        // pretty/multi-line output would be truncated to just "{" (the malformed-JSON gap).
         FString Out;
-        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
         FJsonSerializer::Serialize(Obj, Writer);
         return Out;
     }

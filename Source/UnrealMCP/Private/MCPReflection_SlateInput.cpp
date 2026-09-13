@@ -51,8 +51,11 @@ namespace
 {
     FString SI_Serialize(const TSharedRef<FJsonObject>& Obj)
     {
+        // Condensed (single-line): the pie_ui_* tools print this raw via _cpp_delegate, and the bridge reads
+        // JSON from ONE line after the marker — pretty/multi-line would be truncated to "{".
         FString Out;
-        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
         FJsonSerializer::Serialize(Obj, Writer);
         return Out;
     }

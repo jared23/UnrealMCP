@@ -1417,4 +1417,30 @@ public:
      *  override). Marks the asset dirty (caller saves). Returns {blackboard, key, enum, enum_entries}. */
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString SetBlackboardKeyEnum(UBlackboardData* Blackboard, const FString& KeyName, const FString& EnumRef);
+
+    // ==== C++ #58 2026-09-13 (MCP_TOOLING_GAPS Project_Aimon batch 2). MCPReflection_ProjectAimonGaps2.cpp.
+    // Build.cs += "AssetTools","AssetRegistry" (FixupReferencers + redirector scan); rest already linked. ====
+
+    /** #58: spawn an actor into the RUNNING PIE world (editor spawn tools target the editor world, which is
+     *  detached during PIE). ClassPath native (/Script/Mod.AActorSub) or BP (/Game/BP.BP_C); location xyz +
+     *  rotation pitch/yaw/roll; optional Label. Requires PIE running. Returns {actor, class, world, x,y,z}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SpawnActorInPie(const FString& ClassPath, float X, float Y, float Z,
+                                   float Pitch, float Yaw, float Roll, const FString& Label);
+
+    /** #58: "Fix Up Redirectors" — resave every referencer to point at each redirector's target, then delete
+     *  the fixed-up redirectors (IAssetTools::FixupReferencers, which stock Python can't reach). TargetPath is
+     *  a specific redirector object path OR a /Game directory to scan recursively. Returns {fixed_count,
+     *  redirectors[]}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString FixupRedirectorReferencers(const FString& TargetPath);
+
+    /** #58: set a default property on an INHERITED native component of a Blueprint (Mesh / CapsuleComponent /
+     *  CharacterMovement …) — set_blueprint_component_property only resolves SCS (BP-added) nodes. Writes the
+     *  generated-class CDO subobject (survives recompile). ValueText is parsed by ImportText (float, vector
+     *  "(X=..,Y=..,Z=..)", enum name, object path, struct literal). Returns {blueprint, component, property,
+     *  cpp_type, value}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetInheritedComponentProperty(UBlueprint* Blueprint, const FString& ComponentName,
+                                                 const FString& PropertyName, const FString& ValueText);
 };

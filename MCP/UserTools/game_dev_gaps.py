@@ -25,6 +25,9 @@ loads on an older plugin DLL. game_screenshot is pure Python (no rebuild needed)
   set_gameplay_tags (G-01) -> set an FGameplayTag / FGameplayTagContainer property from string names (C++ #55)
   set_data_table_row_field (G-02) -> set one row field (FText backfill, or any type via ImportText) (C++ #56)
   set_blackboard_key_enum       -> bind an Enum blackboard key to its UEnum (editor shows enum names) (C++ #57)
+  spawn_actor_in_pie            -> spawn an actor into the RUNNING PIE world (C++ #58)
+  fixup_redirector_referencers  -> resave referencers at a redirector's target + delete it (C++ #58)
+  set_inherited_component_property -> set a default on an inherited native component (Mesh/Capsule/...) (C++ #58)
 """
 import json
 import base64
@@ -523,6 +526,73 @@ def register_tools(mcp, utils):
         )
         try:
             return json.dumps(_exec(body, {"bb": blackboard_path, "key": key_name, "enum": enum, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ==== Project_Aimon gaps batch 2 (C++ #58) =============================================
+
+    @mcp.tool()
+    def spawn_actor_in_pie(ctx, class_path: str, location: list = None, rotation: list = None,
+                           label: str = "") -> str:
+        """Spawn an actor into the RUNNING PIE world during live play (the editor spawn tools target the editor
+        world, which is detached during PIE, so actors land in world 'None'). class_path: native
+        '/Script/Project_Aimon.AimonFood' or a BP '/Game/BP.BP_C'. location/rotation: optional [x,y,z] /
+        [pitch,yaw,roll] (default origin/zero). label: optional actor label. Requires PIE running
+        (start play_in_editor first) + the C++ #58 handler. Returns {actor, class, world, x, y, z}."""
+        loc = (location or [0, 0, 0]) + [0, 0, 0]
+        rot = (rotation or [0, 0, 0]) + [0, 0, 0]
+        body = _cpp_delegate("spawn_actor_in_pie",
+                             "mrl.spawn_actor_in_pie(PARAMS['c'], float(PARAMS['x']),float(PARAMS['y']),float(PARAMS['z']),"
+                             "float(PARAMS['p']),float(PARAMS['yw']),float(PARAMS['r']), PARAMS['lbl'])")
+        try:
+            return json.dumps(_exec(body, {"c": class_path, "x": loc[0], "y": loc[1], "z": loc[2],
+                                           "p": rot[0], "yw": rot[1], "r": rot[2], "lbl": label}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def fixup_redirector_referencers(ctx, target_path: str) -> str:
+        """"Fix Up Redirectors" the way the Content Browser does — resave every referencer to point at each
+        redirector's target, THEN delete the fixed-up redirectors (IAssetTools::FixupReferencers, which stock
+        Python / the existing fixup_redirectors tool can't do — that one only deletes orphaned redirectors).
+        target_path: a specific redirector object path OR a '/Game/...' directory to scan recursively.
+        Requires the C++ #58 handler. Returns {fixed_count, redirectors[]}."""
+        body = _cpp_delegate("fixup_redirector_referencers", "mrl.fixup_redirector_referencers(PARAMS['p'])")
+        try:
+            return json.dumps(_exec(body, {"p": target_path}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def set_inherited_component_property(ctx, blueprint_path: str, component_name: str, property_name: str,
+                                        value: str, save: bool = True) -> str:
+        """Set a default property on an INHERITED native component of a Blueprint (Character's Mesh /
+        CapsuleComponent / CharacterMovement, etc.) — set_blueprint_component_property only resolves SCS
+        (blueprint-added) nodes and errors on inherited native ones. Writes the generated-class CDO subobject
+        (survives recompile). value is parsed by ImportText: float '90.0', vector '(X=0,Y=0,Z=-90)', enum name
+        'AnimationSingleNode', object path '/Game/.../SKM.SKM', or a struct literal. blueprint_path: the BP
+        asset. save: save the BP after. Requires the C++ #58 handler. Returns {component, property, cpp_type,
+        value}."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "bp = unreal.load_asset(PARAMS['bp'])\n"
+            "if mrl is None or not hasattr(mrl, 'set_inherited_component_property'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #58 set_inherited_component_property unavailable — recompile the plugin'}))\n"
+            "elif bp is None:\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'could not load Blueprint: ' + str(PARAMS['bp'])}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.set_inherited_component_property(bp, PARAMS['comp'], PARAMS['prop'], PARAMS['val']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try:\n"
+            "            r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(bp))\n"
+            "        except Exception as _e:\n"
+            "            r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"bp": blueprint_path, "comp": component_name,
+                                           "prop": property_name, "val": value, "save": save}), indent=2)
         except Exception as e:
             return f"Error: {e}"
 

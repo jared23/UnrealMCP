@@ -110,6 +110,9 @@ public class UnrealMCP : ModuleRules
 				// MetasoundEngine is NOT needed (no UMetaSoundSource/editor types used). SoundSubmix (#38) is in
 				// the Engine module (already a dep) -> no dep needed for the submix writer.
 				"MetasoundFrontend",
+				// C++ #58 (Project_Aimon gaps 2): IAssetTools::FixupReferencers (AssetTools) + redirector
+				// registry scan (AssetRegistry). Both editor/runtime modules -> low link risk.
+				"AssetTools", "AssetRegistry",
 				// C++ #46 (mutable Wave 3 graph authoring): UCustomizableObject::GetPrivate()->GetSource()
 				// (CustomizableObject, Runtime) + UCustomizableObjectNode / UEdGraphSchema_CustomizableObject
 				// (CustomizableObjectEditor, UncookedOnly). Both method-level *_API-exported despite MinimalAPI
