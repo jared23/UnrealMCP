@@ -1217,3 +1217,92 @@ FString UMCPReflectionLibrary::SetupAnimSpeedFromVelocity(UAnimBlueprint* AnimBl
     Obj->SetBoolField(TEXT("data_wired"), bD1 && bD2 && bD3);
     return MCPAnimGraph_SerializeObject(Obj);
 }
+
+// 18) SetStateAnimPlayRateFromVariable — drive a state's Sequence Player Play Rate from <variable>/<divisor>
+//     (speed-matched locomotion: play_rate = Speed / RefSpeed, so the walk cycle tracks movement speed).
+FString UMCPReflectionLibrary::SetStateAnimPlayRateFromVariable(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                                               const FString& StateName, const FString& VariableName, float Divisor)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UAnimGraphNode_StateMachineBase* SM = MCPAnimGraph_FindStateMachine(AnimBlueprint, MachineName);
+    if (!SM || !SM->EditorStateMachineGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State machine '%s' not found"), *MachineName)); }
+    UAnimStateNode* State = MCPAnimGraph_FindState(SM->EditorStateMachineGraph, StateName);
+    if (!State || !State->BoundGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State '%s' not found"), *StateName)); }
+    UEdGraph* BoundGraph = State->BoundGraph;
+
+    UAnimGraphNode_SequencePlayer* SeqNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_SequencePlayer>(BoundGraph);
+    if (!SeqNode) { return MCPAnimGraph_Error(TEXT("State has no Sequence Player (call set_state_anim first)")); }
+
+    // Expose the (hidden-by-default) Play Rate pin so it can be driven by a graph link.
+    int32 Index = INDEX_NONE;
+    for (int32 i = 0; i < SeqNode->ShowPinForProperties.Num(); ++i)
+    {
+        if (SeqNode->ShowPinForProperties[i].PropertyName == FName(TEXT("PlayRate"))) { Index = i; break; }
+    }
+    if (Index == INDEX_NONE) { return MCPAnimGraph_Error(TEXT("Sequence Player has no exposable 'PlayRate' pin")); }
+
+    BoundGraph->Modify();
+    SeqNode->Modify();
+    SeqNode->SetPinVisibility(true, Index);   // ANIMGRAPH_API — shows the pin + reconstructs the node
+
+    UEdGraphPin* RatePin = SeqNode->FindPin(TEXT("PlayRate"), EGPD_Input);
+    if (!RatePin) { return MCPAnimGraph_Error(TEXT("Play Rate pin not found after exposing")); }
+
+    // Idempotent: drop any prior driver nodes (variable getter / math call) we may have added.
+    TArray<UEdGraphNode*> ToRemove;
+    for (UEdGraphNode* N : BoundGraph->Nodes)
+    {
+        if (N->IsA<UK2Node_VariableGet>() || N->IsA<UK2Node_CallFunction>()) { ToRemove.Add(N); }
+    }
+    for (UEdGraphNode* N : ToRemove) { FBlueprintEditorUtils::RemoveNode(AnimBlueprint, N, /*bDontRecompile*/true); }
+    RatePin->BreakAllPinLinks();
+
+    UK2Node_VariableGet* VarGet = nullptr;
+    {
+        FGraphNodeCreator<UK2Node_VariableGet> C(*BoundGraph);
+        VarGet = C.CreateNode(false);
+        VarGet->VariableReference.SetSelfMember(FName(*VariableName));
+        C.Finalize();
+    }
+    UEdGraphPin* VarOut = VarGet->GetValuePin();
+    if (!VarOut) { return MCPAnimGraph_Error(FString::Printf(TEXT("Variable '%s' getter has no value pin (does the variable exist?)"), *VariableName)); }
+    VarGet->NodePosX = SeqNode->NodePosX - 640; VarGet->NodePosY = SeqNode->NodePosY + 120;
+
+    bool bWired = false;
+    const bool bUseDivide = !FMath::IsNearlyEqual(Divisor, 1.0f) && Divisor != 0.0f;
+    if (bUseDivide)
+    {
+        UK2Node_CallFunction* Div = nullptr;
+        {
+            FGraphNodeCreator<UK2Node_CallFunction> C(*BoundGraph);
+            Div = C.CreateNode(false);
+            Div->FunctionReference.SetExternalMember(FName(TEXT("Divide_DoubleDouble")), UKismetMathLibrary::StaticClass());
+            C.Finalize();
+        }
+        UEdGraphPin* PinA = Div->FindPin(TEXT("A"), EGPD_Input);
+        UEdGraphPin* PinB = Div->FindPin(TEXT("B"), EGPD_Input);
+        UEdGraphPin* PinRet = Div->GetReturnValuePin();
+        if (!PinA || !PinB || !PinRet) { return MCPAnimGraph_Error(TEXT("Divide node pins not found")); }
+        PinB->DefaultValue = FString::SanitizeFloat(Divisor);
+        Div->NodePosX = SeqNode->NodePosX - 320; Div->NodePosY = SeqNode->NodePosY + 120;
+        const bool bA = MCPAnimGraph_Connect(BoundGraph, VarOut, PinA);
+        const bool bR = MCPAnimGraph_Connect(BoundGraph, PinRet, RatePin);
+        bWired = bA && bR;
+    }
+    else
+    {
+        // Divisor 1.0 -> drive the rate directly from the variable.
+        bWired = MCPAnimGraph_Connect(BoundGraph, VarOut, RatePin);
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("state"), StateName);
+    Obj->SetStringField(TEXT("expression"), bUseDivide ? FString::Printf(TEXT("%s / %s"), *VariableName, *FString::SanitizeFloat(Divisor)) : VariableName);
+    Obj->SetNumberField(TEXT("divisor"), Divisor);
+    Obj->SetBoolField(TEXT("pin_exposed"), true);
+    Obj->SetBoolField(TEXT("wired"), bWired);
+    return MCPAnimGraph_SerializeObject(Obj);
+}

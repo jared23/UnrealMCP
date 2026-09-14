@@ -168,6 +168,7 @@ _fnmap = {
     "connect_sm_to_output": "connect_anim_state_machine_to_output",
     "set_transition_rule": "set_anim_transition_rule",
     "setup_speed_from_velocity": "setup_anim_speed_from_velocity",
+    "set_state_playrate_from_var": "set_state_anim_play_rate_from_variable",
 }
 _rl = getattr(unreal, "MCPReflectionLibrary", None)
 _fn = _fnmap.get(_action)
@@ -229,6 +230,8 @@ else:
                 _res = json.loads(_rl.set_anim_transition_rule(_abp, PARAMS["machine"], PARAMS["from_state"], PARAMS["to_state"], PARAMS["variable"], PARAMS["op"], PARAMS["value"]))
             elif _action == "setup_speed_from_velocity":
                 _res = json.loads(_rl.setup_anim_speed_from_velocity(_abp, PARAMS["variable"]))
+            elif _action == "set_state_playrate_from_var":
+                _res = json.loads(_rl.set_state_anim_play_rate_from_variable(_abp, PARAMS["machine"], PARAMS["state"], PARAMS["variable"], float(PARAMS["divisor"])))
             else:
                 _res = {"status": "error", "error": "unknown action: %s" % _action}
         if _is_err(_res):
@@ -636,6 +639,29 @@ else:
 
         Calls MCPReflectionLibrary.setup_anim_speed_from_velocity (C++ #59). Returns {exec_wired, data_wired}."""
         return _run("setup_speed_from_velocity", {"anim_blueprint_path": anim_blueprint_path, "variable": variable, "save": save})
+
+    # ================================================================== #
+    # 18) set_state_anim_playrate_from_variable  (C++ #59 dynamic rate)   #
+    # ================================================================== #
+    @mcp.tool()
+    def set_state_anim_playrate_from_variable(ctx, anim_blueprint_path: str, machine: str, state: str,
+                                              variable: str, divisor: float = 1.0, save: bool = True) -> str:
+        """Drive a state's Sequence Player Play Rate from '<variable> / <divisor>' — speed-matched locomotion
+        so the walk/run cycle tracks the pawn's actual speed instead of foot-sliding at a fixed rate. Exposes
+        the Sequence Player's hidden Play Rate pin, then wires VariableGet -> Divide -> the pin.
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        machine/state:       existing state-machine + state that already has a Sequence Player (set_state_anim first).
+        variable:            the AnimBP float driving the rate, e.g. 'Speed' (from setup_anim_speed_from_velocity).
+        divisor:             the reference/natural foot speed to divide by (play_rate = variable / divisor).
+                             Use the speed at which the clip looks natural at rate 1.0. divisor=1.0 wires the
+                             variable straight to the pin.
+        save:                persist the AnimBP package (default True).
+
+        Calls MCPReflectionLibrary.set_state_anim_play_rate_from_variable (C++ #59). Idempotent (rebuilds the
+        driver). Returns {expression, pin_exposed, wired}."""
+        return _run("set_state_playrate_from_var", {"anim_blueprint_path": anim_blueprint_path, "machine": machine,
+                                                    "state": state, "variable": variable, "divisor": divisor, "save": save})
 
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. The 13 op inverses
     # above are reported to the coordinator to fold into editor_level.undo (see module docstring / report).

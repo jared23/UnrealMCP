@@ -1082,6 +1082,15 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString SetupAnimSpeedFromVelocity(UAnimBlueprint* AnimBlueprint, const FString& VariableName);
 
+    /** #59: drive a state's Sequence Player Play Rate from <VariableName> / <Divisor> (speed-matched
+     *  locomotion — play_rate = Speed / RefSpeed so the cycle tracks movement speed, no foot-slide). Exposes
+     *  the hidden Play Rate pin, then wires VariableGet -> Divide_DoubleDouble -> the pin (Divisor 1.0 wires
+     *  the variable directly). The variable must exist and the state must have a Sequence Player
+     *  (set_state_anim first). Idempotent. Returns {state, expression, pin_exposed, wired}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateAnimPlayRateFromVariable(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                                    const FString& StateName, const FString& VariableName, float Divisor);
+
     // ==== C++ #19 2026-08-18 batch — Blueprint interfaces + var-flags (MCPReflection_BlueprintExt.cpp),
     //      AnimGraph removers (MCPReflection_AnimRemove.cpp), Niagara renderer/emitter (MCPReflection_NiagaraExt.cpp).
     //      NO Build.cs change (all modules already deps). EnsureStateTreeEditorData decl is up in the StateTree block. ====
