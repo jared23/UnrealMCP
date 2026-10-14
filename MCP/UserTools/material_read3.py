@@ -489,7 +489,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def apply_material(ctx, material_path: str) -> str:
+    def commit_material(ctx, material_path: str) -> str:
         """Recompile, save, and refresh a Material -- commit edits to disk. COMPILE + SAVE (no ledger).
 
         material_path: object/package path of a Material.

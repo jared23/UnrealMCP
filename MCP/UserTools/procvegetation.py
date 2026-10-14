@@ -541,7 +541,7 @@ else:
         return None  # None -> snippet enumerates ALL PVBaseSettings subclasses
 
     @mcp.tool()
-    def describe_pv_nodes(ctx, node: str = None, nodes: list = None, include_pins: bool = True,
+    def describe_pv_node_types(ctx, node: str = None, nodes: list = None, include_pins: bool = True,
                           include_properties: bool = True, max_depth: int = 1,
                           max_properties: int = 200, category: str = None) -> str:
         """Describe Procedural-Vegetation node types by reflecting each settings class's CDO — its

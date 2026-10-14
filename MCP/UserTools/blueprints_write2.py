@@ -537,7 +537,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_blueprint_variable_properties(ctx, blueprint_path: str, variable_name: str,
+    def set_blueprint_variable_category_replication(ctx, blueprint_path: str, variable_name: str,
                                           category: str = None, replication: str = None,
                                           compile: bool = True) -> str:
         """Set a Blueprint member variable's CATEGORY and/or REPLICATION mode (ledgered write).

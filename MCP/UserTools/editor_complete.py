@@ -376,7 +376,7 @@ else:
 
     @mcp.tool()
     @_reg
-    def rename_folder(ctx, old_path: str, new_path: str) -> str:
+    def rename_outliner_folder(ctx, old_path: str, new_path: str) -> str:
         """Rename a World-Outliner folder by re-pathing every actor whose folder path is,
         or is nested under, old_path (moving the whole subtree to new_path). This is the
         Outliner-folder analog of the Content-Browser create_folder/delete_folder tools.

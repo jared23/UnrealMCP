@@ -397,7 +397,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "removed_frame": st["frame"]
 '''
 
     @mcp.tool()
-    def remove_key(ctx, sequence_path: str, channel_index: int, key_index: int = 0,
+    def remove_sequencer_key(ctx, sequence_path: str, channel_index: int, key_index: int = 0,
                    binding: str = None, track_index: int = 0, section_index: int = 0,
                    frame: int = None) -> str:
         """Remove one keyframe from a channel of a LevelSequence section.
@@ -510,7 +510,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "frame": kf, "prior_value": 
 '''
 
     @mcp.tool()
-    def set_key_value(ctx, sequence_path: str, channel_index: int, value, key_index: int = 0,
+    def set_sequencer_key_value(ctx, sequence_path: str, channel_index: int, value, key_index: int = 0,
                       binding: str = None, track_index: int = 0, section_index: int = 0,
                       frame: int = None) -> str:
         """Set a keyframe's value (typed to the channel: float/int/bool).
@@ -1117,7 +1117,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "channel": cname, "channel_t
 '''
 
     @mcp.tool()
-    def add_key(ctx, sequence_path: str, channel_index: int, frame: int, value,
+    def add_sequencer_channel_key(ctx, sequence_path: str, channel_index: int, frame: int, value,
                 binding: str = None, track_index: int = 0, section_index: int = 0,
                 interpolation: str = None) -> str:
         """Add (or overwrite) one keyframe on ANY channel of a LevelSequence section, addressed by index.
@@ -1185,7 +1185,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "keys_written": written, "er
 '''
 
     @mcp.tool()
-    def add_keys(ctx, sequence_path: str, entries: list,
+    def add_sequencer_channel_keys(ctx, sequence_path: str, entries: list,
                  binding: str = None, track_index: int = 0, section_index: int = 0) -> str:
         """Add a BATCH of keyframes onto one section's channels in a single transaction.
 

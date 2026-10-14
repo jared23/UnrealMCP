@@ -466,7 +466,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_customizable_object_parameters(ctx, asset_path: str, filter: str = None,
+    def list_customizable_object_parameters(ctx, asset_path: str, filter: str = None,
                                            include_options: bool = True,
                                            include_ui: bool = True) -> str:
         """Full customization-parameter detail for one CustomizableObject. Read-only.

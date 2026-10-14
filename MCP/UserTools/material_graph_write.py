@@ -565,7 +565,7 @@ else:
 '''
 
     @mcp.tool()
-    def connect_material_property(ctx, material_path: str, from_expr: str,
+    def connect_material_output(ctx, material_path: str, from_expr: str,
                                   material_property: str, from_output: str = "") -> str:
         """Wire an expression's output into one of the Material's property inputs (ledgered WRITE).
 
@@ -632,7 +632,7 @@ else:
 '''
 
     @mcp.tool()
-    def disconnect_material_property(ctx, material_path: str, material_property: str) -> str:
+    def disconnect_material_output(ctx, material_path: str, material_property: str) -> str:
         """Clear a Material's property input, removing whatever expression feeds it (ledgered WRITE).
 
         material_path:     object/package path of the base Material.

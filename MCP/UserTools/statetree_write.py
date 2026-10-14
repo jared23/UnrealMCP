@@ -537,7 +537,7 @@ else:
     # ============================ MCP TOOLS ============================ #
 
     @mcp.tool()
-    def create_statetree(ctx, asset_path: str, schema: str = "component") -> str:
+    def create_state_tree(ctx, asset_path: str, schema: str = "component") -> str:
         """Create a new StateTree asset with an editor-data schema. schema: component|ai|brain|camera.
         Non-modal (factory None + manual editor data). Reversible (undo deletes the asset)."""
         try:
@@ -546,7 +546,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_statetree_state(ctx, asset_path: str, name: str, parent: str = "",
+    def add_state_tree_state(ctx, asset_path: str, name: str, parent: str = "",
                             selection_behavior: str = None, state_type: str = None) -> str:
         """Add a state named `name` under `parent` (empty = a root sub-tree). Optional selection_behavior
         (e.g. TRY_ENTER_STATES) + state_type (e.g. STATE). Reversible."""
@@ -558,44 +558,44 @@ else:
             "node_type": node_type, "state_name": state_name, "config": config}), indent=2)
 
     @mcp.tool()
-    def add_statetree_task(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
+    def add_state_tree_task(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
         """Add a native task node to a state. node_type: bare (StateTreeModule) or full /Script/<Mod>.<Type>.
         config: optional export-text paren body, e.g. (Text="hi"). Reversible."""
         return _add_node(asset_path, "task", node_type, state_name, config)
 
     @mcp.tool()
-    def add_statetree_condition(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
+    def add_state_tree_condition(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
         """Add a native enter-condition node to a state. Reversible."""
         return _add_node(asset_path, "condition", node_type, state_name, config)
 
     @mcp.tool()
-    def add_statetree_consideration(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
+    def add_state_tree_consideration(ctx, asset_path: str, state_name: str, node_type: str, config: str = "") -> str:
         """Add a native utility consideration node to a state. Reversible."""
         return _add_node(asset_path, "consideration", node_type, state_name, config)
 
     @mcp.tool()
-    def add_statetree_evaluator(ctx, asset_path: str, node_type: str, config: str = "") -> str:
+    def add_state_tree_evaluator(ctx, asset_path: str, node_type: str, config: str = "") -> str:
         """Add a native evaluator node at the tree level (editor data). Reversible."""
         return _add_node(asset_path, "evaluator", node_type, "", config)
 
     @mcp.tool()
-    def add_statetree_global_task(ctx, asset_path: str, node_type: str, config: str = "") -> str:
+    def add_state_tree_global_task(ctx, asset_path: str, node_type: str, config: str = "") -> str:
         """Add a native global task node at the tree level (editor data). Reversible."""
         return _add_node(asset_path, "global_task", node_type, "", config)
 
     @mcp.tool()
-    def remove_statetree_state(ctx, asset_path: str, name: str) -> str:
+    def remove_state_tree_state(ctx, asset_path: str, name: str) -> str:
         """Remove a state (and its subtree) by name. Reversible."""
         return json.dumps(_exec(_REMOVE_STATE_BODY, {"asset_path": asset_path, "name": name}), indent=2)
 
     @mcp.tool()
-    def remove_statetree_node(ctx, asset_path: str, kind: str, index: int, state_name: str = "") -> str:
+    def remove_state_tree_node(ctx, asset_path: str, kind: str, index: int, state_name: str = "") -> str:
         """Remove a node by kind (task|condition|consideration|evaluator|global_task) + index. Reversible."""
         return json.dumps(_exec(_REMOVE_NODE_BODY, {"asset_path": asset_path, "kind": kind,
             "index": index, "state_name": state_name}), indent=2)
 
     @mcp.tool()
-    def add_statetree_transition(ctx, asset_path: str, state_name: str, trigger: str, target: str = "",
+    def add_state_tree_transition(ctx, asset_path: str, state_name: str, trigger: str, target: str = "",
                                  priority: str = "Normal", link_type: str = "GotoState") -> str:
         """Add a transition to a state. trigger: ON_STATE_COMPLETED|ON_STATE_SUCCEEDED|ON_STATE_FAILED|ON_TICK|
         ON_EVENT|ON_DELEGATE. link_type GOTO_STATE needs `target` (a state name); NEXT_STATE|SUCCEEDED|FAILED etc.
@@ -604,19 +604,19 @@ else:
             "trigger": trigger, "target": target, "priority": priority, "link_type": link_type}), indent=2)
 
     @mcp.tool()
-    def remove_statetree_transition(ctx, asset_path: str, state_name: str, index: int) -> str:
+    def remove_state_tree_transition(ctx, asset_path: str, state_name: str, index: int) -> str:
         """Remove a transition from a state by index. Reversible (re-imported from capture)."""
         return json.dumps(_exec(_REMOVE_TRANSITION_BODY, {"asset_path": asset_path, "state_name": state_name,
             "index": index}), indent=2)
 
     @mcp.tool()
-    def set_statetree_state_property(ctx, asset_path: str, state_name: str, property: str, value: str) -> str:
+    def set_state_tree_state_property(ctx, asset_path: str, state_name: str, property: str, value: str) -> str:
         """Set a state property: name | weight | type (STATE|GROUP|SUBTREE|LINKED|LINKED_ASSET) |
         selection_behavior (TRY_ENTER_STATE|TRY_SELECT_CHILDREN_IN_ORDER|...). Reversible."""
         return json.dumps(_exec(_SET_STATE_PROP_BODY, {"asset_path": asset_path, "state_name": state_name,
             "property": property, "value": value}), indent=2)
 
     @mcp.tool()
-    def set_statetree_schema(ctx, asset_path: str, schema: str) -> str:
+    def set_state_tree_schema(ctx, asset_path: str, schema: str) -> str:
         """Set the StateTree schema: component|ai|brain|camera. Reversible."""
         return json.dumps(_exec(_SET_SCHEMA_BODY, {"asset_path": asset_path, "schema": schema}), indent=2)

@@ -804,7 +804,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_blueprint_variable_flags(ctx, blueprint_path: str, variable_name: str,
+    def set_blueprint_variable_flags_bel(ctx, blueprint_path: str, variable_name: str,
                                      flags: dict = None, compile: bool = True) -> str:
         """Toggle a Blueprint member variable's editing flags (ledgered, reversible write).
 
@@ -904,7 +904,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "query": query, "kind": kind
 '''
 
     @mcp.tool()
-    def search_types(ctx, query: str = "", kind: str = "any", include_engine: bool = False,
+    def search_asset_types(ctx, query: str = "", kind: str = "any", include_engine: bool = False,
                      max_results: int = None, cursor: int = 0) -> str:
         """Search asset-backed types by name via the AssetRegistry. Read-only.
 

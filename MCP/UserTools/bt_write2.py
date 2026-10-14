@@ -421,7 +421,7 @@ else:
 '''
 
     @mcp.tool()
-    def remove_bt_node(ctx, bt_path: str, node_path: str) -> str:
+    def remove_behavior_tree_node(ctx, bt_path: str, node_path: str) -> str:
         """Remove a node (composite or task) + its whole subtree from a BehaviorTree by dot-index path.
 
         node_path: dot-separated child-index path to the CHILD SLOT to remove ('0' = root.children[0],
@@ -492,7 +492,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_bt_node_property(ctx, bt_path: str, node_path: str, property: str, value) -> str:
+    def set_behavior_tree_node_property(ctx, bt_path: str, node_path: str, property: str, value) -> str:
         """Set a UPROPERTY on a BT node (composite/task/root) addressed by dot-index path.
 
         node_path: dot-index path to the node ('root', '0', '0.2'); property: the node's editor-property
@@ -584,7 +584,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_bt_composite_decorator(ctx, bt_path: str, parent_path: str = "root", child_index: int = 0,
+    def add_behavior_tree_decorator_logic(ctx, bt_path: str, parent_path: str = "root", child_index: int = 0,
                                    operator: str = "AND", decorator_classes: list = None) -> str:
         """Add decorators to a child slot and combine them with AND/OR/NOT logic (FBTDecoratorLogic ops).
 
@@ -918,7 +918,7 @@ print("@@UMCP@@" + json.dumps(out))
 '''
 
     @mcp.tool()
-    def search_bt_nodes(ctx, query: str = None, queries: list = None, kind: str = None,
+    def search_behavior_tree_nodes(ctx, query: str = None, queries: list = None, kind: str = None,
                         max_results: int = 40, include_blueprint: bool = False) -> str:
         """Ranked keyword search over BehaviorTree node classes (Composite/Task/Service/Decorator).
 
@@ -983,7 +983,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_bt_node_type_info(ctx, node_class: str, filter: str = None, editable_only: bool = True) -> str:
+    def get_behavior_tree_node_type_info(ctx, node_class: str, filter: str = None, editable_only: bool = True) -> str:
         """Kind + editable properties/defaults for a BehaviorTree node class (read-only; no editor).
 
         node_class:    a BT node class short name ('BTTask_Wait', 'BTDecorator_Blackboard') or class path.
@@ -1060,7 +1060,7 @@ else:
         "    else:\n")
 
     @mcp.tool()
-    def get_bt_runtime(ctx, actor: str = None, include_blackboard: bool = True) -> str:
+    def get_behavior_tree_runtime(ctx, actor: str = None, include_blackboard: bool = True) -> str:
         """Inspect a RUNNING BehaviorTreeComponent on an actor in the live PIE world (C++ #23 handler):
         is_running, active_node, active_tasks/trees, and (optional) the blackboard snapshot.
 
@@ -1073,7 +1073,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def control_bt_runtime(ctx, action: str = "start", actor: str = None) -> str:
+    def control_behavior_tree_runtime(ctx, action: str = "start", actor: str = None) -> str:
         """Control a RUNNING BehaviorTree on an actor in the live PIE world (C++ #23 handler).
         action: start | restart | stop | pause | resume. REQUIRES PIE (see get_bt_runtime).
         actor: substring/name/label match (empty = the first AIController)."""
@@ -1084,7 +1084,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_bt_dynamic_subtree(ctx, inject_tag: str = None, subtree: str = None, actor: str = None) -> str:
+    def set_behavior_tree_dynamic_subtree(ctx, inject_tag: str = None, subtree: str = None, actor: str = None) -> str:
         """Inject a dynamic subtree at a runtime gameplay tag on a RUNNING BehaviorTreeComponent (C++ #23:
         UBehaviorTreeComponent::SetDynamicSubtree). REQUIRES PIE (see get_bt_runtime).
         inject_tag: a REGISTERED gameplay tag. subtree: a /Game BehaviorTree asset path (empty = clear).

@@ -706,7 +706,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_control_rig_vm(ctx, asset_path: str) -> str:
+    def get_control_rig_compiled_vm(ctx, asset_path: str) -> str:
         """Compiled RigVM summary of a Control Rig (C++ #12 reader). Read-only, static (no ticking).
 
         asset_path: a ControlRigBlueprint path (e.g. '.../CR_Mannequin_FootIK.CR_Mannequin_FootIK').

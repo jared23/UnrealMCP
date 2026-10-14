@@ -582,7 +582,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_blueprint_struct_variable(ctx, struct_path: str, name: str, new_name: str = None,
+    def set_struct_field(ctx, struct_path: str, name: str, new_name: str = None,
                                       type: str = None, type_path: str = None, default: str = None,
                                       tooltip: str = None, container: str = None,
                                       value_type: str = None, value_type_path: str = None) -> str:

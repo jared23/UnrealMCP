@@ -403,7 +403,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def delete_assets(ctx, asset_paths: list, force: bool = False) -> str:
+    def delete_assets_batch(ctx, asset_paths: list, force: bool = False) -> str:
         """Soft-delete many assets: move each into a hidden '/Game/_MCP_Trash' folder (NOT destroyed,
         so restoration is perfect). Referenced assets are skipped unless force=True (a redirector is
         left at the old path so referencers still resolve).

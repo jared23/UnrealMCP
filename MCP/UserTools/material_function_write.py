@@ -763,7 +763,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def cleanup_material_function(ctx, function_path: str, dry_run: bool = True) -> str:
+    def cleanup_material_function_graph(ctx, function_path: str, dry_run: bool = True) -> str:
         """Remove expressions unreachable from any FunctionOutput. Ledgered write (only when dry_run=False).
 
         function_path: object/package path of a MaterialFunction.
@@ -976,7 +976,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_material_function_instance_parameters(ctx, instance_path: str) -> str:
+    def get_material_function_instance_overrides(ctx, instance_path: str) -> str:
         """List a MaterialFunctionInstance's scalar/vector/texture parameter overrides. Read-only.
 
         instance_path: object/package path of a MaterialFunctionInstance.

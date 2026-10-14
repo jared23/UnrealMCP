@@ -284,7 +284,7 @@ else:
 '''
 
     @mcp.tool()
-    def create_folder(ctx, path: str) -> str:
+    def create_content_folder(ctx, path: str) -> str:
         """Create a content-browser folder (directory). Programmatic, no dialog.
 
         path: absolute content path under a mounted root (e.g. '/Game/MCP_Scratch/MCP_A_Sub').
@@ -322,7 +322,7 @@ else:
 '''
 
     @mcp.tool()
-    def delete_folder(ctx, path: str) -> str:
+    def delete_content_folder(ctx, path: str) -> str:
         """Delete a content-browser folder -- ONLY IF IT IS EMPTY (no assets). Programmatic, no dialog.
 
         path: absolute content path of the folder to remove.

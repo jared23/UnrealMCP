@@ -318,7 +318,7 @@ else:
 '''
 
     @mcp.tool()
-    def remove_data_layer(ctx, name_or_asset: str) -> str:
+    def delete_data_layer(ctx, name_or_asset: str) -> str:
         """Remove a World Partition Data Layer INSTANCE. Ledgered write (asset is preserved).
 
         name_or_asset: identifier of the target data layer (its DataLayerAsset path, asset name,

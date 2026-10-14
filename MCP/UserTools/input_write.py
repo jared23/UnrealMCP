@@ -369,7 +369,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_mapping_to_context(ctx, imc_path: str, input_action_path: str, key: str) -> str:
+    def add_key_mapping(ctx, imc_path: str, input_action_path: str, key: str) -> str:
         """Add one key -> InputAction mapping to an existing InputMappingContext.
 
         imc_path:          object/package path of the InputMappingContext asset.

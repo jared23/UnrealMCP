@@ -594,7 +594,7 @@ else:
     # 1) generate_terrain                                                #
     # ================================================================== #
     @mcp.tool()
-    def generate_terrain(ctx, actor_name: str, seed: int = 1337, amplitude: float = 6000.0,
+    def generate_landscape(ctx, actor_name: str, seed: int = 1337, amplitude: float = 6000.0,
                          sharpness: float = 1.35, warp: float = 0.35, feature_scale: float = None,
                          octaves: int = 6, ridged: bool = True, detail: float = 0.25,
                          uplift: float = 0.0, erosion: float = 0.4, erosion_radius: int = 2,
@@ -655,7 +655,7 @@ else:
     # 2) edit_terrain_region                                             #
     # ================================================================== #
     @mcp.tool()
-    def edit_terrain_region(ctx, actor_name: str, operation: str, center=None, radius: float = None,
+    def edit_landscape_region(ctx, actor_name: str, operation: str, center=None, radius: float = None,
                             falloff: float = 0.4, amount: float = 200.0, height: float = None,
                             use_height: bool = False, iterations: int = 1, step_height: float = 400.0,
                             feature_scale: float = None, seed: int = 1337) -> str:
@@ -768,7 +768,7 @@ else:
     # 3) regenerate_terrain_region                                       #
     # ================================================================== #
     @mcp.tool()
-    def regenerate_terrain_region(ctx, actor_name: str, center=None, radius: float = None,
+    def regenerate_landscape_region(ctx, actor_name: str, center=None, radius: float = None,
                                   blend: str = "feather", seed: int = 1337, amplitude: float = 6000.0,
                                   sharpness: float = 1.35, warp: float = 0.35, feature_scale: float = None,
                                   erosion: float = 0.0, talus_angle: float = 35.0,
@@ -860,7 +860,7 @@ else:
     # 4) apply_terrain_process                                           #
     # ================================================================== #
     @mcp.tool()
-    def apply_terrain_process(ctx, actor_name: str, process: str, snow_line: float = None,
+    def apply_landscape_process(ctx, actor_name: str, process: str, snow_line: float = None,
                               sea_level: float = None, repose_angle_degrees: float = 35.0,
                               iterations: int = 3, bench_width: float = 500.0,
                               snow_depth: float = 800.0, tilt_degrees: float = 0.0,

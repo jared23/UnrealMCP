@@ -255,7 +255,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_skeletal_mesh_socket(ctx, mesh_path: str, socket_name: str, parent_bone: str,
+    def add_mesh_socket(ctx, mesh_path: str, socket_name: str, parent_bone: str,
                                  location: list = None, rotation: list = None, scale: list = None,
                                  force_always_animated: bool = None) -> str:
         """Add a new USkeletalMeshSocket to a SkeletalMesh asset (MESH-owned socket; NOT promoted to
@@ -328,7 +328,7 @@ else:
 '''
 
     @mcp.tool()
-    def remove_skeletal_mesh_socket(ctx, mesh_path: str, socket_name: str) -> str:
+    def remove_mesh_socket(ctx, mesh_path: str, socket_name: str) -> str:
         """Remove a MESH-owned socket from a SkeletalMesh asset. Reversible/ledgered write.
 
         mesh_path:   SkeletalMesh asset path.
@@ -390,7 +390,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_skeletal_mesh_socket_transform(ctx, mesh_path: str, socket_name: str,
+    def set_mesh_socket_transform(ctx, mesh_path: str, socket_name: str,
                                            location: list = None, rotation: list = None,
                                            scale: list = None) -> str:
         """Update a MESH-owned socket's relative transform on a SkeletalMesh. Partial update -- only
@@ -450,7 +450,7 @@ else:
 '''
 
     @mcp.tool()
-    def rename_skeletal_mesh_socket(ctx, mesh_path: str, old_name: str, new_name: str) -> str:
+    def rename_mesh_socket(ctx, mesh_path: str, old_name: str, new_name: str) -> str:
         """Rename a MESH-owned socket on a SkeletalMesh. Reversible/ledgered write.
 
         mesh_path: SkeletalMesh asset path.
@@ -527,7 +527,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_skeleton_socket(ctx, skeleton_path: str, socket_name: str, parent_bone: str,
+    def add_shared_skeleton_socket(ctx, skeleton_path: str, socket_name: str, parent_bone: str,
                             location: list = None, rotation: list = None, scale: list = None) -> str:
         """Add a socket to a USkeleton (C++ #13 handler). Ledgered, reversible. ⚠️ SHARED across every
         mesh on this skeleton — validate on a scratch DUPLICATE, not the real skeleton.
@@ -547,7 +547,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def remove_skeleton_socket(ctx, skeleton_path: str, socket_name: str) -> str:
+    def remove_shared_skeleton_socket(ctx, skeleton_path: str, socket_name: str) -> str:
         """Remove a skeleton socket (C++ #13 handler). Ledgered, reversible. ⚠️ SHARED skeleton.
 
         skeleton_path: object path of a Skeleton asset.

@@ -327,7 +327,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "folder_count": len(folders)
 '''
 
     @mcp.tool()
-    def list_folders(ctx, filter: str = None) -> str:
+    def list_outliner_folders(ctx, filter: str = None) -> str:
         """List the distinct World Outliner folder paths used in the active level, each with a
         count of how many actors sit directly in it. Read-only.
 

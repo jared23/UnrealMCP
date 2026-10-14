@@ -165,8 +165,16 @@ void FUnrealMCPModule::ShutdownModule()
 
 void FUnrealMCPModule::ExtendLevelEditorToolbar()
 {
+    // No Slate toolbar in headless contexts (cook/build commandlets, dedicated
+    // server). Building the SButton here calls FSlateApplicationBase::Get(), which
+    // asserts when there is no Slate application — this is what fails the cook.
+    if (IsRunningCommandlet() || IsRunningDedicatedServer() || !FSlateApplication::IsInitialized())
+    {
+        return;
+    }
+
     static bool bToolbarExtended = false;
-    
+
     if (bToolbarExtended)
     {
         MCP_LOG_WARNING("ExtendLevelEditorToolbar called but toolbar already extended, skipping");

@@ -230,7 +230,7 @@ else:
 '''
 
     @mcp.tool()
-    def delete_curve_keys(ctx, curve_path: str, times: list = None, all: bool = False,
+    def remove_curve_asset_keys(ctx, curve_path: str, times: list = None, all: bool = False,
                           channels: list = None, epsilon: float = 1e-06) -> str:
         """Remove keyframes from a curve asset (CurveFloat / CurveVector / CurveLinearColor), or clear
         a whole channel. REQUIRES the C++ #4 handler (unreal.MCPReflectionLibrary.set_curve_keys_json);

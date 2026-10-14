@@ -517,7 +517,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_keyframe(ctx, sequence_path: str, binding_name: str, frame: int,
+    def add_transform_keyframe(ctx, sequence_path: str, binding_name: str, frame: int,
                      location: list = None, rotation: list = None, scale: list = None) -> str:
         """Add transform keyframes at one frame on a binding's transform section.
 

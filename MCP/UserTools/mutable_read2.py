@@ -449,7 +449,7 @@ else:
 '''
 
     @mcp.tool()
-    def describe_mutable_node(ctx, node_name: str, max_props: int = 60) -> str:
+    def describe_mutable_node_class(ctx, node_name: str, max_props: int = 60) -> str:
         """Describe one authorable Mutable node class by reflecting its class-default object. Read-only.
 
         node_name: class name; exact ('CustomizableObjectNodeObject') or short ('Object',

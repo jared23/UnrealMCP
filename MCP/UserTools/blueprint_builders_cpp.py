@@ -373,7 +373,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def get_type_registry(ctx, kind: str = "class", query: str = "", include_engine: bool = True,
+    def list_native_types(ctx, kind: str = "class", query: str = "", include_engine: bool = True,
                           max: int = 500) -> str:
         """Enumerate the LIVE native type registry -- UClass / UScriptStruct / UEnum -- with filters + a cap.
 

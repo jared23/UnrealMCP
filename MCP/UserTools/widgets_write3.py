@@ -682,7 +682,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def get_slot_properties(ctx, wbp_path: str, widget_name: str) -> str:
+    def get_layout_slot_properties(ctx, wbp_path: str, widget_name: str) -> str:
         """Read a widget's LAYOUT/SLOT properties (its placement within its parent panel). Read-only.
 
         wbp_path:    object/package path of the WidgetBlueprint asset.

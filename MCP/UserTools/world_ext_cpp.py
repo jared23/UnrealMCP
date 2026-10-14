@@ -393,7 +393,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_runtime_grid(ctx, grid_name: str, cell_size: int = None, loading_range: float = None,
+    def edit_world_partition_grid(ctx, grid_name: str, cell_size: int = None, loading_range: float = None,
                          priority: int = None, block_on_slow_streaming: bool = None,
                          origin: str = None, debug_color: str = None) -> str:
         """Edit one spatial-hash EDITING grid of the open World Partition map. REVERSIBLE ledgered write.

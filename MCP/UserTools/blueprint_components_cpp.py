@@ -172,7 +172,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def get_blueprint_scs(ctx, blueprint_path: str) -> str:
+    def get_blueprint_component_hierarchy(ctx, blueprint_path: str) -> str:
         """Walk a Blueprint's Simple Construction Script (default-component tree + attach hierarchy).
 
         blueprint_path: Blueprint asset path (e.g. '/Game/BP/BP_Foo.BP_Foo' or '/Game/BP/BP_Foo').

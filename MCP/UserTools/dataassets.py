@@ -459,7 +459,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_primary_asset_ids(ctx, primary_asset_type: str, max_results: int = None) -> str:
+    def list_primary_asset_ids_of_type(ctx, primary_asset_type: str, max_results: int = None) -> str:
         """List the PrimaryAssetIds registered for a given PrimaryAssetType (read-only),
         via unreal.PrimaryAssetType(type).get_primary_asset_id_list() (a real AssetManager
         query). Returns each id as a 'Type:Name' string.

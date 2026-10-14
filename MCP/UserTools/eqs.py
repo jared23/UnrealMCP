@@ -557,7 +557,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_env_query_config(ctx, asset_path: str) -> str:
+    def get_env_query_full_config(ctx, asset_path: str) -> str:
         """Full EQS config INCLUDING the protected node config VALUES (C++ reflection reader). Read-only.
 
         asset_path: EnvQuery asset path, e.g.

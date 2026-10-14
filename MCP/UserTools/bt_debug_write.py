@@ -164,7 +164,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def list_bt_breakpoints(ctx, behavior_tree_path: str, max_results: int = 200) -> str:
+    def list_behavior_tree_breakpoints(ctx, behavior_tree_path: str, max_results: int = 200) -> str:
         """List every node in a BehaviorTree's editor graph that currently carries a breakpoint.
 
         behavior_tree_path: BehaviorTree asset path (e.g. '/Game/AI/BT_Enemy.BT_Enemy' or '/Game/AI/BT_Enemy').
@@ -207,7 +207,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def set_bt_breakpoint(ctx, behavior_tree_path: str, node_id: str, enabled: bool = True) -> str:
+    def set_behavior_tree_breakpoint(ctx, behavior_tree_path: str, node_id: str, enabled: bool = True) -> str:
         """Place (or enable/disable) a breakpoint on one BehaviorTree node in its editor graph.
 
         behavior_tree_path: BehaviorTree asset path.
@@ -249,7 +249,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def remove_bt_breakpoint(ctx, behavior_tree_path: str, node_id: str = "", remove_all: bool = False) -> str:
+    def remove_behavior_tree_breakpoint(ctx, behavior_tree_path: str, node_id: str = "", remove_all: bool = False) -> str:
         """Clear one BehaviorTree node's breakpoint (by node_id) or EVERY node's (remove_all).
 
         behavior_tree_path: BehaviorTree asset path.

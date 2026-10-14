@@ -179,7 +179,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def create_niagara_scratch_pad_module(ctx, system_path: str, script_name: str = "",
+    def add_niagara_scratch_pad_script(ctx, system_path: str, script_name: str = "",
                                           script_type: str = "dynamic_input") -> str:
         """Add a scratch-pad module/dynamic-input script to a NiagaraSystem (data-level, no view model).
 

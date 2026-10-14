@@ -578,7 +578,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_mutable_parameter(ctx, instance_path: str, param_name: str) -> str:
+    def get_mutable_instance_parameter(ctx, instance_path: str, param_name: str) -> str:
         """Read one parameter's current value on a CustomizableObjectInstance. Read-only.
 
         instance_path: CustomizableObjectInstance asset path.

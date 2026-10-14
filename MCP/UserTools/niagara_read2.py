@@ -228,7 +228,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def list_niagara_modules(ctx, path: str = "/Niagara", name_filter: str = None,
+    def list_niagara_module_assets(ctx, path: str = "/Niagara", name_filter: str = None,
                              usage: str = "Module", max_results: int = 200) -> str:
         """Enumerate Niagara Module scripts (UNiagaraScript assets with Usage == Module) via AssetRegistry.
 

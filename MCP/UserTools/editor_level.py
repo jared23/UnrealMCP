@@ -511,7 +511,7 @@ print("@@UMCP@@" + json.dumps(info))
 '''
 
     @mcp.tool()
-    def get_world_info(ctx) -> str:
+    def get_level_summary(ctx) -> str:
         """Get a summary of the active editor world/level: world name and package path,
         placed-actor count, engine version, play-in-editor state, world-partition flag,
         persistent level, and game mode (if any). Read-only."""

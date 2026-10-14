@@ -190,7 +190,7 @@ gc.collect()
 '''
 
     @mcp.tool()
-    def get_expression_type_info(ctx, expression_class: str) -> str:
+    def get_material_expression_class_info(ctx, expression_class: str) -> str:
         """Pins + reflected properties of a material-expression CLASS. READ-ONLY (no asset touched).
 
         expression_class: class name with or without the 'MaterialExpression' prefix

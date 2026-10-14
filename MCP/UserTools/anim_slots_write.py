@@ -203,7 +203,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_anim_slot(ctx, skeleton_path: str, slot_name: str, group_name: str = "") -> str:
+    def register_skeleton_slot(ctx, skeleton_path: str, slot_name: str, group_name: str = "") -> str:
         """Register a montage slot on a Skeleton, placing it in group_name (C++ #18 add_skeleton_slot).
         An empty group_name uses the engine DefaultGroup. If the slot already exists it is moved to the
         new group (its prior group is captured for undo). Ledgered, reversible.
@@ -330,7 +330,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_anim_slot_group(ctx, skeleton_path: str, group_name: str) -> str:
+    def add_skeleton_slot_group(ctx, skeleton_path: str, group_name: str) -> str:
         """Create a montage slot GROUP on a Skeleton (C++ #18 add_skeleton_slot_group). If the group
         already exists this is a no-op (added=false) and undo does nothing. Ledgered, reversible.
 

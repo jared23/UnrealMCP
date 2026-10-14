@@ -1144,7 +1144,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "sequence": seq.get_name(),
     # GENERIC TRACK / SECTION ADD + REMOVE                                #
     # ================================================================== #
     @mcp.tool()
-    def add_track(ctx, sequence_path: str, track_class: str, binding_name: str = None,
+    def add_track_by_class(ctx, sequence_path: str, track_class: str, binding_name: str = None,
                   add_section: bool = False) -> str:
         """Add a track of ANY MovieScene track class to a LevelSequence (master or a binding).
 
@@ -1201,7 +1201,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "sequence": seq.get_name(),
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_section(ctx, sequence_path: str, track_index: int, binding_name: str = None,
+    def add_section_to_track(ctx, sequence_path: str, track_index: int, binding_name: str = None,
                     start_frame: int = None, end_frame: int = None) -> str:
         """Add an empty section (frame range) to a located track.
 

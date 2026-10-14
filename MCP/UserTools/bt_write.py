@@ -316,7 +316,7 @@ else:
 
     # ----------------------------- tools ------------------------------- #
     @mcp.tool()
-    def set_bt_root(ctx, bt_path: str, composite_type: str = "selector", node_name: str = "") -> str:
+    def set_behavior_tree_root(ctx, bt_path: str, composite_type: str = "selector", node_name: str = "") -> str:
         """Set the ROOT composite of a BehaviorTree (only when it has no root yet).
 
         bt_path:        object/package path of the BehaviorTree asset.
@@ -333,7 +333,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_bt_child_composite(ctx, bt_path: str, parent_path: str = "root",
+    def add_behavior_tree_child_composite(ctx, bt_path: str, parent_path: str = "root",
                                composite_type: str = "selector", node_name: str = "") -> str:
         """Append a child COMPOSITE (selector/sequence/simple_parallel) under a parent composite.
 
@@ -356,7 +356,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_bt_task(ctx, bt_path: str, parent_path: str = "root",
+    def add_behavior_tree_task(ctx, bt_path: str, parent_path: str = "root",
                     task_class: str = "BTTask_Wait", node_name: str = "") -> str:
         """Append a leaf TASK under a parent composite.
 
@@ -374,7 +374,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_bt_service(ctx, bt_path: str, composite_path: str = "root",
+    def add_behavior_tree_service(ctx, bt_path: str, composite_path: str = "root",
                        service_class: str = "BTService_DefaultFocus") -> str:
         """Add a SERVICE to a composite node (services tick while their subtree is active).
 
@@ -390,7 +390,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_bt_decorator(ctx, bt_path: str, parent_path: str = "root", child_index: int = 0,
+    def add_behavior_tree_decorator(ctx, bt_path: str, parent_path: str = "root", child_index: int = 0,
                          decorator_class: str = "BTDecorator_Blackboard") -> str:
         """Add a DECORATOR that guards entry to a specific child slot of a composite.
 
@@ -432,7 +432,7 @@ else:
 '''
 
     @mcp.tool()
-    def sync_bt_editor_graph(ctx, bt_path: str) -> str:
+    def sync_behavior_tree_editor_graph(ctx, bt_path: str) -> str:
         """Rebuild the BT EDITOR graph from the runtime RootNode so the asset is editor-round-trippable
         (C++ #11). Call ONCE after building/editing a BT with set_bt_root / add_bt_child_composite /
         add_bt_task / add_bt_service / add_bt_decorator. Without it, opening the BT in the Behavior Tree

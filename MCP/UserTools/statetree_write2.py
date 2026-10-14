@@ -1030,7 +1030,7 @@ else:
     # ============================ MCP TOOL WRAPPERS ============================ #
 
     @mcp.tool()
-    def get_statetree_node(ctx, asset_path: str, guid: str) -> str:
+    def get_state_tree_node(ctx, asset_path: str, guid: str) -> str:
         """Find a StateTree node/state/transition by GUID. Read-only.
 
         Searches editor-node ids (tasks/enter-conditions/considerations/evaluators/global-tasks), state ids,
@@ -1042,7 +1042,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def get_statetree_full_info(ctx, asset_path: str, verbosity: int = 1) -> str:
+    def get_state_tree_full_info(ctx, asset_path: str, verbosity: int = 1) -> str:
         """Aggregate one StateTree's full info: schema, evaluators/global-tasks, color palette, the recursive
         state hierarchy (name/type/id/task-types/counts), total_state_count, and editor property bindings
         (via C++ #14 reader if present). Read-only.
@@ -1064,7 +1064,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def search_statetree_nodes(ctx, asset_path: str, query: str = "", category: str = "all") -> str:
+    def search_state_tree_nodes(ctx, asset_path: str, query: str = "", category: str = "all") -> str:
         """Search nodes across a StateTree by type/config substring. Read-only.
 
         query:    case-insensitive substring matched against node type name + export text (empty = all).
@@ -1077,7 +1077,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def search_statetree_properties(ctx, asset_path: str, property_query: str = "",
+    def search_state_tree_properties(ctx, asset_path: str, property_query: str = "",
                                     value_query: str = "") -> str:
         """Search node CONFIGURED properties (name/value) across a StateTree. Read-only.
 
@@ -1092,7 +1092,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def list_statetree_transition_targets(ctx, asset_path: str) -> str:
+    def list_state_tree_transition_targets(ctx, asset_path: str) -> str:
         """List valid transition targets (all states: name/path/id/type) + the transition LinkType enum
         values for a StateTree. Read-only. GOTO_STATE targets a named state; NEXT_STATE / SUCCEEDED /
         FAILED / NONE need no explicit target."""
@@ -1102,7 +1102,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def list_statetree_enum_values(ctx, category: str = "all") -> str:
+    def list_state_tree_enum_values(ctx, category: str = "all") -> str:
         """List StateTree enum values by category. Read-only.
 
         category: trigger (StateTreeTransitionTrigger) | priority (StateTreeTransitionPriority) |
@@ -1114,7 +1114,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_statetree_node_property(ctx, asset_path: str, kind: str, index: int, property: str,
+    def set_state_tree_node_property(ctx, asset_path: str, kind: str, index: int, property: str,
                                     value: str, state_name: str = "", container: str = "") -> str:
         """Set ONE configured property on a native StateTree node via the C++ #18 reflection handler
         (FProperty ImportText on the reflected node struct; the Python nested-struct import that crashed the
@@ -1140,7 +1140,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_statetree_transition_property(ctx, asset_path: str, state_name: str, index: int,
+    def set_state_tree_transition_property(ctx, asset_path: str, state_name: str, index: int,
                                           property: str, value: str) -> str:
         """Set ONE property on a state's transition via the C++ #18 handler (FProperty ImportText on
         FStateTreeTransition). Reversible.
@@ -1161,7 +1161,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_statetree_component_tree(ctx, blueprint_path: str, statetree_path: str = "",
+    def set_state_tree_component_tree(ctx, blueprint_path: str, statetree_path: str = "",
                                      component_name: str = "", property_name: str = "") -> str:
         """Assign (or clear) the StateTree asset on a Blueprint's UStateTreeComponent template via the C++ #18
         handler (locates the FStateTreeReference property by type and repoints it). Reversible.
@@ -1180,7 +1180,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_statetree_color(ctx, asset_path: str, state_name: str, color: str) -> str:
+    def set_state_tree_color(ctx, asset_path: str, state_name: str, color: str) -> str:
         """Set a state's editor color by referencing a palette color via the C++ #18 handler. Reversible.
 
         color: a palette color DisplayName (case-insensitive), or 'default' for the default/no color, or a
@@ -1208,7 +1208,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def get_statetree_parameters(ctx, asset_path: str) -> str:
+    def get_state_tree_parameters(ctx, asset_path: str) -> str:
         """List a StateTree's root parameters (FInstancedPropertyBag) via the C++ #18 reader. Read-only.
         Returns parameters[] {name, type, id, value} + parameters_guid (the source struct id for bindings)."""
         try:
@@ -1217,7 +1217,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_statetree_parameter(ctx, asset_path: str, name: str, type_name: str) -> str:
+    def add_state_tree_parameter(ctx, asset_path: str, name: str, type_name: str) -> str:
         """Add a root parameter to a StateTree's property bag via the C++ #18 handler. Reversible.
 
         type_name: bool|byte|int|int64|float|double|name|string|text | vector|vector2|vector4|rotator|quat|
@@ -1235,7 +1235,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_statetree_parameter(ctx, asset_path: str, name: str, value: str) -> str:
+    def set_state_tree_parameter(ctx, asset_path: str, name: str, value: str) -> str:
         """Set a root parameter's value (serialized-string) via the C++ #18 handler. Reversible.
         Undo op st_set_parameter restores the captured prior serialized value."""
         try:
@@ -1251,7 +1251,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def remove_statetree_parameter(ctx, asset_path: str, name: str) -> str:
+    def remove_state_tree_parameter(ctx, asset_path: str, name: str) -> str:
         """Remove a root parameter via the C++ #18 handler (captures its type + value). Reversible for
         scalar types (undo re-adds then sets the value); struct/enum/object type-objects are not round-tripped.
         Undo op st_remove_parameter re-adds the parameter and restores its value."""
@@ -1268,7 +1268,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def add_statetree_binding(ctx, asset_path: str, source_struct_id: str, source_path: str,
+    def add_state_tree_property_binding(ctx, asset_path: str, source_struct_id: str, source_path: str,
                               target_struct_id: str, target_path: str) -> str:
         """Add a property binding (source -> target) to a StateTree's editor bindings via the C++ #18 handler.
         Reversible. struct ids are GUIDs (parameters_guid from get_statetree_parameters, or a node/state id).
@@ -1287,7 +1287,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def remove_statetree_binding(ctx, asset_path: str, target_struct_id: str, target_path: str) -> str:
+    def remove_state_tree_binding(ctx, asset_path: str, target_struct_id: str, target_path: str) -> str:
         """Remove the property binding at a target path via the C++ #18 handler. Reversible: the source is
         captured (via the C++ bindings reader) BEFORE removal so the undo can re-add it.
         Undo op st_remove_binding re-adds the captured source->target binding."""
@@ -1315,7 +1315,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def compile_statetree(ctx, asset_path: str) -> str:
+    def compile_state_tree(ctx, asset_path: str) -> str:
         """Compile a StateTree via the C++ #18 handler (UStateTreeEditingSubsystem::CompileStateTree — the
         canonical headless compile). NOT a reversible edit (regenerates compiled data), so NOT ledgered.
         Returns {compiled, error_count, warning_count, messages[]}."""
@@ -1327,7 +1327,7 @@ else:
     # ==================== C++ #21: the last 3 StateTree features -> 100% ==================== #
 
     @mcp.tool()
-    def get_statetree_binding_sources(ctx, asset_path: str, target_struct_id: str) -> str:
+    def list_state_tree_binding_candidates(ctx, asset_path: str, target_struct_id: str) -> str:
         """List the valid binding SOURCES for a target struct (root/state parameters, evaluators, global tasks,
         preceding tasks, context data...) via the C++ #21 handler (UStateTreeEditorData::GetBindableStructs).
         Read-only. target_struct_id = a node/state/parameters GUID (from get_statetree_parameters / a node id).
@@ -1339,7 +1339,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def bind_statetree_task_completion(ctx, asset_path: str, source_task_id: str, target_struct_id: str,
+    def add_state_tree_task_completion_binding(ctx, asset_path: str, source_task_id: str, target_struct_id: str,
                                        target_path: str, condition: str = "completes") -> str:
         """Bind a TASK's completion (a generated delegate) to a target listener path via the C++ #21 handler
         (FStateTreeEditorPropertyBindings::AddTaskCompletionBinding). Reversible.
@@ -1360,7 +1360,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def bind_statetree_delegate(ctx, asset_path: str, dispatcher_struct_id: str, dispatcher_path: str,
+    def add_state_tree_delegate_binding(ctx, asset_path: str, dispatcher_struct_id: str, dispatcher_path: str,
                                 listener_struct_id: str, listener_path: str) -> str:
         """Bind a delegate DISPATCHER (source) to a LISTENER (target) via the C++ #21 handler (a property binding
         of an FStateTreeDelegateDispatcher-typed source path to an FStateTreeDelegateListener-typed target path).

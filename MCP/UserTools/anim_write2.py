@@ -636,7 +636,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_montage_slot(ctx, montage_path: str, slot_name: str) -> str:
+    def add_montage_slot_track(ctx, montage_path: str, slot_name: str) -> str:
         """Add a named animation SLOT track to an AnimMontage. Ledgered write.
 
         montage_path: object path of an AnimMontage.
@@ -711,7 +711,7 @@ else:
 '''
 
     @mcp.tool()
-    def add_montage_segment(ctx, montage_path: str, slot_name: str, animation: str,
+    def add_montage_slot_segment(ctx, montage_path: str, slot_name: str, animation: str,
                             play_rate: float = 1.0, loop_count: int = 1) -> str:
         """Append an animation segment to a montage slot's timeline. Ledgered write.
 

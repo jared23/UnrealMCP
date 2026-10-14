@@ -275,7 +275,7 @@ gc.collect()
     # validate_niagara_graph                                              #
     # ------------------------------------------------------------------ #
     @mcp.tool()
-    def validate_niagara_graph(ctx, system_path: str) -> str:
+    def validate_niagara_system_compile(ctx, system_path: str) -> str:
         """Validate a NiagaraSystem's graph by compiling it and reporting a pass/fail verdict. Read-oriented
         (compiles to validate; no save, no ledger).
 

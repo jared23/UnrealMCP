@@ -839,7 +839,7 @@ else:
 '''
 
     @mcp.tool()
-    def list_rig_modules(ctx, asset_path: str) -> str:
+    def list_installed_rig_modules(ctx, asset_path: str) -> str:
         """List the modules installed on a MODULAR Control Rig (READ-ONLY).
 
         asset_path: ControlRigBlueprint path.
@@ -887,7 +887,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "filter": (PARAMS.get("filte
 '''
 
     @mcp.tool()
-    def list_rig_module_assets(ctx, filter: str = None, detailed: bool = False,
+    def find_rig_module_assets(ctx, filter: str = None, detailed: bool = False,
                                only_modules: bool = False) -> str:
         """List Control Rig assets in the project (optionally only module assets) via the Asset Registry
         (READ-ONLY).

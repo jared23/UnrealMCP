@@ -194,7 +194,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def get_blueprint_variable_flags(ctx, blueprint_path: str, var_name: str) -> str:
+    def get_blueprint_variable_flags_raw(ctx, blueprint_path: str, var_name: str) -> str:
         """Read a member variable's flags (setters exist but had no getters): instance_editable /
         blueprint_read_only / expose_on_spawn / private / expose_to_cinematics / config_variable / category /
         replication. Read-only. Unblocks reversible flag setters."""

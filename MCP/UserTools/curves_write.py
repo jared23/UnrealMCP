@@ -322,7 +322,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_curve_keys(ctx, curve_path: str, channels: list) -> str:
+    def set_curve_asset_keys(ctx, curve_path: str, channels: list) -> str:
         """Author (overwrite) keyframes on a curve asset. REQUIRES the C++ #4 handler
         (unreal.MCPReflectionLibrary.set_curve_keys_json) -- the curve's FRichCurve is protected to
         stock Python. Returns a clear error if the plugin DLL predates C++ #4.

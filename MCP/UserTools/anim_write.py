@@ -541,7 +541,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_anim_curve_key(ctx, anim_path: str, curve_name: str, time: float, value: float) -> str:
+    def set_anim_sequence_curve_key(ctx, anim_path: str, curve_name: str, time: float, value: float) -> str:
         """Add or overwrite a FLOAT curve key on an AnimSequence / AnimMontage curve (the curve is
         created if it does not exist). Ledgered write.
 

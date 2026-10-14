@@ -652,7 +652,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_pcg_node_type_info(ctx, class_name: str, max_depth: int = 1,
+    def get_pcg_settings_class_info(ctx, class_name: str, max_depth: int = 1,
                                max_properties: int = 300) -> str:
         """Reflect a PCG node type's settings CLASS default object: its UPROPERTYs (values), split
         into node-specific vs inherited-from-PCGSettings. Read-only, no ledger.

@@ -41,3 +41,7 @@ docs/drafts/
 # Transient build/debug artifacts (never public)
 *.deferred_crash
 Build Errors*.txt
+
+# Windows Explorer folder metadata (junk)
+desktop.ini
+**/desktop.ini

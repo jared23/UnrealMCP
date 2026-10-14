@@ -445,7 +445,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_world_settings(ctx, filter: str = None, max_results: int = None,
+    def get_world_settings_actor(ctx, filter: str = None, max_results: int = None,
                            cursor: int = 0, max_depth: int = 1) -> str:
         """Dump the active level's WorldSettings (AWorldSettings actor) via reflection. Read-only.
 

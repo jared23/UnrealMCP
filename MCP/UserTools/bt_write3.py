@@ -306,7 +306,7 @@ else:
 '''
 
     @mcp.tool()
-    def connect_bt_nodes(ctx, bt_path: str, node_path: str, new_parent_path: str = "root",
+    def connect_behavior_tree_nodes(ctx, bt_path: str, node_path: str, new_parent_path: str = "root",
                          new_index: int = -1) -> str:
         """Re-parent an existing BehaviorTree child node (composite or task) under a new composite parent.
 
@@ -382,7 +382,7 @@ else:
 '''
 
     @mcp.tool()
-    def create_bt_node_blueprint(ctx, name: str, kind: str = "task",
+    def create_behavior_tree_node_blueprint(ctx, name: str, kind: str = "task",
                                  package_path: str = "/Game/MCP_Scratch",
                                  parent_class: str = None) -> str:
         """Create a Blueprint subclass of a BehaviorTree *_BlueprintBase node class (task/service/decorator).

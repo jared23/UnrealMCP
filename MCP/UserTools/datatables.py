@@ -303,7 +303,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_data_table_info(ctx, data_table_path: str) -> str:
+    def get_data_table_overview(ctx, data_table_path: str) -> str:
         """Summarize a DataTable: its row struct (name + path), row count, all row names,
         and column names (both display/export names and mangled internal UPROPERTY names).
         Read-only.
@@ -391,7 +391,7 @@ else:
 '''
 
     @mcp.tool()
-    def get_data_table_schema(ctx, data_table_path: str) -> str:
+    def get_data_table_columns(ctx, data_table_path: str) -> str:
         """Get a DataTable's column schema: for each column its display/export name, mangled
         internal UPROPERTY name, and type. Read-only.
 

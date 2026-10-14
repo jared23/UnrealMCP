@@ -228,7 +228,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "channels_requested": channe
 '''
 
     @mcp.tool()
-    def performance_start_trace(ctx, channels_or_preset: str = "default", file_path: str = "") -> str:
+    def performance_trace_start(ctx, channels_or_preset: str = "default", file_path: str = "") -> str:
         """Start an Unreal Insights trace: enable channels then write to a .utrace file. NON-reversible
         (not ledgered -- trace state is engine session state).
 
@@ -271,7 +271,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "stop_output": lines,
 '''
 
     @mcp.tool()
-    def performance_stop_trace(ctx) -> str:
+    def performance_trace_stop(ctx) -> str:
         """Stop the active Unreal Insights trace (Trace.Stop). NON-reversible (not ledgered).
 
         Ends any running trace connection and finalizes the .utrace file. Returns whether the engine

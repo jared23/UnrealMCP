@@ -302,7 +302,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "class": "UserDefinedStruct"
 '''
 
     @mcp.tool()
-    def list_blueprint_structs(ctx, filter: str = None, path_filter: str = None,
+    def list_blueprint_struct_assets(ctx, filter: str = None, path_filter: str = None,
                                max_results: int = None, cursor: int = 0) -> str:
         """List UserDefinedStruct (Blueprint struct) assets in the project. Read-only.
 
@@ -372,7 +372,7 @@ print("@@UMCP@@" + json.dumps({"status": "success", "total": total,
 '''
 
     @mcp.tool()
-    def find_structs(ctx, filter: str = None, include_in_use_native: bool = False,
+    def search_struct_types(ctx, filter: str = None, include_in_use_native: bool = False,
                      max_results: int = None) -> str:
         """Find struct types. Read-only.
 

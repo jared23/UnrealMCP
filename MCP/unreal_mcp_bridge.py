@@ -113,6 +113,39 @@ def _strip_ctx_wrapper(func):
     return wrapper
 
 
+def _init_domain_filter():
+    """Read UNREALMCP_DOMAINS and load the file->domain manifest.
+
+    Returns (requested_frozenset_or_None, resolve_fn_or_None). None means 'no filter'
+    -> register every tool exactly as before, so an unconfigured session is unchanged.
+    When set (e.g. UNREALMCP_DOMAINS="anim,rig,world"), only tools whose domain is in
+    the set are registered; 'core' is always included whether or not it is listed.
+    """
+    raw = os.environ.get("UNREALMCP_DOMAINS", "").strip()
+    if not raw or raw.lower() in ("*", "all"):
+        return None, None
+    # 'core' is an explicit domain, not auto-added, so every tool lives in exactly one
+    # server (per the spec). Self-contained workflow entries list 'core' themselves.
+    requested = frozenset(
+        d.strip().lower() for d in raw.replace(";", ",").split(",") if d.strip()
+    )
+    dm = None
+    try:
+        import domain_manifest as dm  # MCP dir is on sys.path when run from there
+    except Exception:
+        try:
+            _mp = os.path.join(os.path.dirname(__file__), "domain_manifest.py")
+            _spec = importlib.util.spec_from_file_location("domain_manifest", _mp)
+            dm = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(dm)
+        except Exception as e:
+            print(f"UNREALMCP_DOMAINS={raw!r} set but domain_manifest.py failed to load "
+                  f"({e}); loading ALL tools.", file=sys.stderr)
+            return None, None
+    print(f"[UnrealMCP] domain filter active: {sorted(requested)}", file=sys.stderr)
+    return requested, dm.resolve_domain
+
+
 class _ToolShim:
     """FastMCP-compatible facade over MCPServer. The Commands/ and UserTools/ modules register
     via `@mcp.tool()`; this captures those registrations and, on run(), adds ctx-stripped
@@ -121,6 +154,10 @@ class _ToolShim:
     def __init__(self, real):
         self._real = real
         self._captured = []
+        # Optional domain filter (UNREALMCP_DOMAINS). None -> register everything.
+        self._requested, self._resolve = _init_domain_filter()
+        # Optional router mode (UNREALMCP_ROUTERS): collapse verb families into per-domain routers.
+        self._routers = os.environ.get("UNREALMCP_ROUTERS", "").strip().lower() in ("1", "true", "yes", "on")
 
     def tool(self, *args, **kwargs):
         name = kwargs.get("name")
@@ -131,15 +168,65 @@ class _ToolShim:
             return fn
         return deco
 
+    def _flush_routers(self):
+        """Router mode: register per-domain enum routers instead of individual tools."""
+        try:
+            import mcp_routers
+        except Exception:
+            _mp = os.path.join(os.path.dirname(__file__), "mcp_routers.py")
+            _spec = importlib.util.spec_from_file_location("mcp_routers", _mp)
+            mcp_routers = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(mcp_routers)
+        resolve = self._resolve
+        if resolve is None:
+            try:
+                import domain_manifest as _dm
+            except Exception:
+                _mp = os.path.join(os.path.dirname(__file__), "domain_manifest.py")
+                _spec = importlib.util.spec_from_file_location("domain_manifest", _mp)
+                _dm = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_dm)
+            resolve = _dm.resolve_domain
+        groups = mcp_routers.build_router_groups(self._captured, resolve, self._requested)
+        added = 0
+        for (domain, rverb), entries in sorted(groups.items()):
+            router, desc = mcp_routers.make_router(domain, rverb, entries)
+            self._real.add_tool(router, name=router.__name__, description=desc)
+            added += 1
+        self._captured = []
+        print(f"[UnrealMCP] router mode: {added} routers "
+              f"(domains={sorted(self._requested) if self._requested else 'all'})", file=sys.stderr)
+
     def flush(self):
+        if self._routers:
+            self._flush_routers()
+            return
+        added = 0
+        skipped = 0
         for fn, name, description in self._captured:
+            tool_name = name or fn.__name__
+            if self._requested is not None and self._resolve is not None:
+                # Resolve on the ORIGINAL fn (its __code__ points at the real tool file);
+                # the ctx-stripped wrapper below would point at this bridge instead.
+                try:
+                    co = getattr(fn, "__code__", None)
+                    domain = self._resolve(co.co_filename if co is not None else "", tool_name)
+                except Exception:
+                    domain = "misc"
+                if domain not in self._requested:
+                    skipped += 1
+                    continue
             wrapper = _strip_ctx_wrapper(fn)
             self._real.add_tool(
                 wrapper,
-                name=name or fn.__name__,
+                name=tool_name,
                 description=description or (fn.__doc__ or "").strip() or None,
             )
+            added += 1
         self._captured = []
+        if self._requested is not None:
+            print(f"[UnrealMCP] registered {added} tools, skipped {skipped} "
+                  f"(domains={sorted(self._requested)})", file=sys.stderr)
 
     def run(self, *args, **kwargs):
         self.flush()

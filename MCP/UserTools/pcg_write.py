@@ -1034,7 +1034,7 @@ else:
 '''
 
     @mcp.tool()
-    def set_pcg_subgraph_target(ctx, graph_path: str, node_name: str, subgraph: str) -> str:
+    def set_pcg_subgraph_node_graph(ctx, graph_path: str, node_name: str, subgraph: str) -> str:
         """Set the target graph of a PCG subgraph node (PCGSubgraphSettings.set_subgraph). Captures
         the prior target. Ledgered write (op 'pcg_set_subgraph' -> `undo` restores it).
 

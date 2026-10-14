@@ -531,7 +531,7 @@ else:
             return f"Error: {e}"
 
     @mcp.tool()
-    def set_widget_slot_property(ctx, wbp_path: str, widget_name: str, property: str, value=None) -> str:
+    def set_widget_layout_slot_property(ctx, wbp_path: str, widget_name: str, property: str, value=None) -> str:
         """Set a LAYOUT/SLOT property on a widget's panel slot (its position within its parent panel).
         Pure Python (dual method-getter/setter + editor-property path covering CanvasPanelSlot and
         box/overlay slots). Compiles + saves the WidgetBlueprint after.
