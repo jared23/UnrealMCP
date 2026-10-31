@@ -122,6 +122,11 @@ def _load(path):
         return None, "no asset path given"
     obj = _try(lambda: unreal.EditorAssetLibrary.load_asset(path))
     if obj is None:
+        # EditorAssetLibrary.load_asset refuses while PIE is running; the core loaders work during PIE.
+        obj = _try(lambda: unreal.load_asset(path))
+    if obj is None:
+        obj = _try(lambda: unreal.load_object(None, path))
+    if obj is None:
         return None, "asset not found or failed to load: %s" % path
     return obj, None
 def _round(x, n=6):

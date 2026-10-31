@@ -169,6 +169,11 @@ _fnmap = {
     "set_transition_rule": "set_anim_transition_rule",
     "setup_speed_from_velocity": "setup_anim_speed_from_velocity",
     "set_state_playrate_from_var": "set_state_anim_play_rate_from_variable",
+    # C++ #60 blendspace-in-state + montage slot
+    "set_state_blend_space": "set_state_blend_space",
+    "insert_anim_slot": "insert_anim_slot",
+    # C++ #61 general AnimGraph node insertion (aim offset / layered blend per bone)
+    "insert_anim_graph_node": "insert_anim_graph_node",
 }
 _rl = getattr(unreal, "MCPReflectionLibrary", None)
 _fn = _fnmap.get(_action)
@@ -232,6 +237,15 @@ else:
                 _res = json.loads(_rl.setup_anim_speed_from_velocity(_abp, PARAMS["variable"]))
             elif _action == "set_state_playrate_from_var":
                 _res = json.loads(_rl.set_state_anim_play_rate_from_variable(_abp, PARAMS["machine"], PARAMS["state"], PARAMS["variable"], float(PARAMS["divisor"])))
+            elif _action == "set_state_blend_space":
+                _res = json.loads(_rl.set_state_blend_space(_abp, PARAMS["machine"], PARAMS["state"], PARAMS["blend_space"], PARAMS.get("x_variable") or "", PARAMS.get("y_variable") or "", PARAMS.get("play_rate_variable") or ""))
+            elif _action == "insert_anim_slot":
+                _res = json.loads(_rl.insert_anim_slot(_abp, PARAMS.get("slot_name") or ""))
+            elif _action == "insert_anim_graph_node":
+                _res = json.loads(_rl.insert_anim_graph_node(_abp, PARAMS["node_class"],
+                    PARAMS.get("properties_json") or "", PARAMS.get("pin_bindings_json") or "",
+                    PARAMS.get("branch_filter_bone") or "", int(PARAMS.get("branch_filter_depth") or 0),
+                    PARAMS.get("blend_source_node_guid") or ""))
             else:
                 _res = {"status": "error", "error": "unknown action: %s" % _action}
         if _is_err(_res):
@@ -662,6 +676,96 @@ else:
         driver). Returns {expression, pin_exposed, wired}."""
         return _run("set_state_playrate_from_var", {"anim_blueprint_path": anim_blueprint_path, "machine": machine,
                                                     "state": state, "variable": variable, "divisor": divisor, "save": save})
+
+    # ================================================================== #
+    # 19) set_state_blend_space  (C++ #60 blendspace locomotion)          #
+    # ================================================================== #
+    @mcp.tool()
+    def set_state_blend_space(ctx, anim_blueprint_path: str, machine: str, state: str, blend_space_path: str,
+                              x_variable: str = "", y_variable: str = "", play_rate_variable: str = "",
+                              save: bool = True) -> str:
+        """Fill a state with a Blend Space Player wired to the state's Result pose — the set_state_anim
+        counterpart for a BlendSpace asset (set_state_anim only makes a Sequence Player, which fails on a
+        BlendSpace). Binds the blend space's X / Y sample-coordinate pins and its Play Rate pin to AnimBP
+        member variables so the blend follows gameplay (e.g. X=Speed, Y=Direction). Idempotent (reuses an
+        existing Blend Space Player in the state; drops any prior Sequence Player so seq->blendspace swaps
+        cleanly, and rebuilds the variable drivers).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        machine/state:       existing state-machine + state names.
+        blend_space_path:    the BlendSpace (or BlendSpace1D) asset, e.g.
+                             '/Game/Aimon/Emberkit/BS_Emberkit_Locomotion.BS_Emberkit_Locomotion'.
+        x_variable:          AnimBP float member driving the X axis (e.g. 'Speed'); '' leaves X at its default.
+        y_variable:          AnimBP float member driving the Y axis (e.g. 'Direction'); '' for a 1D blendspace.
+        play_rate_variable:  AnimBP float member driving Play Rate (e.g. 'LocomotionPlayRate'); '' to leave it 1.0.
+        save:                persist the AnimBP package (default True; NOT a compile).
+
+        Calls MCPReflectionLibrary.set_state_blend_space (C++ #60). Returns {blend_space,
+        blend_space_player_guid, connected_to_result, and x_bound/y_bound/play_rate_bound for each bound pin}."""
+        return _run("set_state_blend_space", {"anim_blueprint_path": anim_blueprint_path, "machine": machine,
+                                              "state": state, "blend_space": blend_space_path,
+                                              "x_variable": x_variable, "y_variable": y_variable,
+                                              "play_rate_variable": play_rate_variable, "save": save})
+
+    # ================================================================== #
+    # 20) insert_anim_slot  (C++ #60 montage slot)                        #
+    # ================================================================== #
+    @mcp.tool()
+    def insert_anim_slot(ctx, anim_blueprint_path: str, slot_name: str = "DefaultSlot", save: bool = True) -> str:
+        """Splice a montage Slot node between whatever currently feeds the AnimGraph Output Pose and the
+        Output Pose, so slot/montage playback (the AM_* montages played by gameplay) layers over the
+        locomotion pose. Without a Slot node in the AnimGraph, PlayMontage/PlaySlotAnimation produce nothing.
+        Idempotent (reuses a Slot of the same name; if already spliced it only re-confirms the wiring).
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        slot_name:           the slot name (default 'DefaultSlot'; montages reference it as
+                             '<Group>.<Slot>', e.g. 'DefaultGroup.DefaultSlot'). The group/slot registry
+                             lives on the skeleton; this names the node's slot.
+        save:                persist the AnimBP package (default True).
+
+        Calls MCPReflectionLibrary.insert_anim_slot (C++ #60). Returns {slot_name, slot_node_guid,
+        reused_existing, source_wired, output_wired}."""
+        return _run("insert_anim_slot", {"anim_blueprint_path": anim_blueprint_path, "slot_name": slot_name, "save": save})
+
+    # ================================================================== #
+    # 21) insert_anim_graph_node  (C++ #61 general node insertion)        #
+    # ================================================================== #
+    @mcp.tool()
+    def insert_anim_graph_node(ctx, anim_blueprint_path: str, node_class: str, properties: dict = None,
+                               pin_bindings: dict = None, branch_filter_bone: str = "",
+                               branch_filter_depth: int = 0, blend_source_node_guid: str = "",
+                               save: bool = True) -> str:
+        """Splice a general overlay node into the AnimGraph between whatever currently feeds the Output Pose
+        and the Output Pose — the counterpart to insert_anim_slot for non-slot nodes (Aim Offset Player,
+        Layered Blend Per Bone, Apply Additive, etc.). set_state_blend_space only works INSIDE a state; this
+        places a node at the AnimGraph's top level.
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        node_class:          friendly name ('AimOffset' | 'LayeredBoneBlend' | 'BlendSpacePlayer' | 'Slot')
+                             or a class path ('/Script/AnimGraph.AnimGraphNode_ApplyAdditive').
+        properties:          dict of {property: value} set on the node's embedded FAnimNode struct via
+                             ImportText (e.g. {'bMeshSpaceRotationBlend': True}); the special key 'asset' sets
+                             the blendspace/sequence on asset-player nodes (e.g. an aim-offset BlendSpace).
+        pin_bindings:        dict of {pin_name: anim_variable} wiring each input pin to a VariableGet
+                             (e.g. {'X': 'HeadYaw', 'Y': 'HeadPitch', 'Alpha': 'AimAlpha'}).
+        branch_filter_bone:  for a Layered Blend Per Bone, add one blend layer filtered from this bone
+                             (e.g. 'neck_01' so the layer only affects the head/spine from the neck down-tree).
+        branch_filter_depth: blend depth for that branch filter (0 = from the bone, deeper = fade over N bones).
+        blend_source_node_guid: feed another node's output pose into this node's BLEND pose input — the
+                             aim-offset -> layered-blend link (pass the aim-offset node's guid).
+        save:                persist the AnimBP package (default True; NOT a compile).
+
+        Calls MCPReflectionLibrary.insert_anim_graph_node (C++ #61). Typical head-layer recipe: (1) insert an
+        'AimOffset' with asset + X/Y bound to head yaw/pitch (captures its node_guid); (2) insert a
+        'LayeredBoneBlend' with branch_filter_bone='neck_01' and blend_source_node_guid=<the aim-offset guid>
+        so the aim offset layers over locomotion only from the neck. Returns {node_class, node_guid,
+        base_wired, output_wired, asset?, branch_filter_bone?, bound_pins?}."""
+        return _run("insert_anim_graph_node", {
+            "anim_blueprint_path": anim_blueprint_path, "node_class": node_class,
+            "properties_json": json.dumps(properties or {}),
+            "pin_bindings_json": json.dumps(pin_bindings or {}),
+            "branch_filter_bone": branch_filter_bone, "branch_filter_depth": branch_filter_depth,
+            "blend_source_node_guid": blend_source_node_guid, "save": save})
 
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. The 13 op inverses
     # above are reported to the coordinator to fold into editor_level.undo (see module docstring / report).

@@ -779,10 +779,21 @@ else:
     _LOG_TAIL_BODY = r'''
 import unreal, os, json
 d = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_log_dir())
+# Pick the engine's OWN log (<ProjectName>.log), not whatever .log os.listdir returns first (the
+# embedded browser's cef3.log sorted ahead of Project_Aimon.log, 2026-10-19). Fall back to the
+# most-recently-written non-backup .log.
 main = None
-for f in os.listdir(d):
-    if f.endswith(".log") and "-backup-" not in f:
-        main = os.path.join(d, f); break
+proj = None
+try:
+    proj = os.path.splitext(os.path.basename(unreal.Paths.get_project_file_path()))[0]
+except Exception:
+    proj = None
+cands = [f for f in os.listdir(d) if f.endswith(".log") and "-backup-" not in f]
+if proj and (proj + ".log") in cands:
+    main = os.path.join(d, proj + ".log")
+elif cands:
+    cands.sort(key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)
+    main = os.path.join(d, cands[0])
 unreal.log_flush()
 lines = []
 if main:

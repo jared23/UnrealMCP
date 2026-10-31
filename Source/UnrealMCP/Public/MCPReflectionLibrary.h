@@ -1091,6 +1091,70 @@ public:
     static FString SetStateAnimPlayRateFromVariable(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
                                                     const FString& StateName, const FString& VariableName, float Divisor);
 
+    /** #60: fill a state with a UAnimGraphNode_BlendSpacePlayer wired to the state Result (the set_state_anim
+     *  counterpart for a BlendSpace — set_state_anim only makes a Sequence Player). Binds the X / Y sample
+     *  coordinate pins and the Play Rate pin to member variables (each optional; pass "" to skip). Idempotent
+     *  (reuses an existing Blend Space Player, drops any prior Sequence Player / driver nodes). Returns
+     *  {blend_space, blend_space_player_guid, connected_to_result, x_bound?, y_bound?, play_rate_bound?}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString SetStateBlendSpace(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                      const FString& StateName, const FString& BlendSpacePath,
+                                      const FString& XVariable, const FString& YVariable,
+                                      const FString& PlayRateVariable);
+
+    /** #60: splice a UAnimGraphNode_Slot (montage slot, e.g. "DefaultSlot") between whatever currently feeds
+     *  the AnimGraph Output Pose and the Output Pose, so slot/montage playback (AM_* montages) layers over the
+     *  locomotion pose. Idempotent (reuses a slot node of the same SlotName, and no-ops the source rewire if
+     *  already spliced). Returns {slot_name, slot_node_guid, reused_existing, source_wired, output_wired}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InsertAnimSlot(UAnimBlueprint* AnimBlueprint, const FString& SlotName);
+
+    /** #61: splice a general overlay node (Aim Offset Player, Layered Blend Per Bone, or any
+     *  UAnimGraphNode_Base) between whatever feeds the AnimGraph Output Pose and the Output Pose.
+     *  NodeClass: friendly name ("AimOffset"/"LayeredBoneBlend"/...) or a class path. PropertiesJson:
+     *  {prop:value} onto the node's embedded FAnimNode struct, plus a special "asset" key (sets the
+     *  blendspace/sequence on asset-player nodes). PinBindingsJson: {pinName:variable} bound via VariableGet
+     *  (X/Y/Alpha/...). BranchFilterBone/Depth: for a Layered Blend, add one layer filtered from that bone.
+     *  BlendSourceNodeGuid: feed that node's output into this node's blend pose (the aim-offset->layer link).
+     *  Returns {node_class, node_guid, base_wired, output_wired, asset?, branch_filter_bone?, bound_pins?}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString InsertAnimGraphNode(UAnimBlueprint* AnimBlueprint, const FString& NodeClass,
+                                       const FString& PropertiesJson, const FString& PinBindingsJson,
+                                       const FString& BranchFilterBone, int32 BranchFilterDepth,
+                                       const FString& BlendSourceNodeGuid);
+
+    // ==== C++ #61 (Companion-Game content gaps, MCPReflection_ContentGaps.cpp) ====
+    /** #61: run the Persona editor's ValidateSampleData()+ResampleData() so a script-built blend space gets
+     *  its runtime BlendSpaceData (1D Segments / 2D Triangles) — without it a tool-added sample outputs the
+     *  bind pose. Returns {blend_space, sample_count, is_1d}. Save the asset to persist. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString ResampleBlendSpace(const FString& BlendSpacePath);
+
+    /** #61: auto-generate per-bone bodies on a skeletal mesh's physics asset
+     *  (FPhysicsAssetUtils::CreateFromSkeletalMesh), optionally keeping only a bone whitelist. ParamsJson
+     *  (optional): {geom_type:capsule|sphere|box, min_bone_size, body_for_all, create_constraints,
+     *  disable_collision_by_default, auto_orient}. KeepBonesJson: JSON array of bone names ("" or [] = keep
+     *  all). Returns {physics_asset, body_count, constraint_count, bodies[], removed_bodies?}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString RegeneratePhysicsAsset(const FString& SkeletalMeshPath, const FString& ParamsJson, const FString& KeepBonesJson);
+
+    /** #61: add ONE capsule/sphere/box body for a bone to a physics asset (FPhysicsAssetUtils::CreateNewBody
+     *  + AggGeom element). Shape: capsule|sphere|box. CenterJson: optional [x,y,z] local offset. Returns
+     *  {physics_asset, bone, shape, body_index, body_count}. Save the asset to persist. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CreatePhysicsBody(const FString& PhysicsAssetPath, const FString& BoneName,
+                                     const FString& Shape, float Radius, float Length, const FString& CenterJson);
+
+    /** #61: dialog-free dependency-aware copy. SourcesJson: JSON array of object paths. FolderMapJson: map of
+     *  src-package-prefix -> dst-package-prefix (longest match wins). SourceRoot: only hard deps under this
+     *  package root are copied (soft refs reported). bStripTestPrefix strips a "_PT_" tag from copy names.
+     *  AdvancedCopyPackages re-points copies at each other; copied Niagara systems are recompiled + saved.
+     *  bDryRun returns the plan without copying. Returns {package_count, plan[], soft_refs_left_in_place[],
+     *  niagara_recompiled?} or {status:error, unmapped[]}. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString CopyAssetsWithDependencies(const FString& SourcesJson, const FString& FolderMapJson,
+                                              const FString& SourceRoot, bool bStripTestPrefix, bool bDryRun);
+
     // ==== C++ #19 2026-08-18 batch — Blueprint interfaces + var-flags (MCPReflection_BlueprintExt.cpp),
     //      AnimGraph removers (MCPReflection_AnimRemove.cpp), Niagara renderer/emitter (MCPReflection_NiagaraExt.cpp).
     //      NO Build.cs change (all modules already deps). EnsureStateTreeEditorData decl is up in the StateTree block. ====

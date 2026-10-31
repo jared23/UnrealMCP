@@ -643,3 +643,124 @@ def register_tools(mcp, utils):
                                "checked": candidates}, indent=2)
         except Exception as e:
             return f"Error: {e}"
+
+    # ---- #61 resample_blend_space -------------------------------------------------
+    @mcp.tool()
+    def resample_blend_space(ctx, blend_space_path: str, save: bool = True) -> str:
+        """Rebuild a blend space's runtime data so it actually plays. A blend space whose samples were added
+        by script (add_blend_space_sample) has NO BlendSpaceData (1D Segments / 2D Triangles) until the
+        Persona editor's ResampleData() runs, so its Blend Space Player outputs the BIND POSE at every input.
+        This runs ValidateSampleData()+ResampleData() (what the editor does) directly — no need to open each
+        asset. Call after adding/removing samples. blend_space_path: the BlendSpace/BlendSpace1D object path.
+        save: save the asset after (default True). Requires the C++ #61 handler. Returns {sample_count, is_1d}."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "if mrl is None or not hasattr(mrl, 'resample_blend_space'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #61 resample_blend_space unavailable — recompile the plugin'}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.resample_blend_space(PARAMS['path']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try: r['saved'] = bool(unreal.EditorAssetLibrary.save_asset(PARAMS['path'], False))\n"
+            "        except Exception as _e: r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"path": blend_space_path, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ---- #61 regenerate_physics_asset ---------------------------------------------
+    @mcp.tool()
+    def regenerate_physics_asset(ctx, skeletal_mesh_path: str, geom_type: str = "capsule",
+                                 keep_bones: list = None, min_bone_size: float = 0.0,
+                                 create_constraints: bool = True, disable_collision_by_default: bool = True,
+                                 save: bool = True) -> str:
+        """Auto-generate per-bone collision bodies on a skeletal mesh's physics asset
+        (FPhysicsAssetUtils::CreateFromSkeletalMesh) — UE Python can't write physics-asset bodies
+        (SkeletalBodySetups is protected). Destroys existing bodies first, then one body per bone fitted to
+        the dominant-weight vertices. geom_type: 'capsule'|'sphere'|'box'. keep_bones: if given, keep ONLY
+        bodies whose bone is in this list (e.g. hurtbox bones) and destroy the rest. min_bone_size: skip bones
+        smaller than this. skeletal_mesh_path: the SkeletalMesh (must already have a physics asset assigned).
+        save: save the physics-asset package after. Requires the C++ #61 handler. Returns {physics_asset,
+        body_count, constraint_count, bodies[], removed_bodies?}."""
+        params_json = json.dumps({"geom_type": geom_type, "min_bone_size": float(min_bone_size),
+                                  "create_constraints": bool(create_constraints),
+                                  "disable_collision_by_default": bool(disable_collision_by_default)})
+        keep_json = json.dumps(keep_bones or [])
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "if mrl is None or not hasattr(mrl, 'regenerate_physics_asset'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #61 regenerate_physics_asset unavailable — recompile the plugin'}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.regenerate_physics_asset(PARAMS['mesh'], PARAMS['params'], PARAMS['keep']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok' and r.get('physics_asset'):\n"
+            "        try: r['saved'] = bool(unreal.EditorAssetLibrary.save_asset(r['physics_asset'], False))\n"
+            "        except Exception as _e: r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"mesh": skeletal_mesh_path, "params": params_json,
+                                           "keep": keep_json, "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ---- #61 create_physics_body --------------------------------------------------
+    @mcp.tool()
+    def create_physics_body(ctx, physics_asset_path: str, bone_name: str, shape: str = "capsule",
+                            radius: float = 10.0, length: float = 20.0, center: list = None,
+                            save: bool = True) -> str:
+        """Add ONE collision body for a bone to a physics asset (the surgical alternative to
+        regenerate_physics_asset). shape: 'capsule'|'sphere'|'box'. radius/length size the primitive (capsule:
+        radius+length; sphere: radius; box: radius->half-extents X/Y, length->Z). center: optional [x,y,z]
+        local offset. physics_asset_path: the PhysicsAsset object path. save: save after. Requires the C++ #61
+        handler. Returns {bone, shape, body_index, body_count}."""
+        center_json = json.dumps(center or [])
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "if mrl is None or not hasattr(mrl, 'create_physics_body'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #61 create_physics_body unavailable — recompile the plugin'}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.create_physics_body(PARAMS['pa'], PARAMS['bone'], PARAMS['shape'], float(PARAMS['radius']), float(PARAMS['length']), PARAMS['center']))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try: r['saved'] = bool(unreal.EditorAssetLibrary.save_asset(PARAMS['pa'], False))\n"
+            "        except Exception as _e: r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"pa": physics_asset_path, "bone": bone_name, "shape": shape,
+                                           "radius": radius, "length": length, "center": center_json,
+                                           "save": save}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ---- #61 copy_assets_with_dependencies ----------------------------------------
+    @mcp.tool()
+    def copy_assets_with_dependencies(ctx, sources: list, folder_map: dict, source_root: str = "",
+                                      strip_test_prefix: bool = False, dry_run: bool = True) -> str:
+        """Dependency-aware COPY of assets into new folders, with every copy re-pointed at the other copies
+        (never back at the sources) — duplicate_asset keeps references to the originals, and the engine's
+        Advanced Copy is a modal dialog with no rename. sources: list of object paths to promote. folder_map:
+        {src_package_prefix: dst_package_prefix} (longest match wins) applied to each copied package.
+        source_root: only hard deps UNDER this package root are copied (soft refs are reported, left in place);
+        '' copies the whole hard-dependency closure. strip_test_prefix: drop a '_PT_' tag from copy names.
+        Copied Niagara systems are recompiled + saved (they keep stale compiled data otherwise). dry_run
+        (default True) returns the from->to plan WITHOUT copying — run it first, then dry_run=False. Requires
+        the C++ #61 handler. Returns {package_count, plan[], soft_refs_left_in_place[], niagara_recompiled?}."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "if mrl is None or not hasattr(mrl, 'copy_assets_with_dependencies'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #61 copy_assets_with_dependencies unavailable — recompile the plugin'}))\n"
+            "else:\n"
+            "    print('@@UMCP@@' + mrl.copy_assets_with_dependencies(PARAMS['sources'], PARAMS['folders'], PARAMS['root'], bool(PARAMS['strip']), bool(PARAMS['dry'])))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"sources": json.dumps(sources or []),
+                                           "folders": json.dumps(folder_map or {}),
+                                           "root": source_root, "strip": strip_test_prefix,
+                                           "dry": dry_run}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"

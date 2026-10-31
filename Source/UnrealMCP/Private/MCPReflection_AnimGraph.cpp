@@ -74,6 +74,14 @@
 
 // --- C++ #59 (locomotion authoring): node types + K2 nodes for state anim / rules / speed drive ---
 #include "AnimGraphNode_SequencePlayer.h"           // UAnimGraphNode_SequencePlayer (fill a state)
+#include "AnimGraphNode_BlendSpacePlayer.h"         // UAnimGraphNode_BlendSpacePlayer (#60: blend space in a state)
+#include "AnimGraphNode_Slot.h"                      // UAnimGraphNode_Slot (#60: montage slot in the AnimGraph)
+#include "Animation/BlendSpace.h"                    // UBlendSpace (#60)
+#include "AnimGraphNode_RotationOffsetBlendSpace.h" // #61: Aim Offset Player
+#include "AnimGraphNode_LayeredBoneBlend.h"          // #61: Layered Blend Per Bone (AddPinToBlendByFilter)
+#include "AnimGraphNode_AssetPlayerBase.h"           // #61: SetAnimationAsset (virtual)
+#include "Animation/AnimationAsset.h"                // #61: UAnimationAsset
+#include "Animation/AnimData/BoneMaskFilter.h"       // #61: FInputBlendPose / FBranchFilter
 #include "AnimGraphNode_StateResult.h"              // UAnimGraphNode_StateResult (state's output pose)
 #include "AnimGraphNode_Root.h"                     // UAnimGraphNode_Root (AnimGraph Output Pose)
 #include "AnimGraphNode_TransitionResult.h"         // UAnimGraphNode_TransitionResult (rule bCanEnterTransition)
@@ -1304,5 +1312,466 @@ FString UMCPReflectionLibrary::SetStateAnimPlayRateFromVariable(UAnimBlueprint* 
     Obj->SetNumberField(TEXT("divisor"), Divisor);
     Obj->SetBoolField(TEXT("pin_exposed"), true);
     Obj->SetBoolField(TEXT("wired"), bWired);
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// ===========================================================================
+//  C++ #60 — Blend Space Player in a state + montage Slot in the AnimGraph
+//  (the last Companion-Game AnimGraph gap: finish ABP_Emberkit's blendspace
+//   locomotion + a DefaultSlot so the AM_Emberkit_* montages can play).
+// ===========================================================================
+namespace
+{
+    // Ensure an anim-node input pin named PropName exists + is visible, exposing it
+    // via the optional-pin array if it is hidden-by-default (e.g. PlayRate). X/Y on a
+    // BlendSpacePlayer are PinShownByDefault so FindPin resolves them directly.
+    UEdGraphPin* MCPAnimGraph_EnsurePinVisible(UAnimGraphNode_Base* Node, const TCHAR* PropName)
+    {
+        if (!Node) { return nullptr; }
+        if (UEdGraphPin* Existing = Node->FindPin(PropName, EGPD_Input)) { return Existing; }
+        int32 Index = INDEX_NONE;
+        for (int32 i = 0; i < Node->ShowPinForProperties.Num(); ++i)
+        {
+            if (Node->ShowPinForProperties[i].PropertyName == FName(PropName)) { Index = i; break; }
+        }
+        if (Index == INDEX_NONE) { return nullptr; }
+        Node->SetPinVisibility(true, Index);   // ANIMGRAPH_API — shows the pin + reconstructs
+        return Node->FindPin(PropName, EGPD_Input);
+    }
+
+    // Drop a self-member VariableGet and wire its value into Node's input pin PinName
+    // (exposing the pin if hidden). Empty VarName -> no-op (returns true: nothing asked).
+    // Returns false only if the pin/variable could not be resolved/linked.
+    bool MCPAnimGraph_BindVarToPin(UEdGraph* Graph, UAnimGraphNode_Base* Node,
+                                   const TCHAR* PinName, const FString& VarName, int32 PosYOffset)
+    {
+        if (VarName.IsEmpty()) { return true; }
+        UEdGraphPin* Pin = MCPAnimGraph_EnsurePinVisible(Node, PinName);
+        if (!Pin) { return false; }
+
+        UK2Node_VariableGet* VarGet = nullptr;
+        {
+            FGraphNodeCreator<UK2Node_VariableGet> C(*Graph);
+            VarGet = C.CreateNode(false);
+            VarGet->VariableReference.SetSelfMember(FName(*VarName));
+            C.Finalize();
+        }
+        UEdGraphPin* VarOut = VarGet ? VarGet->GetValuePin() : nullptr;
+        if (!VarOut) { return false; }
+        VarGet->NodePosX = Node->NodePosX - 420;
+        VarGet->NodePosY = Node->NodePosY + PosYOffset;
+
+        Pin->BreakAllPinLinks();
+        return MCPAnimGraph_Connect(Graph, VarOut, Pin);
+    }
+}
+
+// 19) SetStateBlendSpace — fill a state's bound graph with a Blend Space Player wired to the state
+//     Result, binding its X / Y / Play Rate pins to member variables. The set_state_anim counterpart
+//     for UAnimGraphNode_BlendSpacePlayer (set_state_anim only makes a Sequence Player). Idempotent.
+FString UMCPReflectionLibrary::SetStateBlendSpace(UAnimBlueprint* AnimBlueprint, const FString& MachineName,
+                                                  const FString& StateName, const FString& BlendSpacePath,
+                                                  const FString& XVariable, const FString& YVariable,
+                                                  const FString& PlayRateVariable)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UAnimGraphNode_StateMachineBase* SM = MCPAnimGraph_FindStateMachine(AnimBlueprint, MachineName);
+    if (!SM || !SM->EditorStateMachineGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State machine '%s' not found"), *MachineName)); }
+    UAnimStateNode* State = MCPAnimGraph_FindState(SM->EditorStateMachineGraph, StateName);
+    if (!State || !State->BoundGraph) { return MCPAnimGraph_Error(FString::Printf(TEXT("State '%s' not found"), *StateName)); }
+    UEdGraph* BoundGraph = State->BoundGraph;
+
+    UBlendSpace* BS = LoadObject<UBlendSpace>(nullptr, *BlendSpacePath);
+    if (!BS) { return MCPAnimGraph_Error(FString::Printf(TEXT("Could not load blend space '%s'"), *BlendSpacePath)); }
+
+    UAnimGraphNode_StateResult* ResultNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_StateResult>(BoundGraph);
+    if (!ResultNode) { return MCPAnimGraph_Error(TEXT("State bound graph has no result node")); }
+    UEdGraphPin* ResultIn = MCPAnimGraph_FindPosePin(ResultNode, EGPD_Input);
+    if (!ResultIn) { return MCPAnimGraph_Error(TEXT("State result node has no input pose pin")); }
+
+    BoundGraph->Modify();
+
+    // Idempotent rebuild: reuse an existing Blend Space Player; drop any prior Sequence Player
+    // (switching a state seq->blendspace) and any prior driver nodes (VariableGet / math calls).
+    UAnimGraphNode_BlendSpacePlayer* BSNode = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_BlendSpacePlayer>(BoundGraph);
+    {
+        TArray<UEdGraphNode*> ToRemove;
+        for (UEdGraphNode* N : BoundGraph->Nodes)
+        {
+            if (N->IsA<UAnimGraphNode_SequencePlayer>() ||
+                N->IsA<UK2Node_VariableGet>() || N->IsA<UK2Node_CallFunction>())
+            {
+                ToRemove.Add(N);
+            }
+        }
+        for (UEdGraphNode* N : ToRemove) { FBlueprintEditorUtils::RemoveNode(AnimBlueprint, N, /*bDontRecompile*/true); }
+    }
+
+    if (BSNode)
+    {
+        BSNode->Modify();
+        BSNode->SetAnimationAsset(BS);             // virtual -> Node.SetBlendSpace (vtable dispatch)
+        BSNode->CopySettingsFromAnimationAsset(BS); // sync bLoop from the asset
+        BSNode->ReconstructNode();
+    }
+    else
+    {
+        FGraphNodeCreator<UAnimGraphNode_BlendSpacePlayer> Creator(*BoundGraph);
+        BSNode = Creator.CreateNode(false);        // StaticClass() via MinimalAPI
+        BSNode->SetAnimationAsset(BS);
+        BSNode->CopySettingsFromAnimationAsset(BS);
+        Creator.Finalize();
+        BSNode->NodePosX = ResultNode->NodePosX - 360;
+        BSNode->NodePosY = ResultNode->NodePosY;
+    }
+
+    UEdGraphPin* BSOut = MCPAnimGraph_FindPosePin(BSNode, EGPD_Output);
+    if (!BSOut) { return MCPAnimGraph_Error(TEXT("Blend Space Player has no output pose pin")); }
+    ResultIn->BreakAllPinLinks();
+    const bool bConnected = MCPAnimGraph_Connect(BoundGraph, BSOut, ResultIn);
+
+    // Bind the sample-coordinate + play-rate pins to member variables (each optional).
+    BSNode->Modify();
+    const bool bX    = MCPAnimGraph_BindVarToPin(BoundGraph, BSNode, TEXT("X"),        XVariable,        -40);
+    const bool bY    = MCPAnimGraph_BindVarToPin(BoundGraph, BSNode, TEXT("Y"),        YVariable,         60);
+    const bool bRate = MCPAnimGraph_BindVarToPin(BoundGraph, BSNode, TEXT("PlayRate"), PlayRateVariable, 160);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("state"), StateName);
+    Obj->SetStringField(TEXT("blend_space"), BS->GetPathName());
+    Obj->SetStringField(TEXT("blend_space_player_guid"), BSNode->NodeGuid.ToString());
+    Obj->SetBoolField(TEXT("connected_to_result"), bConnected);
+    if (!XVariable.IsEmpty())        { Obj->SetBoolField(TEXT("x_bound"), bX); }
+    if (!YVariable.IsEmpty())        { Obj->SetBoolField(TEXT("y_bound"), bY); }
+    if (!PlayRateVariable.IsEmpty()) { Obj->SetBoolField(TEXT("play_rate_bound"), bRate); }
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// 20) InsertAnimSlot — splice a UAnimGraphNode_Slot (montage slot) between whatever currently feeds
+//     the AnimGraph Output Pose and the Output Pose, so slot/montage playback (AM_* montages) layers
+//     over the locomotion pose. Idempotent (reuses a slot node of the same SlotName).
+FString UMCPReflectionLibrary::InsertAnimSlot(UAnimBlueprint* AnimBlueprint, const FString& SlotName)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UEdGraph* AnimGraph = MCPAnimGraph_FindAnimGraph(AnimBlueprint);
+    if (!AnimGraph) { return MCPAnimGraph_Error(TEXT("Could not locate the AnimGraph on this Animation Blueprint")); }
+    UAnimGraphNode_Root* Root = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_Root>(AnimGraph);
+    if (!Root) { return MCPAnimGraph_Error(TEXT("AnimGraph has no Output Pose (root) node")); }
+    UEdGraphPin* RootIn = MCPAnimGraph_FindPosePin(Root, EGPD_Input);
+    if (!RootIn) { return MCPAnimGraph_Error(TEXT("Output Pose node has no input pose pin")); }
+
+    const FName WantSlot = SlotName.IsEmpty() ? FName(TEXT("DefaultSlot")) : FName(*SlotName);
+
+    // Whatever currently drives the Output Pose becomes the slot's Source input.
+    UEdGraphPin* CurrentSource = (RootIn->LinkedTo.Num() > 0) ? RootIn->LinkedTo[0] : nullptr;
+
+    AnimGraph->Modify();
+
+    // Reuse an existing slot node with the same SlotName (idempotent re-run).
+    UAnimGraphNode_Slot* SlotNode = nullptr;
+    for (UEdGraphNode* N : AnimGraph->Nodes)
+    {
+        if (UAnimGraphNode_Slot* S = Cast<UAnimGraphNode_Slot>(N))
+        {
+            if (S->Node.SlotName == WantSlot) { SlotNode = S; break; }
+        }
+    }
+    const bool bReused = (SlotNode != nullptr);
+    if (SlotNode)
+    {
+        SlotNode->Modify();
+    }
+    else
+    {
+        FGraphNodeCreator<UAnimGraphNode_Slot> Creator(*AnimGraph);
+        SlotNode = Creator.CreateNode(false);     // StaticClass() via MinimalAPI
+        SlotNode->Node.SlotName = WantSlot;        // Source + SlotName are public UPROPERTYs
+        Creator.Finalize();
+        SlotNode->NodePosX = Root->NodePosX - 300;
+        SlotNode->NodePosY = Root->NodePosY;
+    }
+
+    UEdGraphPin* SlotIn  = MCPAnimGraph_FindPosePin(SlotNode, EGPD_Input);
+    UEdGraphPin* SlotOut = MCPAnimGraph_FindPosePin(SlotNode, EGPD_Output);
+    if (!SlotIn || !SlotOut) { return MCPAnimGraph_Error(TEXT("Slot node has no pose pins")); }
+
+    // Splice: [CurrentSource] -> Slot.Source ; Slot.Out -> Output Pose.
+    // Skip the source rewire if the slot is already the thing feeding Output (re-run).
+    bool bSourceWired = true;
+    const bool bAlreadySpliced = (CurrentSource && CurrentSource->GetOwningNode() == SlotNode);
+    RootIn->BreakAllPinLinks();
+    if (CurrentSource && !bAlreadySpliced)
+    {
+        SlotIn->BreakAllPinLinks();
+        bSourceWired = MCPAnimGraph_Connect(AnimGraph, CurrentSource, SlotIn);
+    }
+    const bool bOutputWired = MCPAnimGraph_Connect(AnimGraph, SlotOut, RootIn);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("slot_name"), WantSlot.ToString());
+    Obj->SetStringField(TEXT("slot_node_guid"), SlotNode->NodeGuid.ToString());
+    Obj->SetBoolField(TEXT("reused_existing"), bReused);
+    Obj->SetBoolField(TEXT("source_wired"), bSourceWired);
+    Obj->SetBoolField(TEXT("output_wired"), bOutputWired);
+    Obj->SetBoolField(TEXT("had_prior_source"), CurrentSource != nullptr);
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// ===========================================================================
+//  C++ #61 — InsertAnimGraphNode: splice a general overlay node (Aim Offset
+//  Player, Layered Blend Per Bone, or any UAnimGraphNode_Base) between whatever
+//  feeds the AnimGraph Output Pose and the Output Pose. The missing counterpart
+//  to insert_anim_slot for non-slot nodes.
+// ===========================================================================
+namespace
+{
+    UEdGraphPin* MCPAnimGraph_FindInputPosePinByName(UEdGraphNode* Node, const TCHAR* Name)
+    {
+        if (!Node) { return nullptr; }
+        for (UEdGraphPin* P : Node->Pins)
+        {
+            if (P && P->Direction == EGPD_Input && UAnimationGraphSchema::IsPosePin(P->PinType) && P->PinName == FName(Name))
+            {
+                return P;
+            }
+        }
+        return nullptr;
+    }
+
+    void MCPAnimGraph_CollectInputPosePins(UEdGraphNode* Node, TArray<UEdGraphPin*>& Out)
+    {
+        if (!Node) { return; }
+        for (UEdGraphPin* P : Node->Pins)
+        {
+            if (P && P->Direction == EGPD_Input && UAnimationGraphSchema::IsPosePin(P->PinType)) { Out.Add(P); }
+        }
+    }
+
+    // Resolve a friendly name / class path to a UAnimGraphNode_Base subclass.
+    UClass* MCPAnimGraph_ResolveNodeClass(const FString& NameOrPath)
+    {
+        const FString N = NameOrPath.ToLower();
+        if (N == TEXT("aimoffset") || N == TEXT("aimoffsetplayer") || N == TEXT("rotationoffsetblendspace"))
+        {
+            return UAnimGraphNode_RotationOffsetBlendSpace::StaticClass();
+        }
+        if (N == TEXT("layeredboneblend") || N == TEXT("layeredblendperbone") || N == TEXT("layeredblend"))
+        {
+            return UAnimGraphNode_LayeredBoneBlend::StaticClass();
+        }
+        if (N == TEXT("blendspaceplayer") || N == TEXT("blendspace"))
+        {
+            return UAnimGraphNode_BlendSpacePlayer::StaticClass();
+        }
+        if (N == TEXT("slot")) { return UAnimGraphNode_Slot::StaticClass(); }
+        // Full class path, e.g. "/Script/AnimGraph.AnimGraphNode_ApplyAdditive".
+        if (UClass* ByPath = LoadObject<UClass>(nullptr, *NameOrPath)) { return ByPath; }
+        // Bare class name.
+        if (UClass* ByName = FindFirstObject<UClass>(*NameOrPath, EFindFirstObjectOptions::NativeFirst)) { return ByName; }
+        return nullptr;
+    }
+}
+
+// 21) InsertAnimGraphNode — create a node of NodeClass, set its Node-struct properties (and asset, for
+//     asset-player nodes), optionally configure a Layered-Blend branch filter + feed a blend pose from
+//     another node, splice it before the Output Pose, and bind input pins to member variables.
+FString UMCPReflectionLibrary::InsertAnimGraphNode(UAnimBlueprint* AnimBlueprint, const FString& NodeClass,
+                                                   const FString& PropertiesJson, const FString& PinBindingsJson,
+                                                   const FString& BranchFilterBone, int32 BranchFilterDepth,
+                                                   const FString& BlendSourceNodeGuid)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    UEdGraph* AnimGraph = MCPAnimGraph_FindAnimGraph(AnimBlueprint);
+    if (!AnimGraph) { return MCPAnimGraph_Error(TEXT("Could not locate the AnimGraph on this Animation Blueprint")); }
+    UAnimGraphNode_Root* Root = MCPAnimGraph_FirstNodeOfType<UAnimGraphNode_Root>(AnimGraph);
+    if (!Root) { return MCPAnimGraph_Error(TEXT("AnimGraph has no Output Pose (root) node")); }
+    UEdGraphPin* RootIn = MCPAnimGraph_FindPosePin(Root, EGPD_Input);
+    if (!RootIn) { return MCPAnimGraph_Error(TEXT("Output Pose node has no input pose pin")); }
+
+    UClass* Cls = MCPAnimGraph_ResolveNodeClass(NodeClass);
+    if (!Cls) { return MCPAnimGraph_Error(FString::Printf(TEXT("Could not resolve node class '%s'"), *NodeClass)); }
+    if (!Cls->IsChildOf(UAnimGraphNode_Base::StaticClass()))
+    {
+        return MCPAnimGraph_Error(FString::Printf(TEXT("'%s' is not a UAnimGraphNode_Base subclass"), *Cls->GetName()));
+    }
+
+    // Whatever currently drives the Output Pose becomes the new node's base-pose input.
+    UEdGraphPin* CurrentSource = (RootIn->LinkedTo.Num() > 0) ? RootIn->LinkedTo[0] : nullptr;
+
+    AnimGraph->Modify();
+
+    // UEdGraph::CreateNode is protected (FGraphNodeCreator-only friend); replicate it for a runtime UClass
+    // via NewObject + the public AddNode, then the same Finalize steps FGraphNodeCreator runs.
+    UAnimGraphNode_Base* Node = NewObject<UAnimGraphNode_Base>(AnimGraph, Cls, NAME_None, RF_Transactional);
+    if (!Node) { return MCPAnimGraph_Error(TEXT("Node creation failed")); }
+    AnimGraph->AddNode(Node, /*bUserAction*/ false, /*bSelectNewNode*/ false);  // ENGINE_API
+    Node->CreateNewGuid();
+    Node->PostPlacedNewNode();
+    if (Node->Pins.Num() == 0) { Node->AllocateDefaultPins(); }
+    Node->NodePosX = Root->NodePosX - 300;
+    Node->NodePosY = Root->NodePosY;
+
+    // --- Properties (onto the embedded "Node" FStructProperty) + special "asset" key. ---
+    TSharedPtr<FJsonObject> Props;
+    if (!PropertiesJson.IsEmpty())
+    {
+        TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(PropertiesJson);
+        FJsonSerializer::Deserialize(R, Props);
+    }
+    FString AssetApplied;
+    if (Props.IsValid())
+    {
+        FString AssetPath;
+        if (Props->TryGetStringField(TEXT("asset"), AssetPath) && !AssetPath.IsEmpty())
+        {
+            if (UAnimGraphNode_AssetPlayerBase* AP = Cast<UAnimGraphNode_AssetPlayerBase>(Node))
+            {
+                if (UAnimationAsset* A = LoadObject<UAnimationAsset>(nullptr, *AssetPath))
+                {
+                    AP->SetAnimationAsset(A);   // virtual (vtable)
+                    AssetApplied = A->GetPathName();
+                }
+            }
+        }
+        FStructProperty* NodeProp = FindFProperty<FStructProperty>(Node->GetClass(), TEXT("Node"));
+        if (NodeProp && NodeProp->Struct)
+        {
+            void* NodeData = NodeProp->ContainerPtrToValuePtr<void>(Node);
+            for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Props->Values)
+            {
+                if (KV.Key == TEXT("asset")) { continue; }
+                FProperty* Sub = FindFProperty<FProperty>(NodeProp->Struct, FName(*KV.Key));
+                if (!Sub) { continue; }
+                FString ValStr;
+                if (!KV.Value->TryGetString(ValStr))
+                {
+                    if (KV.Value->Type == EJson::Boolean) { ValStr = KV.Value->AsBool() ? TEXT("true") : TEXT("false"); }
+                    else if (KV.Value->Type == EJson::Number) { ValStr = FString::SanitizeFloat(KV.Value->AsNumber()); }
+                }
+                if (!ValStr.IsEmpty())
+                {
+                    Sub->ImportText_Direct(*ValStr, Sub->ContainerPtrToValuePtr<void>(NodeData), Node, PPF_None);
+                }
+            }
+        }
+    }
+
+    // --- Layered Blend Per Bone: ensure a blend layer + set its branch filter. ---
+    bool bBranchFilterSet = false;
+    if (UAnimGraphNode_LayeredBoneBlend* LB = Cast<UAnimGraphNode_LayeredBoneBlend>(Node))
+    {
+        if (!BranchFilterBone.IsEmpty())
+        {
+            LB->Node.BlendMode = ELayeredBoneBlendMode::BranchFilter;
+            if (LB->Node.BlendPoses.Num() == 0)
+            {
+                LB->AddPinToBlendByFilter();   // ANIMGRAPH_API — grows BlendPoses/LayerSetup/BlendWeights + a pin
+            }
+            if (LB->Node.LayerSetup.Num() > 0)
+            {
+                FBranchFilter Filter;
+                Filter.BoneName = FName(*BranchFilterBone);
+                Filter.BlendDepth = BranchFilterDepth;
+                LB->Node.LayerSetup[0].BranchFilters.Reset();
+                LB->Node.LayerSetup[0].BranchFilters.Add(Filter);
+                bBranchFilterSet = true;
+            }
+        }
+    }
+
+    Node->ReconstructNode();
+
+    // --- Splice into the output chain. ---
+    UEdGraphPin* BaseIn = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("BasePose"));
+    if (!BaseIn) { BaseIn = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("Source")); }
+    TArray<UEdGraphPin*> InputPosePins;
+    MCPAnimGraph_CollectInputPosePins(Node, InputPosePins);
+    if (!BaseIn && InputPosePins.Num() > 0) { BaseIn = InputPosePins[0]; }
+    UEdGraphPin* NodeOut = MCPAnimGraph_FindPosePin(Node, EGPD_Output);
+    if (!BaseIn || !NodeOut) { return MCPAnimGraph_Error(TEXT("Node has no usable base-pose input / output pose pin")); }
+
+    RootIn->BreakAllPinLinks();
+    bool bBaseWired = true;
+    const bool bAlreadyThis = (CurrentSource && CurrentSource->GetOwningNode() == Node);
+    if (CurrentSource && !bAlreadyThis)
+    {
+        BaseIn->BreakAllPinLinks();
+        bBaseWired = MCPAnimGraph_Connect(AnimGraph, CurrentSource, BaseIn);
+    }
+    const bool bOutWired = MCPAnimGraph_Connect(AnimGraph, NodeOut, RootIn);
+
+    // --- Optional: feed a blend pose from another node (e.g. an Aim Offset -> this Layered Blend). ---
+    bool bBlendSourceWired = false;
+    FString BlendSourceResolved;
+    if (!BlendSourceNodeGuid.IsEmpty())
+    {
+        FGuid Guid;
+        if (FGuid::Parse(BlendSourceNodeGuid, Guid))
+        {
+            if (UAnimGraphNode_Base* SrcNode = MCPAnimGraph_FindNodeByGuid(AnimBlueprint, Guid))
+            {
+                UEdGraphPin* SrcOut = MCPAnimGraph_FindPosePin(SrcNode, EGPD_Output);
+                // The blend pose is an input pose pin that is NOT the base pose pin.
+                UEdGraphPin* BlendIn = nullptr;
+                for (UEdGraphPin* P : InputPosePins) { if (P != BaseIn) { BlendIn = P; break; } }
+                if (SrcOut && BlendIn)
+                {
+                    BlendIn->BreakAllPinLinks();
+                    bBlendSourceWired = MCPAnimGraph_Connect(AnimGraph, SrcOut, BlendIn);
+                    BlendSourceResolved = SrcNode->NodeGuid.ToString();
+                }
+            }
+        }
+    }
+
+    // --- Bind input pins (X / Y / Alpha / ...) to member variables. ---
+    TArray<FString> BoundPins;
+    if (!PinBindingsJson.IsEmpty())
+    {
+        TSharedPtr<FJsonObject> Bind;
+        TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(PinBindingsJson);
+        if (FJsonSerializer::Deserialize(R, Bind) && Bind.IsValid())
+        {
+            Node->Modify();
+            int32 Offset = -40;
+            for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Bind->Values)
+            {
+                FString VarName;
+                if (KV.Value->TryGetString(VarName) && !VarName.IsEmpty())
+                {
+                    if (MCPAnimGraph_BindVarToPin(AnimGraph, Node, *KV.Key, VarName, Offset))
+                    {
+                        BoundPins.Add(FString::Printf(TEXT("%s=%s"), *KV.Key, *VarName));
+                    }
+                    Offset += 100;
+                }
+            }
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("node_class"), Cls->GetName());
+    Obj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+    Obj->SetBoolField(TEXT("base_wired"), bBaseWired);
+    Obj->SetBoolField(TEXT("output_wired"), bOutWired);
+    Obj->SetBoolField(TEXT("had_prior_source"), CurrentSource != nullptr);
+    if (!AssetApplied.IsEmpty()) { Obj->SetStringField(TEXT("asset"), AssetApplied); }
+    if (bBranchFilterSet) { Obj->SetStringField(TEXT("branch_filter_bone"), BranchFilterBone); Obj->SetNumberField(TEXT("branch_filter_depth"), BranchFilterDepth); }
+    if (!BlendSourceNodeGuid.IsEmpty()) { Obj->SetBoolField(TEXT("blend_source_wired"), bBlendSourceWired); if (!BlendSourceResolved.IsEmpty()) { Obj->SetStringField(TEXT("blend_source_guid"), BlendSourceResolved); } }
+    if (BoundPins.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> B;
+        for (const FString& S : BoundPins) { B.Add(MakeShared<FJsonValueString>(S)); }
+        Obj->SetArrayField(TEXT("bound_pins"), B);
+    }
     return MCPAnimGraph_SerializeObject(Obj);
 }

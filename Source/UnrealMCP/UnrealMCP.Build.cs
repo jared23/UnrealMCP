@@ -112,7 +112,13 @@ public class UnrealMCP : ModuleRules
 				"MetasoundFrontend",
 				// C++ #58 (Project_Aimon gaps 2): IAssetTools::FixupReferencers (AssetTools) + redirector
 				// registry scan (AssetRegistry). Both editor/runtime modules -> low link risk.
+				// C++ #61 reuses AssetTools (AdvancedCopyPackages) + AssetRegistry (dependency closure).
 				"AssetTools", "AssetRegistry",
+				// C++ #61 (physics-asset body authoring, MCPReflection_ContentGaps.cpp):
+				// FPhysicsAssetUtils::CreateFromSkeletalMesh / CreateNewBody / DestroyBody are
+				// PHYSICSUTILITIES_API in the editor-only "PhysicsUtilities" developer module. SkeletalMesh /
+				// PhysicsAsset / AggGeom are Engine (already a dep); the BlendSpace resample uses ENGINE_API.
+				"PhysicsUtilities",
 				// C++ #46 (mutable Wave 3 graph authoring): UCustomizableObject::GetPrivate()->GetSource()
 				// (CustomizableObject, Runtime) + UCustomizableObjectNode / UEdGraphSchema_CustomizableObject
 				// (CustomizableObjectEditor, UncookedOnly). Both method-level *_API-exported despite MinimalAPI

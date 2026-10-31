@@ -153,6 +153,11 @@ def _try(fn, d=None):
 def _load_system(path):
     obj = _try(lambda: unreal.EditorAssetLibrary.load_asset(path))
     if obj is None:
+        # EditorAssetLibrary.load_asset refuses while PIE is running; the core loaders work during PIE.
+        obj = _try(lambda: unreal.load_asset(path))
+    if obj is None:
+        obj = _try(lambda: unreal.load_object(None, path))
+    if obj is None:
         return None, ("asset not found: %s" % path)
     if not isinstance(obj, unreal.NiagaraSystem):
         return None, ("asset is not a NiagaraSystem (got %s): %s" % (obj.get_class().get_name(), path))
