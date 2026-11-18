@@ -279,10 +279,16 @@ public:
      * JSON scalar/array interpreted by the parameter's stored type: bool -> true/false; int/float ->
      * number; vector2/vector/vector4/quat/linearcolor -> array (e.g. [1,0,0], [1,0,0,1]). Captures and
      * returns the PRIOR value (for undo). Marks the package dirty.
-     * Returns {"system","param","set","prev"} (or {"error"}). `prev` is null if the param had no readable value.
+     * Returns {"system","param","type","set","prev","stored"} (or {"error"}). `prev` is null if the param had
+     * no readable value; `stored` is the value read back from the store after the write.
+     * C++ #62: a single-element array ("[0.35]") is unwrapped for scalar types (it used to store 0).
      */
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString SetNiagaraUserParameterValue(UNiagaraSystem* System, const FString& ParamName, const FString& ValueJson);
+
+    /** C++ #62: read a `User.<ParamName>` default. Returns {"system","param","type","value"} (or {"error"}). */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
+    static FString GetNiagaraUserParameterValue(UNiagaraSystem* System, const FString& ParamName);
 
     /**
      * Remove `User.<ParamName>` from a NiagaraSystem's exposed parameter store. Captures and returns the
@@ -1154,6 +1160,34 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MCP|Authoring")
     static FString CopyAssetsWithDependencies(const FString& SourcesJson, const FString& FolderMapJson,
                                               const FString& SourceRoot, bool bStripTestPrefix, bool bDryRun);
+
+    // ==== C++ #62 (Companion-Game gaps 2026-11-11..17) ==============================================
+    // MCPReflection_CompanionGaps.cpp + MCPReflection_AnimGraph.cpp. Condensed JSON, "status" ok/error.
+
+    /** The VALUE behind each input of one emitter module: local literal | linked parameter | dynamic input
+     *  (+ its inputs, recursive) | data interface (+ props) | rapid-iteration constant; + static switches. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Niagara")
+    static FString GetNiagaraModuleInputValues(const FString& SystemPath, const FString& EmitterName,
+                                               const FString& ScriptUsage, const FString& ModuleName,
+                                               const FString& InputFilter);
+
+    /** Live CPU-sim particle positions (world space) + optional float attributes, bounds and radius from
+     *  the component, for each Niagara component on Actor. AttributesJson: JSON array of attribute names. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Niagara")
+    static FString GetNiagaraParticlePositions(AActor* Actor, const FString& ComponentName,
+                                               const FString& EmitterName, int32 MaxParticles,
+                                               const FString& AttributesJson);
+
+    /** Re-fit every montage slot segment to its sequence's current length (after a reimport), re-chain
+     *  segment start positions and recompute the montage length. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Animation")
+    static FString RefreshMontageSegments(UAnimMontage* Montage);
+
+    /** Set FAnimNode-struct properties on ANY anim graph node (incl. inside a state) by node guid, with a
+     *  per-key report (applied/unknown/failed). Special key "asset" sets an asset player's asset. */
+    UFUNCTION(BlueprintCallable, Category = "MCP|Animation")
+    static FString SetAnimGraphNodeProperties(UAnimBlueprint* AnimBlueprint, const FString& NodeGuid,
+                                              const FString& PropertiesJson);
 
     // ==== C++ #19 2026-08-18 batch — Blueprint interfaces + var-flags (MCPReflection_BlueprintExt.cpp),
     //      AnimGraph removers (MCPReflection_AnimRemove.cpp), Niagara renderer/emitter (MCPReflection_NiagaraExt.cpp).

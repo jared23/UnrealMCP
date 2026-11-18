@@ -82,6 +82,8 @@
 #include "AnimGraphNode_AssetPlayerBase.h"           // #61: SetAnimationAsset (virtual)
 #include "Animation/AnimationAsset.h"                // #61: UAnimationAsset
 #include "Animation/AnimData/BoneMaskFilter.h"       // #61: FInputBlendPose / FBranchFilter
+#include "AnimGraphNode_SaveCachedPose.h"            // #62: pose fork (Save Cached Pose)
+#include "AnimGraphNode_UseCachedPose.h"             // #62: pose fork (Use Cached Pose)
 #include "AnimGraphNode_StateResult.h"              // UAnimGraphNode_StateResult (state's output pose)
 #include "AnimGraphNode_Root.h"                     // UAnimGraphNode_Root (AnimGraph Output Pose)
 #include "AnimGraphNode_TransitionResult.h"         // UAnimGraphNode_TransitionResult (rule bCanEnterTransition)
@@ -1576,6 +1578,102 @@ namespace
         if (UClass* ByName = FindFirstObject<UClass>(*NameOrPath, EFindFirstObjectOptions::NativeFirst)) { return ByName; }
         return nullptr;
     }
+
+    // C++ #62: resolve a Node-struct property by its C++ name, ignoring case and underscores and an
+    // optional bool 'b' prefix ("PlayRate" | "play_rate" | "playrate"; "bLoop" | "loop").
+    FProperty* MCPAnimGraph_FindNodeStructProp(const UStruct* Struct, const FString& Key)
+    {
+        if (!Struct) { return nullptr; }
+        if (FProperty* Exact = FindFProperty<FProperty>(Struct, FName(*Key))) { return Exact; }
+        auto Norm = [](FString S) { S.ReplaceInline(TEXT("_"), TEXT("")); return S.ToLower(); };
+        const FString K = Norm(Key);
+        for (TFieldIterator<FProperty> It(Struct); It; ++It)
+        {
+            const FString N = Norm(It->GetName());
+            if (N == K || (CastField<FBoolProperty>(*It) && N == TEXT("b") + K)) { return *It; }
+        }
+        return nullptr;
+    }
+
+    // C++ #62: set the embedded FAnimNode-struct properties of an anim graph node from a JSON object and
+    // REPORT what happened (the #61 path skipped unknown keys / failed imports silently, so a property that
+    // "had no effect" could simply have never been set). A property whose pin is currently VISIBLE and
+    // unlinked also gets the pin default — at compile a visible pin's default wins over the struct value.
+    // Fills Report.applied {prop: stored text}, Report.unknown [keys], Report.failed [{key, value}].
+    void MCPAnimGraph_ApplyNodeProps(UAnimGraphNode_Base* Node, const TSharedPtr<FJsonObject>& Props,
+                                     const TSharedRef<FJsonObject>& Report)
+    {
+        TSharedRef<FJsonObject> Applied = MakeShared<FJsonObject>();
+        TArray<TSharedPtr<FJsonValue>> Unknown, Failed;
+        FStructProperty* NodeProp = Node ? FindFProperty<FStructProperty>(Node->GetClass(), TEXT("Node")) : nullptr;
+        if (Props.IsValid() && NodeProp && NodeProp->Struct)
+        {
+            Node->Modify();
+            void* NodeData = NodeProp->ContainerPtrToValuePtr<void>(Node);
+            for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Props->Values)
+            {
+                if (KV.Key == TEXT("asset")) { continue; }
+                FProperty* Sub = MCPAnimGraph_FindNodeStructProp(NodeProp->Struct, KV.Key);
+                if (!Sub) { Unknown.Add(MakeShared<FJsonValueString>(KV.Key)); continue; }
+                FString ValStr;
+                if (!KV.Value->TryGetString(ValStr))
+                {
+                    if (KV.Value->Type == EJson::Boolean) { ValStr = KV.Value->AsBool() ? TEXT("true") : TEXT("false"); }
+                    else if (KV.Value->Type == EJson::Number) { ValStr = FString::SanitizeFloat(KV.Value->AsNumber()); }
+                }
+                void* SubPtr = Sub->ContainerPtrToValuePtr<void>(NodeData);
+                if (ValStr.IsEmpty() || Sub->ImportText_Direct(*ValStr, SubPtr, Node, PPF_None) == nullptr)
+                {
+                    TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+                    F->SetStringField(TEXT("key"), KV.Key);
+                    F->SetStringField(TEXT("value"), ValStr);
+                    Failed.Add(MakeShared<FJsonValueObject>(F));
+                    continue;
+                }
+                FString Stored;
+                Sub->ExportTextItem_Direct(Stored, SubPtr, nullptr, Node, PPF_None);
+                if (UEdGraphPin* Pin = Node->FindPin(Sub->GetFName(), EGPD_Input))
+                {
+                    if (Pin->LinkedTo.Num() == 0) { Pin->DefaultValue = Stored; }
+                }
+                Applied->SetStringField(Sub->GetName(), Stored);
+            }
+        }
+        Report->SetObjectField(TEXT("applied"), Applied);
+        if (Unknown.Num() > 0) { Report->SetArrayField(TEXT("unknown"), Unknown); }
+        if (Failed.Num() > 0)  { Report->SetArrayField(TEXT("failed"), Failed); }
+    }
+
+    // C++ #62: the base-pose input pin of a node (BasePose | Source | first input pose pin).
+    UEdGraphPin* MCPAnimGraph_BaseInputPin(UEdGraphNode* Node)
+    {
+        UEdGraphPin* P = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("BasePose"));
+        if (!P) { P = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("Source")); }
+        if (!P)
+        {
+            TArray<UEdGraphPin*> Pins;
+            MCPAnimGraph_CollectInputPosePins(Node, Pins);
+            if (Pins.Num() > 0) { P = Pins[0]; }
+        }
+        return P;
+    }
+
+    // C++ #62: a Use Cached Pose node bound to Save (NameOfCache is private -> set by reflection; the node
+    // also re-derives it from SaveCachedPoseNode on compile).
+    UAnimGraphNode_UseCachedPose* MCPAnimGraph_MakeUseCachedPose(UEdGraph* Graph, UAnimGraphNode_SaveCachedPose* Save,
+                                                                 int32 PosX, int32 PosY)
+    {
+        FGraphNodeCreator<UAnimGraphNode_UseCachedPose> C(*Graph);
+        UAnimGraphNode_UseCachedPose* Use = C.CreateNode(false);
+        Use->SaveCachedPoseNode = Save;
+        if (FStrProperty* NameProp = FindFProperty<FStrProperty>(UAnimGraphNode_UseCachedPose::StaticClass(), TEXT("NameOfCache")))
+        {
+            NameProp->SetPropertyValue_InContainer(Use, Save->CacheName);
+        }
+        C.Finalize();
+        Use->NodePosX = PosX; Use->NodePosY = PosY;
+        return Use;
+    }
 }
 
 // 21) InsertAnimGraphNode — create a node of NodeClass, set its Node-struct properties (and asset, for
@@ -1639,28 +1737,10 @@ FString UMCPReflectionLibrary::InsertAnimGraphNode(UAnimBlueprint* AnimBlueprint
                 }
             }
         }
-        FStructProperty* NodeProp = FindFProperty<FStructProperty>(Node->GetClass(), TEXT("Node"));
-        if (NodeProp && NodeProp->Struct)
-        {
-            void* NodeData = NodeProp->ContainerPtrToValuePtr<void>(Node);
-            for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Props->Values)
-            {
-                if (KV.Key == TEXT("asset")) { continue; }
-                FProperty* Sub = FindFProperty<FProperty>(NodeProp->Struct, FName(*KV.Key));
-                if (!Sub) { continue; }
-                FString ValStr;
-                if (!KV.Value->TryGetString(ValStr))
-                {
-                    if (KV.Value->Type == EJson::Boolean) { ValStr = KV.Value->AsBool() ? TEXT("true") : TEXT("false"); }
-                    else if (KV.Value->Type == EJson::Number) { ValStr = FString::SanitizeFloat(KV.Value->AsNumber()); }
-                }
-                if (!ValStr.IsEmpty())
-                {
-                    Sub->ImportText_Direct(*ValStr, Sub->ContainerPtrToValuePtr<void>(NodeData), Node, PPF_None);
-                }
-            }
-        }
     }
+    // C++ #62: struct props applied with a per-key report (applied/unknown/failed).
+    TSharedRef<FJsonObject> PropReport = MakeShared<FJsonObject>();
+    MCPAnimGraph_ApplyNodeProps(Node, Props, PropReport);
 
     // --- Layered Blend Per Bone: ensure a blend layer + set its branch filter. ---
     bool bBranchFilterSet = false;
@@ -1686,49 +1766,99 @@ FString UMCPReflectionLibrary::InsertAnimGraphNode(UAnimBlueprint* AnimBlueprint
     }
 
     Node->ReconstructNode();
+    // Pin defaults for props whose pins are visible (ReconstructNode re-derives pins from the struct, so
+    // re-apply after it — the helper also writes visible unlinked pin defaults).
+    if (Props.IsValid()) { TSharedRef<FJsonObject> Ignored = MakeShared<FJsonObject>(); MCPAnimGraph_ApplyNodeProps(Node, Props, Ignored); }
 
     // --- Splice into the output chain. ---
-    UEdGraphPin* BaseIn = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("BasePose"));
-    if (!BaseIn) { BaseIn = MCPAnimGraph_FindInputPosePinByName(Node, TEXT("Source")); }
+    UEdGraphPin* BaseIn = MCPAnimGraph_BaseInputPin(Node);
     TArray<UEdGraphPin*> InputPosePins;
     MCPAnimGraph_CollectInputPosePins(Node, InputPosePins);
-    if (!BaseIn && InputPosePins.Num() > 0) { BaseIn = InputPosePins[0]; }
     UEdGraphPin* NodeOut = MCPAnimGraph_FindPosePin(Node, EGPD_Output);
     if (!BaseIn || !NodeOut) { return MCPAnimGraph_Error(TEXT("Node has no usable base-pose input / output pose pin")); }
+    UEdGraphPin* BlendIn = nullptr;   // the blend pose is an input pose pin that is NOT the base pose pin
+    for (UEdGraphPin* P : InputPosePins) { if (P != BaseIn) { BlendIn = P; break; } }
 
-    RootIn->BreakAllPinLinks();
-    bool bBaseWired = true;
-    const bool bAlreadyThis = (CurrentSource && CurrentSource->GetOwningNode() == Node);
-    if (CurrentSource && !bAlreadyThis)
-    {
-        BaseIn->BreakAllPinLinks();
-        bBaseWired = MCPAnimGraph_Connect(AnimGraph, CurrentSource, BaseIn);
-    }
-    const bool bOutWired = MCPAnimGraph_Connect(AnimGraph, NodeOut, RootIn);
-
-    // --- Optional: feed a blend pose from another node (e.g. an Aim Offset -> this Layered Blend). ---
-    bool bBlendSourceWired = false;
-    FString BlendSourceResolved;
+    // Optional blend source (e.g. an Aim Offset feeding this Layered Blend's blend pose).
+    UAnimGraphNode_Base* SrcNode = nullptr;
+    UEdGraphPin* SrcOut = nullptr;
     if (!BlendSourceNodeGuid.IsEmpty())
     {
         FGuid Guid;
-        if (FGuid::Parse(BlendSourceNodeGuid, Guid))
+        if (FGuid::Parse(BlendSourceNodeGuid, Guid)) { SrcNode = MCPAnimGraph_FindNodeByGuid(AnimBlueprint, Guid); }
+        if (!SrcNode) { return MCPAnimGraph_Error(FString::Printf(TEXT("blend_source_node_guid '%s' not found"), *BlendSourceNodeGuid)); }
+        SrcOut = MCPAnimGraph_FindPosePin(SrcNode, EGPD_Output);
+        if (!SrcOut || !BlendIn) { return MCPAnimGraph_Error(TEXT("blend source has no output pose pin, or this node has no blend-pose input")); }
+    }
+
+    // C++ #62 POSE FORK: when the blend source is the very node that currently feeds the Output Pose (the
+    // head-layer recipe: AimOffset spliced first, then a Layered Blend fed from it), the #61 code wired BOTH
+    // the base and the blend pose to the Aim Offset — so the branch filter had no untouched pose to blend
+    // against. A pose output can't fan out, so fork through a cache instead:
+    //   Upstream -> SaveCachedPose ; UseCachedPose -> BlendSource.base ; UseCachedPose -> this.base ;
+    //   BlendSource.out -> this.blend ; this.out -> Output Pose.
+    const bool bFork = SrcOut && CurrentSource == SrcOut;
+    bool bBaseWired = true, bBlendSourceWired = false;
+    FString ForkCache, ForkSaveGuid;
+    RootIn->BreakAllPinLinks();
+    if (bFork)
+    {
+        UEdGraphPin* SrcBaseIn = MCPAnimGraph_BaseInputPin(SrcNode);
+        UEdGraphPin* Upstream = (SrcBaseIn && SrcBaseIn->LinkedTo.Num() > 0) ? SrcBaseIn->LinkedTo[0] : nullptr;
+        if (!Upstream)
         {
-            if (UAnimGraphNode_Base* SrcNode = MCPAnimGraph_FindNodeByGuid(AnimBlueprint, Guid))
-            {
-                UEdGraphPin* SrcOut = MCPAnimGraph_FindPosePin(SrcNode, EGPD_Output);
-                // The blend pose is an input pose pin that is NOT the base pose pin.
-                UEdGraphPin* BlendIn = nullptr;
-                for (UEdGraphPin* P : InputPosePins) { if (P != BaseIn) { BlendIn = P; break; } }
-                if (SrcOut && BlendIn)
-                {
-                    BlendIn->BreakAllPinLinks();
-                    bBlendSourceWired = MCPAnimGraph_Connect(AnimGraph, SrcOut, BlendIn);
-                    BlendSourceResolved = SrcNode->NodeGuid.ToString();
-                }
-            }
+            return MCPAnimGraph_Error(TEXT("pose fork: nothing feeds the blend source's base pose (wire the blend source first)"));
+        }
+        // Unique cache name across the AnimBP.
+        TSet<FString> Taken;
+        {
+            TArray<UEdGraph*> Graphs;
+            MCPAnimGraph_CollectAllGraphs(AnimBlueprint, Graphs);
+            for (UEdGraph* G : Graphs) { for (UEdGraphNode* N : G->Nodes) { if (UAnimGraphNode_SaveCachedPose* S = Cast<UAnimGraphNode_SaveCachedPose>(N)) { Taken.Add(S->CacheName); } } }
+        }
+        ForkCache = TEXT("MCP_PreBlendPose");
+        for (int32 i = 1; Taken.Contains(ForkCache); ++i) { ForkCache = FString::Printf(TEXT("MCP_PreBlendPose_%d"), i); }
+
+        UAnimGraphNode_SaveCachedPose* Save = nullptr;
+        {
+            FGraphNodeCreator<UAnimGraphNode_SaveCachedPose> C(*AnimGraph);
+            Save = C.CreateNode(false);
+            Save->CacheName = ForkCache;
+            C.Finalize();
+        }
+        Save->NodePosX = SrcNode->NodePosX - 600; Save->NodePosY = SrcNode->NodePosY - 260;
+        ForkSaveGuid = Save->NodeGuid.ToString();
+        UEdGraphPin* SaveIn = MCPAnimGraph_FindPosePin(Save, EGPD_Input);
+        UAnimGraphNode_UseCachedPose* UseA = MCPAnimGraph_MakeUseCachedPose(AnimGraph, Save, SrcNode->NodePosX - 300, SrcNode->NodePosY);
+        UAnimGraphNode_UseCachedPose* UseB = MCPAnimGraph_MakeUseCachedPose(AnimGraph, Save, Node->NodePosX - 300, Node->NodePosY - 160);
+        UEdGraphPin* UseAOut = MCPAnimGraph_FindPosePin(UseA, EGPD_Output);
+        UEdGraphPin* UseBOut = MCPAnimGraph_FindPosePin(UseB, EGPD_Output);
+        if (!SaveIn || !UseAOut || !UseBOut) { return MCPAnimGraph_Error(TEXT("pose fork: cached-pose nodes have no pose pins")); }
+
+        SrcBaseIn->BreakAllPinLinks();
+        const bool bS = MCPAnimGraph_Connect(AnimGraph, Upstream, SaveIn);
+        const bool bA = MCPAnimGraph_Connect(AnimGraph, UseAOut, SrcBaseIn);
+        BaseIn->BreakAllPinLinks();
+        bBaseWired = MCPAnimGraph_Connect(AnimGraph, UseBOut, BaseIn) && bS && bA;
+        BlendIn->BreakAllPinLinks();
+        bBlendSourceWired = MCPAnimGraph_Connect(AnimGraph, SrcOut, BlendIn);
+    }
+    else
+    {
+        const bool bAlreadyThis = (CurrentSource && CurrentSource->GetOwningNode() == Node);
+        if (CurrentSource && !bAlreadyThis)
+        {
+            BaseIn->BreakAllPinLinks();
+            bBaseWired = MCPAnimGraph_Connect(AnimGraph, CurrentSource, BaseIn);
+        }
+        if (SrcOut && BlendIn)
+        {
+            BlendIn->BreakAllPinLinks();
+            bBlendSourceWired = MCPAnimGraph_Connect(AnimGraph, SrcOut, BlendIn);
         }
     }
+    const bool bOutWired = MCPAnimGraph_Connect(AnimGraph, NodeOut, RootIn);
+    const FString BlendSourceResolved = SrcNode ? SrcNode->NodeGuid.ToString() : FString();
 
     // --- Bind input pins (X / Y / Alpha / ...) to member variables. ---
     TArray<FString> BoundPins;
@@ -1767,11 +1897,68 @@ FString UMCPReflectionLibrary::InsertAnimGraphNode(UAnimBlueprint* AnimBlueprint
     if (!AssetApplied.IsEmpty()) { Obj->SetStringField(TEXT("asset"), AssetApplied); }
     if (bBranchFilterSet) { Obj->SetStringField(TEXT("branch_filter_bone"), BranchFilterBone); Obj->SetNumberField(TEXT("branch_filter_depth"), BranchFilterDepth); }
     if (!BlendSourceNodeGuid.IsEmpty()) { Obj->SetBoolField(TEXT("blend_source_wired"), bBlendSourceWired); if (!BlendSourceResolved.IsEmpty()) { Obj->SetStringField(TEXT("blend_source_guid"), BlendSourceResolved); } }
+    if (bFork)
+    {
+        TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+        F->SetStringField(TEXT("cache_name"), ForkCache);
+        F->SetStringField(TEXT("save_cached_pose_guid"), ForkSaveGuid);
+        F->SetStringField(TEXT("wiring"), TEXT("upstream -> SaveCachedPose; UseCachedPose -> blend_source.base; UseCachedPose -> this.base; blend_source -> this.blend"));
+        Obj->SetObjectField(TEXT("pose_fork"), F);
+    }
+    if (Props.IsValid()) { Obj->SetObjectField(TEXT("properties"), PropReport); }
     if (BoundPins.Num() > 0)
     {
         TArray<TSharedPtr<FJsonValue>> B;
         for (const FString& S : BoundPins) { B.Add(MakeShared<FJsonValueString>(S)); }
         Obj->SetArrayField(TEXT("bound_pins"), B);
     }
+    return MCPAnimGraph_SerializeObject(Obj);
+}
+
+// 22) C++ #62 SetAnimGraphNodeProperties — set the embedded FAnimNode-struct properties of ANY anim graph
+//     node (top-level AnimGraph or inside a state's bound graph) found by node guid, with a per-key report.
+//     E.g. a held Blend Space / Aim Offset pose: {"PlayRate":0, "bLoop":false, "StartPosition":1}.
+//     The special key "asset" sets the asset on an asset-player node.
+FString UMCPReflectionLibrary::SetAnimGraphNodeProperties(UAnimBlueprint* AnimBlueprint, const FString& NodeGuid,
+                                                          const FString& PropertiesJson)
+{
+    if (!AnimBlueprint) { return MCPAnimGraph_Error(TEXT("AnimBlueprint is null")); }
+    FGuid Guid;
+    if (!FGuid::Parse(NodeGuid, Guid)) { return MCPAnimGraph_Error(FString::Printf(TEXT("bad node guid '%s'"), *NodeGuid)); }
+    UAnimGraphNode_Base* Node = MCPAnimGraph_FindNodeByGuid(AnimBlueprint, Guid);
+    if (!Node) { return MCPAnimGraph_Error(FString::Printf(TEXT("no anim graph node with guid '%s'"), *NodeGuid)); }
+
+    TSharedPtr<FJsonObject> Props;
+    TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(PropertiesJson);
+    if (!FJsonSerializer::Deserialize(R, Props) || !Props.IsValid())
+    {
+        return MCPAnimGraph_Error(TEXT("properties_json must be a JSON object"));
+    }
+
+    FString AssetApplied;
+    FString AssetPath;
+    if (Props->TryGetStringField(TEXT("asset"), AssetPath) && !AssetPath.IsEmpty())
+    {
+        UAnimGraphNode_AssetPlayerBase* AP = Cast<UAnimGraphNode_AssetPlayerBase>(Node);
+        UAnimationAsset* A = LoadObject<UAnimationAsset>(nullptr, *AssetPath);
+        if (!AP || !A) { return MCPAnimGraph_Error(FString::Printf(TEXT("could not set asset '%s' (node is not an asset player, or asset not found)"), *AssetPath)); }
+        Node->Modify();
+        AP->SetAnimationAsset(A);
+        AssetApplied = A->GetPathName();
+    }
+
+    TSharedRef<FJsonObject> Report = MakeShared<FJsonObject>();
+    MCPAnimGraph_ApplyNodeProps(Node, Props, Report);
+    Node->ReconstructNode();
+    { TSharedRef<FJsonObject> Ignored = MakeShared<FJsonObject>(); MCPAnimGraph_ApplyNodeProps(Node, Props, Ignored); }
+    FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBlueprint);
+
+    TSharedRef<FJsonObject> Obj = MCPAnimGraph_Ok();
+    Obj->SetStringField(TEXT("anim_blueprint"), AnimBlueprint->GetName());
+    Obj->SetStringField(TEXT("node_class"), Node->GetClass()->GetName());
+    Obj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+    Obj->SetStringField(TEXT("graph"), Node->GetGraph() ? Node->GetGraph()->GetName() : FString());
+    if (!AssetApplied.IsEmpty()) { Obj->SetStringField(TEXT("asset"), AssetApplied); }
+    Obj->SetObjectField(TEXT("properties"), Report);
     return MCPAnimGraph_SerializeObject(Obj);
 }

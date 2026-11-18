@@ -174,6 +174,8 @@ _fnmap = {
     "insert_anim_slot": "insert_anim_slot",
     # C++ #61 general AnimGraph node insertion (aim offset / layered blend per bone)
     "insert_anim_graph_node": "insert_anim_graph_node",
+    # C++ #62 node-struct properties on any anim graph node (incl. inside states) with a report
+    "set_anim_graph_node_properties": "set_anim_graph_node_properties",
 }
 _rl = getattr(unreal, "MCPReflectionLibrary", None)
 _fn = _fnmap.get(_action)
@@ -246,6 +248,8 @@ else:
                     PARAMS.get("properties_json") or "", PARAMS.get("pin_bindings_json") or "",
                     PARAMS.get("branch_filter_bone") or "", int(PARAMS.get("branch_filter_depth") or 0),
                     PARAMS.get("blend_source_node_guid") or ""))
+            elif _action == "set_anim_graph_node_properties":
+                _res = json.loads(_rl.set_anim_graph_node_properties(_abp, PARAMS["node_guid"], PARAMS.get("properties_json") or "{}"))
             else:
                 _res = {"status": "error", "error": "unknown action: %s" % _action}
         if _is_err(_res):
@@ -746,26 +750,62 @@ else:
         properties:          dict of {property: value} set on the node's embedded FAnimNode struct via
                              ImportText (e.g. {'bMeshSpaceRotationBlend': True}); the special key 'asset' sets
                              the blendspace/sequence on asset-player nodes (e.g. an aim-offset BlendSpace).
+                             Keys match the C++ name ignoring case/underscores ('PlayRate'|'play_rate',
+                             'bLoop'|'loop'). The response's `properties` reports {applied:{prop: stored
+                             value}, unknown:[...], failed:[...]} so a key that didn't take is visible.
         pin_bindings:        dict of {pin_name: anim_variable} wiring each input pin to a VariableGet
                              (e.g. {'X': 'HeadYaw', 'Y': 'HeadPitch', 'Alpha': 'AimAlpha'}).
         branch_filter_bone:  for a Layered Blend Per Bone, add one blend layer filtered from this bone
                              (e.g. 'neck_01' so the layer only affects the head/spine from the neck down-tree).
         branch_filter_depth: blend depth for that branch filter (0 = from the bone, deeper = fade over N bones).
         blend_source_node_guid: feed another node's output pose into this node's BLEND pose input — the
-                             aim-offset -> layered-blend link (pass the aim-offset node's guid).
+                             aim-offset -> layered-blend link (pass the aim-offset node's guid). If that node
+                             is the one currently feeding the Output Pose, the pose is FORKED through a Save
+                             Cached Pose (C++ #62): upstream -> SaveCachedPose; UseCachedPose -> the blend
+                             source's base; UseCachedPose -> this node's base; blend source -> this node's
+                             blend. So the base pose is the UNTOUCHED pose and the branch filter really limits
+                             the blend source to the filtered bones (reported as `pose_fork`).
         save:                persist the AnimBP package (default True; NOT a compile).
 
-        Calls MCPReflectionLibrary.insert_anim_graph_node (C++ #61). Typical head-layer recipe: (1) insert an
+        Calls MCPReflectionLibrary.insert_anim_graph_node (C++ #61/#62). Head-layer recipe: (1) insert an
         'AimOffset' with asset + X/Y bound to head yaw/pitch (captures its node_guid); (2) insert a
         'LayeredBoneBlend' with branch_filter_bone='neck_01' and blend_source_node_guid=<the aim-offset guid>
-        so the aim offset layers over locomotion only from the neck. Returns {node_class, node_guid,
-        base_wired, output_wired, asset?, branch_filter_bone?, bound_pins?}."""
+        -> base = locomotion+montage pose (cached), blend = aim offset, filtered from the neck. Returns
+        {node_class, node_guid, base_wired, output_wired, asset?, branch_filter_bone?, bound_pins?,
+        pose_fork?, properties?}. HELD blend-space pose: {'PlayRate': 0, 'StartPosition': 1}
+        (StartPosition is normalised 0..1). For a player inside a state use set_anim_graph_node_properties."""
         return _run("insert_anim_graph_node", {
             "anim_blueprint_path": anim_blueprint_path, "node_class": node_class,
             "properties_json": json.dumps(properties or {}),
             "pin_bindings_json": json.dumps(pin_bindings or {}),
             "branch_filter_bone": branch_filter_bone, "branch_filter_depth": branch_filter_depth,
             "blend_source_node_guid": blend_source_node_guid, "save": save})
+
+    # ================================================================== #
+    # 22) set_anim_graph_node_properties  (C++ #62)                       #
+    # ================================================================== #
+    @mcp.tool()
+    def set_anim_graph_node_properties(ctx, anim_blueprint_path: str, node_guid: str, properties: dict,
+                                       save: bool = True) -> str:
+        """Set properties of the embedded FAnimNode struct on ANY anim graph node — top-level AnimGraph or a
+        node INSIDE a state (e.g. the Blend Space Player made by set_state_blend_space, whose response carries
+        blend_space_player_guid). The way to set Blend Space / Aim Offset hold settings, sync groups, etc.
+
+        anim_blueprint_path: object path of a UAnimBlueprint.
+        node_guid:           the node's guid (from set_state_blend_space / insert_anim_graph_node /
+                             get_anim_state_machine_json).
+        properties:          {property: value}, C++ names matched ignoring case/underscores ('PlayRate',
+                             'play_rate', 'bLoop'/'loop', 'StartPosition', 'GroupName', ...). Values go
+                             through ImportText (numbers, bools, enum names, struct literals). Special key
+                             'asset' sets an asset player's asset. A property whose pin is visible and
+                             unlinked also gets the pin default (a visible pin's default wins at compile).
+                             Held pose: {'PlayRate': 0, 'StartPosition': 1}.
+        save:                persist the AnimBP package (default True; compile separately).
+
+        Returns {node_class, node_guid, graph, properties:{applied:{prop: stored}, unknown?, failed?}}."""
+        return _run("set_anim_graph_node_properties", {
+            "anim_blueprint_path": anim_blueprint_path, "node_guid": node_guid,
+            "properties_json": json.dumps(properties or {}), "save": save})
 
     # This module registers NO `undo` tool; editor_level.py owns the unified `undo`. The 13 op inverses
     # above are reported to the coordinator to fold into editor_level.undo (see module docstring / report).

@@ -324,7 +324,25 @@ else:
         except Exception as e:
             return f"Error: {e}"
 
-    _SET_AXIS_BODY = _HELPERS + r'''
+    # C++ #62 (Companion gap, logged 2026-10-31): samples/axes changed by script never got runtime
+    # BlendSpaceData (1D Segments / 2D Triangles) -> the Blend Space / Aim Offset Player posed NOTHING (bind
+    # pose) in game, silently. Every sample/axis writer now resamples (ValidateSampleData + ResampleData, the
+    # calls the Persona editor makes) before it saves. Falls back to a warning on a pre-#61 DLL.
+    _RESAMPLE_HELPER = r'''
+def _resample(bs):
+    _m = getattr(unreal, "MCPReflectionLibrary", None)
+    if _m is None or not hasattr(_m, "resample_blend_space"):
+        return {"resampled": False, "resample_warning": "C++ #61 resample_blend_space unavailable - the blend space will pose nothing in game until resampled (rebuild the plugin)"}
+    try:
+        _r = json.loads(_m.resample_blend_space(bs.get_path_name()))
+    except Exception as _e:
+        return {"resampled": False, "resample_warning": str(_e)}
+    if _r.get("status") != "ok":
+        return {"resampled": False, "resample_warning": _r.get("error") or _r.get("message") or str(_r)}
+    return {"resampled": True}
+'''
+
+    _SET_AXIS_BODY = _HELPERS + _RESAMPLE_HELPER + r'''
 bs, err = _load(PARAMS["blend_space_path"])
 if err:
     print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
@@ -352,10 +370,13 @@ else:
                 p.set_editor_property("grid_num", int(PARAMS["grid_divisions"]))
             bp[axis] = p
             bs.set_editor_property("blend_parameters", bp)
+        _rs = _resample(bs)
         _save(PARAMS["blend_space_path"])
         _ledger().append({"op": "set_blend_space_axis", "asset_path": PARAMS["blend_space_path"], "axis": axis, "prior": prior})
-        print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": PARAMS["blend_space_path"],
-            "axis": axis, "prior": prior, "axes_after": _bs_axis_rows(bs), "ledger_depth": len(_ledger())}))
+        _o = {"status": "success", "asset_path": PARAMS["blend_space_path"],
+            "axis": axis, "prior": prior, "axes_after": _bs_axis_rows(bs), "ledger_depth": len(_ledger())}
+        _o.update(_rs)
+        print("@@UMCP@@" + json.dumps(_o))
 '''
 
     @mcp.tool()
@@ -381,7 +402,7 @@ else:
         except Exception as e:
             return f"Error: {e}"
 
-    _ADD_SAMPLE_BODY = _HELPERS + r'''
+    _ADD_SAMPLE_BODY = _HELPERS + _RESAMPLE_HELPER + r'''
 bs, err = _load(PARAMS["blend_space_path"])
 if err:
     print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
@@ -416,11 +437,14 @@ else:
             samples.append(s)
             with unreal.ScopedEditorTransaction("MCP add_blend_space_sample"):
                 bs.set_editor_property("sample_data", samples)
+            _rs = _resample(bs)
             _save(PARAMS["blend_space_path"])
             _ledger().append({"op": "add_blend_space_sample", "asset_path": PARAMS["blend_space_path"], "prior_count": prior_count})
-            print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": PARAMS["blend_space_path"],
+            _o = {"status": "success", "asset_path": PARAMS["blend_space_path"],
                 "animation": anim.get_path_name(), "x": x, "y": y, "prior_count": prior_count,
-                "samples_after": _bs_sample_rows(bs), "ledger_depth": len(_ledger())}))
+                "samples_after": _bs_sample_rows(bs), "ledger_depth": len(_ledger())}
+            _o.update(_rs)
+            print("@@UMCP@@" + json.dumps(_o))
 '''
 
     @mcp.tool()
@@ -446,7 +470,7 @@ else:
         except Exception as e:
             return f"Error: {e}"
 
-    _REMOVE_SAMPLE_BODY = _HELPERS + r'''
+    _REMOVE_SAMPLE_BODY = _HELPERS + _RESAMPLE_HELPER + r'''
 bs, err = _load(PARAMS["blend_space_path"])
 if err:
     print("@@UMCP@@" + json.dumps({"status": "error", "message": err}))
@@ -467,10 +491,13 @@ else:
         del samples[idx]
         with unreal.ScopedEditorTransaction("MCP remove_blend_space_sample"):
             bs.set_editor_property("sample_data", samples)
+        _rs = _resample(bs)
         _save(PARAMS["blend_space_path"])
         _ledger().append({"op": "remove_blend_space_sample", "asset_path": PARAMS["blend_space_path"], "index": idx, "sample": captured})
-        print("@@UMCP@@" + json.dumps({"status": "success", "asset_path": PARAMS["blend_space_path"],
-            "removed_index": idx, "removed": captured, "samples_after": _bs_sample_rows(bs), "ledger_depth": len(_ledger())}))
+        _o = {"status": "success", "asset_path": PARAMS["blend_space_path"],
+            "removed_index": idx, "removed": captured, "samples_after": _bs_sample_rows(bs), "ledger_depth": len(_ledger())}
+        _o.update(_rs)
+        print("@@UMCP@@" + json.dumps(_o))
 '''
 
     @mcp.tool()

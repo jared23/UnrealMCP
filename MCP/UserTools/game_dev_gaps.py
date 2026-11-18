@@ -463,16 +463,22 @@ def register_tools(mcp, utils):
         collides with the FText Name column). table_path: the DataTable asset. row_name: the row's id (its
         RowName / MoveTag). field_name: the column (C++ or authored name). value: the string to set.
 
-        raw=False (default): treat `value` as plain display text -> FText::FromString (the FText backfill case).
-        raw=True: parse `value` with the engine's ImportText for ANY field type — float '5.0', struct
-        '(X=1,Y=2)', name 'Foo', etc. (use for non-FText fields the importer mangled). save: save the table
-        after. Requires the C++ #56 handler."""
+        Any field type works on the default path: an FText field takes `value` as plain display text
+        (FText::FromString — the FText backfill case); every other type (float '600', int, name 'Foo', enum
+        'EValue', struct '(X=1,Y=2)', object path) is parsed from its text form by ImportText (C++ #62 — it
+        used to refuse non-FText fields unless raw). raw=True forces ImportText even for an FText field
+        (e.g. an NSLOCTEXT(...) literal). save: save the table after. Works during PIE. Returns
+        {field, cpp_type, prev, stored}. Requires the C++ #56 handler."""
         body = (
             "import unreal, json\n"
             "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
             "raw = bool(PARAMS['raw'])\n"
             "fn = 'set_data_table_row_field_from_text' if raw else 'set_data_table_row_text'\n"
-            "dt = unreal.load_asset(PARAMS['table'])\n"
+            "dt = None\n"
+            "for _ld in (lambda p: unreal.EditorAssetLibrary.load_asset(p), lambda p: unreal.load_asset(p), lambda p: unreal.load_object(None, p)):\n"
+            "    try: dt = _ld(PARAMS['table'])\n"
+            "    except Exception: dt = None\n"
+            "    if dt is not None: break\n"
             "if mrl is None or not hasattr(mrl, fn):\n"
             "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #56 DataTable field writer unavailable — recompile the plugin'}))\n"
             "elif dt is None:\n"
@@ -482,6 +488,8 @@ def register_tools(mcp, utils):
             "        r = json.loads(mrl.set_data_table_row_field_from_text(dt, PARAMS['row'], PARAMS['field'], PARAMS['value']))\n"
             "    else:\n"
             "        r = json.loads(mrl.set_data_table_row_text(dt, PARAMS['row'], PARAMS['field'], PARAMS['value']))\n"
+            "        if r.get('status') == 'error' and 'is not an FText' in str(r.get('error', '')):\n"
+            "            r = json.loads(mrl.set_data_table_row_field_from_text(dt, PARAMS['row'], PARAMS['field'], PARAMS['value']))\n"
             "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
             "        try:\n"
             "            r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(dt))\n"
@@ -762,5 +770,117 @@ def register_tools(mcp, utils):
                                            "folders": json.dumps(folder_map or {}),
                                            "root": source_root, "strip": strip_test_prefix,
                                            "dry": dry_run}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ==== Companion-Game gaps batch 12 (C++ #62) ===========================================
+
+    @mcp.tool()
+    def get_niagara_module_input_values(ctx, system_path: str, emitter: str, module: str,
+                                        script_usage: str = "", input_filter: str = "") -> str:
+        """Read the VALUES behind an emitter module's inputs (get_niagara_module_inputs only lists names and
+        types). For each input: mode 'local' (override-pin literal) | 'rapid_iteration' (an unset stack value
+        — where e.g. a ShapeLocation radius actually lives) | 'linked' (bound parameter, e.g. 'User.FlightTime')
+        | 'dynamic_input' (function name + ITS inputs, recursively — e.g. Lerp_Float A/B/Alpha under
+        InitializeParticle Lifetime) | 'data_interface' (class + its properties, e.g. curve keys) | 'object' |
+        'module_default'. Also returns the module's static switches.
+
+        system_path: NiagaraSystem path. emitter: emitter handle name. module: module function name
+        ('ShapeLocation', 'InitializeParticle') or its script asset name. script_usage: particle_spawn |
+        particle_update | emitter_spawn | emitter_update | '' (search all). input_filter: optional
+        substring on input names. Read-only. Requires the C++ #62 handler."""
+        body = _cpp_delegate("get_niagara_module_input_values",
+                             "mrl.get_niagara_module_input_values(PARAMS['s'], PARAMS['e'], PARAMS['u'], PARAMS['m'], PARAMS['f'])")
+        try:
+            return json.dumps(_exec(body, {"s": system_path, "e": emitter, "u": script_usage,
+                                           "m": module, "f": input_filter}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def get_niagara_particle_positions(ctx, actor: str = "", component: str = "", emitter: str = "",
+                                       max_particles: int = 500, attributes: list = None,
+                                       world: str = "auto") -> str:
+        """Read LIVE particle positions (world space) of a running Niagara effect — to size gameplay contact
+        against what the VFX actually covers. Per emitter: positions_world rows [x,y,z(,attrs...)], bounds,
+        max/mean XY radius and max radius from the component. CPU-sim emitters only (GPU data stays on the GPU
+        — the tool says so). UE 5.8 dropped GetNiagaraParticlePositions_DebugOnly, so this reads the particle
+        data buffer directly.
+
+        actor: name/label substring of the actor holding the NiagaraComponent ('' = first actor with one).
+        component / emitter: optional filters. max_particles: rows returned per emitter (stats use all).
+        attributes: optional float attribute names to add as columns (e.g. ['Age','NormalizedAge']).
+        world: 'auto' (PIE if running, else the editor world — needs a realtime viewport so it ticks) |
+        'pie' | 'editor'. Read-only. Requires the C++ #62 handler."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)\n"
+            "les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)\n"
+            "mode = PARAMS['world']\n"
+            "in_pie = les.is_in_play_in_editor()\n"
+            "w = None\n"
+            "if mode == 'pie' or (mode == 'auto' and in_pie):\n"
+            "    w = ues.get_game_world() if in_pie else None\n"
+            "else:\n"
+            "    w = ues.get_editor_world()\n"
+            "if mrl is None or not hasattr(mrl, 'get_niagara_particle_positions'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #62 get_niagara_particle_positions unavailable — recompile the plugin'}))\n"
+            "elif w is None:\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'no %s world (start PIE for world=pie)' % mode}))\n"
+            "else:\n"
+            "    name = PARAMS['actor'] or ''\n"
+            "    t = None\n"
+            "    for a in unreal.GameplayStatics.get_all_actors_of_class(w, unreal.Actor):\n"
+            "        try:\n"
+            "            if name:\n"
+            "                if a.get_name() == name or name.lower() in a.get_name().lower() or name.lower() in a.get_actor_label().lower():\n"
+            "                    if a.get_components_by_class(unreal.NiagaraComponent): t = a; break\n"
+            "            elif a.get_components_by_class(unreal.NiagaraComponent):\n"
+            "                t = a; break\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    if t is None:\n"
+            "        print('@@UMCP@@' + json.dumps({'status':'error','message':'no actor with a NiagaraComponent matched %r in %s' % (name, w.get_name())}))\n"
+            "    else:\n"
+            "        print('@@UMCP@@' + mrl.get_niagara_particle_positions(t, PARAMS['comp'], PARAMS['em'], int(PARAMS['max']), PARAMS['attrs']))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"actor": actor, "comp": component, "em": emitter,
+                                           "max": max_particles, "attrs": json.dumps(attributes or []),
+                                           "world": (world or "auto").lower()}), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    def refresh_montage_segments(ctx, montage_path: str, save: bool = True) -> str:
+        """Re-fit a montage to its animations after a reimport changed their length (e.g. AM_*_Evade kept its
+        old 0.667 s after the clip was reimported at 2.233 s). For each slot segment: AnimEndTime = the
+        sequence's current play length, segment start positions re-chained, then the montage length is
+        recomputed and sections/notifies re-linked — what the montage editor does on its next tick, without
+        deleting/recreating the asset (which trips source control). Sections that now lie past the end are
+        flagged (not moved). montage_path: the AnimMontage path. save: save after. Returns {prev_length,
+        new_length, changed, segments[], sections[]}. Requires the C++ #62 handler."""
+        body = (
+            "import unreal, json\n"
+            "mrl = getattr(unreal, 'MCPReflectionLibrary', None)\n"
+            "m = None\n"
+            "for _ld in (lambda p: unreal.EditorAssetLibrary.load_asset(p), lambda p: unreal.load_asset(p)):\n"
+            "    try: m = _ld(PARAMS['m'])\n"
+            "    except Exception: m = None\n"
+            "    if m is not None: break\n"
+            "if mrl is None or not hasattr(mrl, 'refresh_montage_segments'):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'C++ #62 refresh_montage_segments unavailable — recompile the plugin'}))\n"
+            "elif m is None or not isinstance(m, unreal.AnimMontage):\n"
+            "    print('@@UMCP@@' + json.dumps({'status':'error','message':'not an AnimMontage: ' + str(PARAMS['m'])}))\n"
+            "else:\n"
+            "    r = json.loads(mrl.refresh_montage_segments(m))\n"
+            "    if PARAMS.get('save') and r.get('status') == 'ok':\n"
+            "        try: r['saved'] = bool(unreal.EditorAssetLibrary.save_loaded_asset(m, False))\n"
+            "        except Exception as _e: r['saved_error'] = str(_e)\n"
+            "    print('@@UMCP@@' + json.dumps(r))\n"
+        )
+        try:
+            return json.dumps(_exec(body, {"m": montage_path, "save": save}), indent=2)
         except Exception as e:
             return f"Error: {e}"

@@ -3060,9 +3060,11 @@ for _ in range(count):
         pj = entry.get("prev_value_json", "null")
         if sysobj is None or mrl is None or not hasattr(mrl, "set_niagara_user_parameter_value"):
             undone.append({**entry, "result": "system-or-handler-absent"})
-        elif pj is None or pj == "null":
+        elif pj is None or pj == "null" or pj == "[null]":
             undone.append({**entry, "result": "no-prior-value-skipped"})
         else:
+            if not str(pj).lstrip().startswith("["):
+                pj = "[" + str(pj) + "]"   # C++ #62: UE JSON reader rejects a bare root scalar
             mrl.set_niagara_user_parameter_value(sysobj, entry.get("param"), pj)
             _save_niag(sysobj, ap)
             undone.append({**entry, "result": "user-param-restored"})
@@ -3078,6 +3080,8 @@ for _ in range(count):
         else:
             mrl.add_niagara_user_parameter(sysobj, entry.get("param"), entry.get("type"))
             if vj is not None and vj != "null" and hasattr(mrl, "set_niagara_user_parameter_value"):
+                if not str(vj).lstrip().startswith("["):
+                    vj = "[" + str(vj) + "]"   # C++ #62: UE JSON reader rejects a bare root scalar
                 mrl.set_niagara_user_parameter_value(sysobj, entry.get("param"), vj)
             _save_niag(sysobj, ap)
             undone.append({**entry, "result": "user-param-re-added"})
@@ -4262,6 +4266,8 @@ for _ in range(count):
                     p.set_editor_property("grid_num", int(pr.get("grid_num")))
                     bp[axis] = p
                     bs.set_editor_property("blend_parameters", bp)
+                try: unreal.MCPReflectionLibrary.resample_blend_space(bs.get_path_name())   # C++ #62: keep runtime data in sync
+                except Exception: pass
                 try: unreal.EditorAssetLibrary.save_asset(entry.get("asset_path"), only_if_is_dirty=False)
                 except Exception: pass
             undone.append({**entry, "result": "axis-restored"})
@@ -4276,6 +4282,8 @@ for _ in range(count):
             if len(samples) > pc:
                 with unreal.ScopedEditorTransaction("MCP undo add_blend_space_sample"):
                     bs.set_editor_property("sample_data", samples[:pc])
+                try: unreal.MCPReflectionLibrary.resample_blend_space(bs.get_path_name())   # C++ #62
+                except Exception: pass
                 try: unreal.EditorAssetLibrary.save_asset(entry.get("asset_path"), only_if_is_dirty=False)
                 except Exception: pass
             undone.append({**entry, "result": "sample-truncated"})
@@ -4297,6 +4305,8 @@ for _ in range(count):
             samples.insert(idx, s)
             with unreal.ScopedEditorTransaction("MCP undo remove_blend_space_sample"):
                 bs.set_editor_property("sample_data", samples)
+            try: unreal.MCPReflectionLibrary.resample_blend_space(bs.get_path_name())   # C++ #62
+            except Exception: pass
             try: unreal.EditorAssetLibrary.save_asset(entry.get("asset_path"), only_if_is_dirty=False)
             except Exception: pass
             undone.append({**entry, "result": "sample-reinserted"})

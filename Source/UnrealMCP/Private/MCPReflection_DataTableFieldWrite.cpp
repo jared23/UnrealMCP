@@ -101,10 +101,13 @@ FString UMCPReflectionLibrary::SetDataTableRowText(UDataTable* Table, const FStr
     FTextProperty* TP = CastField<FTextProperty>(Prop);
     if (!TP)
     {
-        return DTW_Error(FString::Printf(TEXT("field '%s' is not an FText (it is %s) — use set_data_table_row_field for other types"),
-            *FieldName, *Prop->GetClass()->GetName()));
+        // C++ #62 (Companion gap, 2026-11-17): a non-FText field used to error here ("use
+        // set_data_table_row_field" — i.e. the very tool that called this). Any other type is set from its
+        // text form by ImportText instead (float "600", name "Foo", struct "(X=1,Y=2)", enum "EValue").
+        return SetDataTableRowFieldFromText(Table, RowName, FieldName, Text);
     }
 
+    Table->Modify();
     FText* Dest = TP->ContainerPtrToValuePtr<FText>(RowData);
     *Dest = FText::FromString(Text);
     DTW_Persist(Table, FName(*RowName));
@@ -126,7 +129,34 @@ FString UMCPReflectionLibrary::SetDataTableRowFieldFromText(UDataTable* Table, c
     uint8* RowData = DTW_Resolve(Table, RowName, FieldName, Prop, Err);
     if (!RowData) return DTW_Error(Err);
 
+    // C++ #62: the engine's numeric ImportText accepts ANY text (Atof -> "notanumber" became 0.0, silently).
+    // Validate numerics (an enum-backed byte property still takes enum names) and bools before writing.
+    {
+        const FString V = ValueText.TrimStartAndEnd();
+        const FByteProperty* ByteP = CastField<FByteProperty>(Prop);
+        const bool bEnumByte = ByteP && ByteP->Enum;
+        if (CastField<FNumericProperty>(Prop) && !bEnumByte)
+        {
+            double Parsed = 0.0;
+            if (!LexTryParseString(Parsed, *V))
+            {
+                return DTW_Error(FString::Printf(TEXT("'%s' is not a number (field '%s' is %s)"), *ValueText, *FieldName, *Prop->GetCPPType()));
+            }
+        }
+        else if (CastField<FBoolProperty>(Prop))
+        {
+            const FString L = V.ToLower();
+            if (L != TEXT("true") && L != TEXT("false") && L != TEXT("1") && L != TEXT("0"))
+            {
+                return DTW_Error(FString::Printf(TEXT("'%s' is not a bool (true/false/1/0) for field '%s'"), *ValueText, *FieldName));
+            }
+        }
+    }
+
+    Table->Modify();
     void* Dest = Prop->ContainerPtrToValuePtr<void>(RowData);
+    FString PrevText;
+    Prop->ExportTextItem_Direct(PrevText, Dest, nullptr, Table, PPF_None);
     // ImportText_Direct parses ValueText into the field (e.g. "5.0" for a float, "NSLOCTEXT(...)" or a
     // quoted string for FText, "(X=1,Y=2)" for a struct). Returns nullptr on a parse failure.
     const TCHAR* Result = Prop->ImportText_Direct(*ValueText, Dest, Table, PPF_None);
@@ -137,6 +167,9 @@ FString UMCPReflectionLibrary::SetDataTableRowFieldFromText(UDataTable* Table, c
     }
     DTW_Persist(Table, FName(*RowName));
 
+    FString StoredText;
+    Prop->ExportTextItem_Direct(StoredText, Dest, nullptr, Table, PPF_None);
+
     TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
     O->SetStringField(TEXT("status"), TEXT("ok"));
     O->SetStringField(TEXT("table"), Table->GetPathName());
@@ -144,5 +177,7 @@ FString UMCPReflectionLibrary::SetDataTableRowFieldFromText(UDataTable* Table, c
     O->SetStringField(TEXT("field"), FieldName);
     O->SetStringField(TEXT("cpp_type"), Prop->GetCPPType());
     O->SetStringField(TEXT("value"), ValueText);
+    O->SetStringField(TEXT("prev"), PrevText);
+    O->SetStringField(TEXT("stored"), StoredText);
     return DTW_Serialize(O);
 }

@@ -374,9 +374,19 @@ else:
 
     _SET_USERPARAM_BODY = _NIAGARA_HELPERS + r'''
 system_path = PARAMS["system_path"]; param = PARAMS["param_name"]; value_json = PARAMS["value_json"]
+# C++ #62: UE's JSON reader rejects a bare root scalar, so wrap one ("0.35" / "true") into array form.
+try:
+    _vj = json.loads(value_json)
+    if not isinstance(_vj, list):
+        value_json = json.dumps([_vj])
+except Exception:
+    pass
 EAL = unreal.EditorAssetLibrary
 mrl = getattr(unreal, "MCPReflectionLibrary", None)
 sysobj = EAL.load_asset(system_path)
+if sysobj is None:
+    try: sysobj = unreal.load_asset(system_path)
+    except Exception: sysobj = None
 if sysobj is None or not isinstance(sysobj, unreal.NiagaraSystem):
     print("@@UMCP@@" + json.dumps({"status": "error", "message": "not a NiagaraSystem: %s" % system_path}))
 elif mrl is None or not hasattr(mrl, "set_niagara_user_parameter_value"):
@@ -388,15 +398,67 @@ else:
         print("@@UMCP@@" + json.dumps({"status": "error", "message": res.get("error")}))
     else:
         _sv = _save_niagara(sysobj, system_path)
-        prev_json = json.dumps(res.get("prev"))
+        # Re-read AFTER the save/compile so the response proves the default persisted.
+        _after = None
+        if hasattr(mrl, "get_niagara_user_parameter_value"):
+            try: _after = json.loads(mrl.get_niagara_user_parameter_value(sysobj, param)).get("value")
+            except Exception: _after = None
+        prev_json = json.dumps(res.get("prev") if isinstance(res.get("prev"), list) else [res.get("prev")])
         _ledger().append({"op": "set_user_param", "asset_path": system_path,
                           "param": res.get("param"), "prev_value_json": prev_json})
-        _out = {"status": "success" if _sv.get("saved") else "warning", "system": res.get("system"),
-            "param": res.get("param"), "set": True, "prev": res.get("prev"),
+        _req = json.loads(value_json)
+        _req = _req[0] if isinstance(_req, list) and len(_req) == 1 else _req
+        _match = None
+        if _after is not None:
+            try:
+                _a = _after if isinstance(_after, list) else [_after]
+                _r = _req if isinstance(_req, list) else [_req]
+                _match = len(_a) == len(_r) and all(abs(float(x) - float(y)) < 1e-4 for x, y in zip(_a, _r))
+            except Exception:
+                _match = (_after == _req)
+        _ok = bool(_sv.get("saved")) and _match is not False
+        _out = {"status": "success" if _ok else "warning", "system": res.get("system"),
+            "param": res.get("param"), "type": res.get("type"), "set": True, "prev": res.get("prev"),
+            "stored": res.get("stored"), "stored_after_save": _after, "matches_request": _match,
             "saved": _sv.get("saved"), "compiled": _sv.get("compiled"), "ledger_depth": len(_ledger())}
+        if _match is False: _out["message"] = "value read back after save differs from the request"
         if _sv.get("save_error"): _out["save_error"] = _sv["save_error"]
         print("@@UMCP@@" + json.dumps(_out))
 '''
+
+    _GET_USERPARAM_BODY = r'''
+system_path = PARAMS["system_path"]; param = PARAMS["param_name"]
+mrl = getattr(unreal, "MCPReflectionLibrary", None)
+sysobj = None
+for _ld in (lambda p: unreal.EditorAssetLibrary.load_asset(p), lambda p: unreal.load_asset(p), lambda p: unreal.load_object(None, p)):
+    try:
+        sysobj = _ld(system_path)
+    except Exception:
+        sysobj = None
+    if sysobj is not None: break
+if sysobj is None or not isinstance(sysobj, unreal.NiagaraSystem):
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "not a NiagaraSystem: %s" % system_path}))
+elif mrl is None or not hasattr(mrl, "get_niagara_user_parameter_value"):
+    print("@@UMCP@@" + json.dumps({"status": "error", "message": "C++ handler get_niagara_user_parameter_value unavailable (plugin DLL predates C++ #62; rebuild needed)"}))
+else:
+    res = json.loads(mrl.get_niagara_user_parameter_value(sysobj, param))
+    if res.get("error"):
+        print("@@UMCP@@" + json.dumps({"status": "error", "message": res["error"]}))
+    else:
+        res["status"] = "success"
+        print("@@UMCP@@" + json.dumps(res))
+'''
+
+    @mcp.tool()
+    def get_niagara_user_parameter_value(ctx, system_path: str, param_name: str) -> str:
+        """Read a NiagaraSystem User.* parameter's stored default value (C++ #62). Works during PIE.
+
+        Returns {status, system, param, type, value}."""
+        params = {"system_path": system_path, "param_name": param_name}
+        try:
+            return json.dumps(_exec(_GET_USERPARAM_BODY, params), indent=2)
+        except Exception as e:
+            return f"Error: {e}"
 
     _REMOVE_USERPARAM_BODY = _NIAGARA_HELPERS + r'''
 system_path = PARAMS["system_path"]; param = PARAMS["param_name"]
@@ -446,14 +508,13 @@ else:
     def set_niagara_user_parameter_value(ctx, system_path: str, param_name: str, value_json: str) -> str:
         """Set an existing User.* parameter's default value on a NiagaraSystem (C++ #10).
 
-        value_json: MUST be ARRAY-form JSON -- the UE JSON reader rejects a bare top-level scalar.
-                    Use '[2.5]' (float/int), '[true]'? no -> bool uses '[1]'/'[0]'? -- pass the value
-                    wrapped in an array: float/int '[2.5]' / '[3]', vector '[1,0,0]', vector4/linearcolor
-                    '[1,0,0,1]', quat '[0,0,0,1]'. (Confirmed live 2026-08-16: '[2.5]' and '[1,2,3]' OK,
-                    bare '2.5' rejected.)
+        value_json: float/int '0.35' or '[0.35]', bool 'true' / '[1]', vector '[1,0,0]',
+                    vector4/linearcolor '[1,0,0,1]', quat '[0,0,0,1]'. A bare scalar is wrapped
+                    automatically. (C++ #62 fixed scalars: before, '[0.35]' was stored as 0.)
 
-        Saved via save_niagara_system. The C++ returns the PRIOR value, ledgered for undo. Ledgered
-        'set_user_param' {asset_path,param,prev_value_json}; inverse re-sets prev_value_json."""
+        Saved via save_niagara_system, then read back: the response carries `stored_after_save` and
+        `matches_request` (status 'warning' if they differ). The C++ returns the PRIOR value, ledgered for
+        undo. Ledgered 'set_user_param' {asset_path,param,prev_value_json}; inverse re-sets prev_value_json."""
         params = {"system_path": system_path, "param_name": param_name, "value_json": value_json}
         try:
             return json.dumps(_exec(_SET_USERPARAM_BODY, params), indent=2)

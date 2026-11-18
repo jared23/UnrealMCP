@@ -1711,24 +1711,73 @@ FString UMCPReflectionLibrary::SetNiagaraUserParameterValue(UNiagaraSystem* Syst
     {
         return SerializeJson(ErrorObj(TEXT("invalid value JSON")));
     }
+    // C++ #62 fix (Companion gap, 2026-11-17): callers pass ARRAY-form JSON ("[0.35]") because UE's reader
+    // rejects a bare root scalar — but the float/int/bool branches of ApplyJsonValueToStore call AsNumber()
+    // on the value, and AsNumber() of an ARRAY is 0. So every scalar default was silently stored as 0
+    // ("set":true, "prev":0 forever). Unwrap a single-element array (same idiom as the EQS setter) so the
+    // scalar paths see the number; multi-element arrays (vectors/colors/quats) pass through untouched.
+    if (Val->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& VArr = Val->AsArray();
+        if (VArr.Num() == 1 && VArr[0].IsValid()) { Val = VArr[0]; }
+    }
 
     // Capture the PRIOR value (for undo) BEFORE overwriting.
     const TSharedPtr<FJsonValue> Prev = StoreValueToJson(Store, Type, Offset);
 
+    System->Modify();
     const FNiagaraVariable Var(Type, FullName);
     FString ApplyErr;
     if (!ApplyJsonValueToStore(Store, Var, Val, ApplyErr))
     {
         return SerializeJson(ErrorObj(ApplyErr.IsEmpty() ? TEXT("failed to set value") : ApplyErr));
     }
-    Store.OnParameterChange(); // VERIFY vs engine source: FNiagaraParameterStore::OnParameterChange()/MarkParameterDirty — notify layout; drop this line if the accessor differs
+    Store.OnParameterChange();
     System->MarkPackageDirty();
+
+    // Read the value BACK from the store (re-resolve the offset: AddParameter/rebinds can move it) so the
+    // response reports what is actually stored, not what was requested.
+    FNiagaraTypeDefinition AfterType; int32 AfterOffset = INDEX_NONE;
+    TSharedPtr<FJsonValue> Stored = MakeShared<FJsonValueNull>();
+    if (FindUserVar(Store, FullName, AfterType, AfterOffset))
+    {
+        Stored = StoreValueToJson(Store, AfterType, AfterOffset);
+    }
 
     TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
     Root->SetStringField(TEXT("system"), System->GetName());
     Root->SetStringField(TEXT("param"), FullName.ToString());
+    Root->SetStringField(TEXT("type"), NiagaraTypeToName(Type));
     Root->SetBoolField(TEXT("set"), true);
     Root->SetField(TEXT("prev"), Prev.IsValid() ? Prev : MakeShared<FJsonValueNull>());
+    Root->SetField(TEXT("stored"), Stored.IsValid() ? Stored : MakeShared<FJsonValueNull>());
+    return SerializeJson(Root);
+#else
+    return SerializeJson(ErrorObj(TEXT("editor-only")));
+#endif
+}
+
+// C++ #62: read one User.* parameter's stored default (used to verify a set survived save/compile).
+FString UMCPReflectionLibrary::GetNiagaraUserParameterValue(UNiagaraSystem* System, const FString& ParamName)
+{
+#if WITH_EDITOR
+    if (!System)
+    {
+        return SerializeJson(ErrorObj(TEXT("null system")));
+    }
+    FNiagaraUserRedirectionParameterStore& Store = System->GetExposedParameters();
+    const FName FullName = MakeUserParamName(ParamName);
+    FNiagaraTypeDefinition Type; int32 Offset = INDEX_NONE;
+    if (!FindUserVar(Store, FullName, Type, Offset))
+    {
+        return SerializeJson(ErrorObj(FString::Printf(TEXT("no user parameter '%s'"), *FullName.ToString())));
+    }
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("system"), System->GetName());
+    Root->SetStringField(TEXT("param"), FullName.ToString());
+    Root->SetStringField(TEXT("type"), NiagaraTypeToName(Type));
+    const TSharedPtr<FJsonValue> V = StoreValueToJson(Store, Type, Offset);
+    Root->SetField(TEXT("value"), V.IsValid() ? V : MakeShared<FJsonValueNull>());
     return SerializeJson(Root);
 #else
     return SerializeJson(ErrorObj(TEXT("editor-only")));

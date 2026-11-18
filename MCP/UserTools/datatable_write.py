@@ -141,12 +141,23 @@ def _ledger():
 def _load_dt(path):
     if not path:
         return None, "no data_table_path given"
-    try:
-        obj = unreal.EditorAssetLibrary.load_asset(path)
-    except Exception as e:
-        return None, "load failed: %s" % e
+    # PIE-safe (Companion gap 2026-11-17): EditorAssetLibrary.load_asset refuses while PIE is running
+    # ("asset not found"); the core loaders resolve through the asset registry regardless of the play world.
+    obj = None; _errs = []
+    for _ld in (unreal.EditorAssetLibrary.load_asset, unreal.load_asset, lambda p: unreal.load_object(None, p)):
+        try:
+            obj = _ld(path)
+        except Exception as e:
+            _errs.append(str(e)); obj = None
+        if obj is not None:
+            break
+    if obj is None and "." not in path.rsplit("/", 1)[-1]:
+        try:
+            obj = unreal.load_object(None, path + "." + path.rsplit("/", 1)[-1])
+        except Exception as e:
+            _errs.append(str(e))
     if obj is None:
-        return None, "asset not found: %s" % path
+        return None, "asset not found: %s%s" % (path, (" (" + "; ".join(_errs) + ")") if _errs else "")
     if not isinstance(obj, unreal.DataTable):
         return None, "asset is not a DataTable (got %s): %s" % (obj.get_class().get_name(), path)
     return obj, None
